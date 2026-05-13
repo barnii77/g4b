@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "g4b"
+version = "0.1.0"
+description = "Gemma 4 Inference Engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+authors = [
+    { name = "barnii77", email = "barnii77@barnii77.dev" }
+]
+
+dependencies = [
+    "triton==3.7.0",
+]
+
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.0",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["g4b"]
+
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | venv
+  | build
+  | dist
+  | __pycache__
+)/
+'''
