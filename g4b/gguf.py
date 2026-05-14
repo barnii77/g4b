@@ -4,14 +4,13 @@
 import struct
 import math
 from dataclasses import dataclass
-from functools import reduce
 from pathlib import Path
 from typing import BinaryIO, Callable
 from enum import IntEnum
 
 __all__ = ["load", "GGUFType", "GGUFMetaType", "GGUFMeta", "GGUFTensor", "GGUFError"]
 
-type GGUFMetaType = int | float | bytes | list[GGUFMetaType]
+type GGUFMetaType = int | float | str | list[GGUFMetaType]
 type GGUFMeta = dict[str, GGUFMetaType]
 
 
@@ -74,10 +73,20 @@ class GGUFType(IntEnum):
         assert self in _BLOCK_ELEMENTS
         return _BLOCK_ELEMENTS[self]
 
-    def sizeof_tensor(self, n_elements: int):
+    def sizeof_tensor(self, shape: list[int]) -> int:
+        if not shape:
+            raise GGUFError("tensor has no dimensions")
+
         block_elements = self.block_elements()
-        assert n_elements % block_elements == 0
-        return int(n_elements // block_elements * self.block_bytes())
+
+        if shape[0] % block_elements != 0:
+            raise GGUFError(
+                f"{self} tensor innermost dimension {shape[0]} "
+                f"is not divisible by block size {block_elements}"
+            )
+
+        rows = math.prod(shape[1:])
+        return rows * (shape[0] // block_elements) * self.block_bytes()
 
     def __str__(self):
         return self.name.removeprefix("GGML_TYPE_").lower()
@@ -129,14 +138,14 @@ def load_uint16(file: BinaryIO) -> int: return int.from_bytes(file.read(2), byte
 def load_uint32(file: BinaryIO) -> int: return int.from_bytes(file.read(4), byteorder='little')
 def load_uint64(file: BinaryIO) -> int: return int.from_bytes(file.read(8), byteorder='little')
 def load_bool(file: BinaryIO) -> bool: return bool(load_int8(file))
-def load_float32(file: BinaryIO) -> float: return struct.unpack('f', file.read(4))[0]
-def load_float64(file: BinaryIO) -> float: return struct.unpack('d', file.read(8))[0]
+def load_float32(file: BinaryIO) -> float: return struct.unpack('<f', file.read(4))[0]
+def load_float64(file: BinaryIO) -> float: return struct.unpack('<d', file.read(8))[0]
 # fmt: on
 
 
-def load_str(file: BinaryIO) -> bytes:
+def load_str(file: BinaryIO) -> str:
     length = load_uint64(file)
-    return file.read(length)
+    return file.read(length).decode()
 
 
 def load_array(file: BinaryIO) -> list[GGUFMetaType]:
@@ -172,7 +181,7 @@ def load_header(file: BinaryIO) -> tuple[int, int]:
 def load_meta(file: BinaryIO, kv_count: int) -> GGUFMeta:
     meta: GGUFMeta = {}
     for _ in range(kv_count):
-        k = load_str(file).decode()
+        k = load_str(file)
         v = load_gguf_type(file)
         meta[k] = v
     return meta
@@ -181,9 +190,9 @@ def load_meta(file: BinaryIO, kv_count: int) -> GGUFMeta:
 def load_tensors(file: BinaryIO, tensor_count: int, tensor_alignment: int) -> list[GGUFTensor]:
     tensors_pre_data_load: list[tuple[str, list[int], GGUFType, int]] = []
     for _ in range(tensor_count):
-        name = load_str(file).decode()
+        name = load_str(file)
         n_dims = load_uint32(file)
-        shape = [load_int64(file) for _ in range(n_dims)]
+        shape = [load_uint64(file) for _ in range(n_dims)]
         dtype = GGUFType(load_uint32(file))
         data_offset = load_uint64(file)
         tensors_pre_data_load.append((name, shape, dtype, data_offset))
@@ -194,9 +203,7 @@ def load_tensors(file: BinaryIO, tensor_count: int, tensor_alignment: int) -> li
     tensors: list[GGUFTensor] = []
     for name, shape, dtype, data_offset in tensors_pre_data_load:
         file.seek(tensor_blob_offset + data_offset)
-        n_elements = reduce(lambda a, b: a * b, shape)
-        assert n_elements > 0
-        n_bytes = dtype.sizeof_tensor(n_elements)
+        n_bytes = dtype.sizeof_tensor(shape)
         data = file.read(n_bytes)
         tensors.append(GGUFTensor(name, shape, dtype, data))
 
