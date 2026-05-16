@@ -8,7 +8,16 @@ from pathlib import Path
 from typing import BinaryIO, Callable
 from enum import IntEnum
 
-__all__ = ["load", "GGUFType", "GGUFMetaType", "GGUFMeta", "GGUFTensor", "GGUFError"]
+__all__ = [
+    "load",
+    "GGUFType",
+    "GGUFMetaType",
+    "GGUFMeta",
+    "GGUFTensor",
+    "GGUFError",
+    "GGUF_TYPE_BLOCK_BYTES",
+    "GGUF_TYPE_BLOCK_ELEMENTS",
+]
 
 type GGUFMetaType = int | float | str | list[GGUFMetaType]
 type GGUFMeta = dict[str, GGUFMetaType]
@@ -66,12 +75,12 @@ class GGUFType(IntEnum):
     GGML_TYPE_COUNT = 42
 
     def block_bytes(self) -> int:
-        assert self in _BLOCK_BYTES
-        return _BLOCK_BYTES[self]
+        assert self in GGUF_TYPE_BLOCK_BYTES
+        return GGUF_TYPE_BLOCK_BYTES[self]
 
     def block_elements(self) -> int:
-        assert self in _BLOCK_ELEMENTS
-        return _BLOCK_ELEMENTS[self]
+        assert self in GGUF_TYPE_BLOCK_ELEMENTS
+        return GGUF_TYPE_BLOCK_ELEMENTS[self]
 
     def sizeof_tensor(self, shape: list[int]) -> int:
         if not shape:
@@ -211,7 +220,7 @@ def load_tensors(file: BinaryIO, tensor_count: int, tensor_alignment: int) -> li
 
 
 # fmt: off
-_BLOCK_BYTES: dict[GGUFType, int] = {
+GGUF_TYPE_BLOCK_BYTES: dict[GGUFType, int] = {
     GGUFType.GGML_TYPE_F32: 4,      GGUFType.GGML_TYPE_F16: 2,      GGUFType.GGML_TYPE_BF16: 2,     GGUFType.GGML_TYPE_F64: 8,
     GGUFType.GGML_TYPE_I8: 1,       GGUFType.GGML_TYPE_I16: 2,      GGUFType.GGML_TYPE_I32: 4,      GGUFType.GGML_TYPE_I64: 8,
 
@@ -229,7 +238,7 @@ _BLOCK_BYTES: dict[GGUFType, int] = {
     GGUFType.GGML_TYPE_TQ1_0: 54,   GGUFType.GGML_TYPE_TQ2_0: 66,
     GGUFType.GGML_TYPE_MXFP4: 17,   GGUFType.GGML_TYPE_NVFP4: 36,
 }
-_BLOCK_ELEMENTS: dict[GGUFType, int] = {
+GGUF_TYPE_BLOCK_ELEMENTS: dict[GGUFType, int] = {
     GGUFType.GGML_TYPE_F32: 1,      GGUFType.GGML_TYPE_F16: 1,      GGUFType.GGML_TYPE_BF16: 1,     GGUFType.GGML_TYPE_F64: 1,
     GGUFType.GGML_TYPE_I8: 1,       GGUFType.GGML_TYPE_I16: 1,      GGUFType.GGML_TYPE_I32: 1,      GGUFType.GGML_TYPE_I64: 1,
 

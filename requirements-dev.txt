@@ -1,0 +1,5 @@
+# PyTorch CUDA 13.0 wheels.
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# Install the project in editable mode, including the [dev] extra from pyproject.toml.
+-e .[dev]
