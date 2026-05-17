@@ -13,8 +13,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from g4b import gguf
 
-# TODO go through the print's - I can probably remove a lot of them
-
 
 @dataclass
 class Gemma4Config:
@@ -409,9 +407,13 @@ class LayerKVCache:
         t_end = self.next_t_write_offset
         t_start = max(t_end - self.max_context_len, 0)
         k, v = self.k_buf[:, :, t_start:t_end], self.v_buf[:, :, t_start:t_end]
-        # TODO for multiple tokens in q across time dim we need a custom mask here
-        # TODO implement attn manually
-        return F.scaled_dot_product_attention(q, k, v, scale=1.0, enable_gqa=True)
+
+        k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], 1)
+        v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], 1)
+
+        mask = torch.arange(t_end - q.shape[-2], t_end)[:, None] < torch.arange(t_start, t_end)[None, :]
+        mask = torch.where(mask, float("-inf"), 0)
+        return (q @ k.transpose(-1, -2) + mask).softmax(-1) @ v
 
     def add(self, k: torch.Tensor, v: torch.Tensor):
         B, H, T_new, D_k = k.shape
