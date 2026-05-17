@@ -30,3 +30,24 @@ required_dtypes = set(t.dtype for t in tensors)
 print("required dtypes:")
 for dt in required_dtypes:
     print("\t", dt)
+
+print("special tokens:")
+tokens_requiring_sanitization = []
+for token in meta["tokenizer.ggml.tokens"]:
+    if token.startswith('<') and token.endswith('>') or token.startswith('[') and token.endswith(']'):
+        print("\t", token)
+        continue
+    if ('<' in token or '>' in token or '[' in token or ']' in token) and any(c.isalpha() for c in token):
+        # This token, if processed by a naive tokenizer, could potentially allow the user to inject meta
+        #  tokens like <bos>, <turn|>, etc. because it contains either the starting marker ('<', '[') of a meta token
+        #  or the end marker ('>', ']') but is not itself a meta token it seems. E.g. consider '<eos' and '<eos>' exist
+        #  as tokens in the vocab. A malicious user could write <eos> into their prompt, then the tokenizer would
+        #  BPE merge that into an actual EOS token since '<eos>' exists. If however, neither '<eos' nor 'eos>' exist,
+        #  the tokenizer will merge the user's input into '<', 'eos', '>' but since neither '<eos' nor 'eos>' exist,
+        #  it will not perform the intermediate merge that would be required as a prerequisite for the fatal
+        #  '<' + 'eos>' -> '<eos>' merge. Therefore, if this list stays empty, then as a side effect of how BPE works,
+        #  the user will not be able to inject meta tokens and therefore in theory no sanitization logic is needed.
+        tokens_requiring_sanitization.append(token)
+print("dangerous tokens requiring sanitization logic:")
+for token in tokens_requiring_sanitization:
+    print("\t", token)

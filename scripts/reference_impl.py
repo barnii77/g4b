@@ -10,6 +10,8 @@ It is also pretty hacky at times.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import re
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from g4b import gguf
@@ -612,8 +614,78 @@ def convert_to_fp32_tensor(tensor: gguf.GGUFTensor) -> torch.Tensor:
     return out.reshape(tuple(reversed(tensor.shape)))
 
 
+class Tokenizer:
+    def __init__(self, conf: TokenizerConfig):
+        self._conf = conf
+        self._str_to_tok: dict[str, int] = {tok: i for i, tok in enumerate(conf.tokens)}
+        self._tok_to_str: list[str] = conf.tokens.copy()
+        self._byte_toks = set(self._str_to_tok[Tokenizer._byte_token(b)] for b in range(256))
+
+    @staticmethod
+    def _byte_token(b: int) -> str:
+        return f"<0x{b:02X}>"
+
+    def _bpe_merge(self, pieces: list[str]) -> list[str]:
+        while True:
+            counts = {}
+            for a, b in zip(pieces, pieces[1:]):
+                if a + b in self._str_to_tok:
+                    counts[(a, b)] = counts.get((a, b), 0) + 1
+
+            if not counts:
+                break
+
+            top_a, top_b = max(counts, key=lambda t: counts[t])
+            joined = top_a + top_b
+
+            new_pieces = [pieces[0]]
+            for b in pieces[1:]:
+                a = new_pieces[-1]
+                if a == top_a and b == top_b:
+                    new_pieces.pop()
+                    new_pieces.append(joined)
+                else:
+                    new_pieces.append(b)
+
+            if new_pieces == pieces:
+                break
+            pieces = new_pieces
+
+        return pieces
+
+    def tokenize(self, seq: str) -> list[int]:
+        seq = seq.replace(" ", "▁")  # sentencepiece whitespace normalization
+
+        out: list[int] = []
+        for chunk in re.findall("[^\\n]+|[\\n]+", seq):
+            # gemma 4 tokenizer newline pre-bpe-merge special case
+            if chunk and set(chunk) == {"\n"} and chunk in vocab:
+                out.append(self._str_to_tok[chunk])
+                continue
+
+            bpe = self._bpe_merge(list(chunk))
+
+            # replace unicode codepoints that don't exist in vocab with byte sequences
+            for piece in bpe:
+                if piece in self._str_to_tok:
+                    out.append(self._str_to_tok[piece])
+                else:
+                    out.extend(self._str_to_tok[Tokenizer._byte_token(b)] for b in piece.encode())
+
+        return out
+
+    def detokenize(self, tokens: list[int]) -> str:
+        out_enc = bytearray()
+        for tok in tokens:
+            if tok in self._byte_toks:
+                out_enc.append(int(self._tok_to_str[tok][1:-1], base=16))
+            else:
+                out_enc.extend(self._tok_to_str[tok].encode())
+        return out_enc.decode(errors="replace").replace("▁", " ")
+
+
 @torch.inference_mode()
-def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, SamplingConfig]:
+def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, SamplingConfig, Tokenizer]:
     meta, tensors = gguf.load(Path("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf"))
     check_meta(meta)
     check_dtypes_supported(tensors)
@@ -625,7 +697,9 @@ def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, Sampli
     del tensors
 
     conf, tokenizer_conf, sampling_conf = load_gemma4_conf(meta), load_tokenizer_conf(meta), load_sampling_conf(meta)
-    return Gemma4TextModel.load_from_model_dict(conf, model_dict), conf, tokenizer_conf, sampling_conf
+    model = Gemma4TextModel.load_from_model_dict(conf, model_dict)
+    tokenizer = Tokenizer(tokenizer_conf)
+    return model, conf, tokenizer_conf, sampling_conf, tokenizer
 
 
 @torch.inference_mode()
@@ -654,7 +728,7 @@ def sample_model(
         sample = samples.item()
         assert isinstance(sample, int)
         token_ids.append(sample)
-        yield detokenize(tokenizer_conf, [token_ids[-1]])
+        yield token_ids[-1]
 
 
 def check_meta(meta: gguf.GGUFMeta):
@@ -773,16 +847,14 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")
     return pred_token
 
 
-def detokenize(tokenizer_conf: TokenizerConfig, token_ids: list[int]) -> str:
-    return "".join(map(lambda i: tokenizer_conf.tokens[i], token_ids))
-
-
-# TODO primitive slow tokenize function
-
-
 if __name__ == "__main__":
-    model, gemma_config, tokenizer_config, sampling_config = load_model()
-    input_ids = [tokenizer_config.bos_token_id] + [6974, 496, 12323, 529, 506, 10308, 236761] * 200
+    model, gemma_config, tokenizer_config, sampling_config, tokenizer = load_model()
+    # TODO figure out how to restrict the api from providing special priviledged tokens to the model
+    #  (<unused0>, <pad>, <|turn>, ... many more).
+    #  I think I actually don't need any sanitization logic... see dump_gguf.py for more
+    # TODO the detokenization here is not really correct, e.g. if the model outputs byte tokens <0xDE><0xAD><0xBE><0xEF>
+    #  it will not correctly utf-8 decode this sequence.
+    input_ids = [tokenizer_config.bos_token_id] + tokenizer.tokenize("Please let me know if")
     for tok in sample_model(model, gemma_config, tokenizer_config, sampling_config, input_ids, 42):
-        print(tok, end="")
+        print(tokenizer.detokenize([tok]), end="")
     print()
