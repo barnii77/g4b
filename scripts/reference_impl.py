@@ -13,9 +13,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from g4b import gguf
 
-torch.inference_mode()
-
-# TODO go through the print's - I can probably remove all of them
+# TODO go through the print's - I can probably remove a lot of them
 
 
 @dataclass
@@ -67,8 +65,7 @@ class TokenizerConfig:
 
 
 def make_linear(*shape: int, w: torch.Tensor):
-    w = w.T
-    assert shape == w.shape, f"expected weight tensor shape {shape}, but got {w.shape}"
+    assert shape == w.T.shape, f"expected weight tensor shape {shape}, but got {w.shape}"
     lin = nn.Linear(*shape, bias=False)
     lin.weight = nn.Parameter(w)
     return lin
@@ -119,8 +116,9 @@ class Embeddings(nn.Module):
 
 
 class PerLayerEmbeddings(nn.Module):
-    def __init__(self, conf: Gemma4Config, out_proj: torch.Tensor, out_norm: RMSNorm):
+    def __init__(self, conf: Gemma4Config, gate_proj: torch.Tensor, out_proj: torch.Tensor, out_norm: RMSNorm):
         super().__init__()
+        self.gate_proj = make_linear(conf.embedding_length, conf.embedding_length_per_layer_input, w=gate_proj)
         self.out_proj = make_linear(conf.embedding_length_per_layer_input, conf.embedding_length, w=out_proj)
         self.out_norm = out_norm
 
@@ -152,6 +150,7 @@ class MLP(nn.Module):
         return self.output_norm(y)
 
 
+# TODO this currently does not implement prefill correctly.
 class Attention(nn.Module):
     def __init__(
         self,
@@ -176,7 +175,7 @@ class Attention(nn.Module):
         self.is_swa = conf.attention_sliding_window_pattern[layer_idx]
         self.previous_same_type_layer_idx = None
         for i in reversed(range(layer_idx)):
-            if conf.attention_sliding_window_pattern[i] == self.is_swa:
+            if conf.attention_sliding_window_pattern[i] == self.is_swa and self.n_layers - i > self.n_shared_kv_layers:
                 self.previous_same_type_layer_idx = i
                 break
 
@@ -216,9 +215,9 @@ class Attention(nn.Module):
             # the context window overflows and the kv cache has to truncate, for the newly inserted keys/values.
             time_offset = kv_cache[self.layer_idx].base_time_offset
             # compute KV and add to cache
-            k = self.k_norm(self.k_proj(x)).reshape((B, T, H_kv, D_qk)).transpose(1, 2)
-            v = self.v_norm(self.v_proj(x)).reshape((B, T, H_kv, D_v)).transpose(1, 2)
-            k = self.rope(k, time_offset)
+            k = self.k_norm(self.k_proj(x).reshape((B, T, H_kv, D_qk)).transpose(1, 2))
+            v = self.v_norm(self.v_proj(x).reshape((B, T, H_kv, D_v)).transpose(1, 2))
+            (k,) = self.rope(k, base_time_offset=time_offset)
             kv_cache[self.layer_idx].add(k, v)
             retrieve_layer_idx = self.layer_idx
         else:
@@ -228,9 +227,10 @@ class Attention(nn.Module):
             # add of previous layer already advanced base_time_offset, so we un-advance
             time_offset = kv_cache[retrieve_layer_idx].base_time_offset - T
 
-        q = self.q_norm(self.q_proj(x)).reshape((B, T, H_q, D_qk)).transpose(1, 2)
-        q = self.rope(q, time_offset)
+        q = self.q_norm(self.q_proj(x).reshape((B, T, H_q, D_qk)).transpose(1, 2))
+        (q,) = self.rope(q, base_time_offset=time_offset)
         out = kv_cache[retrieve_layer_idx].retrieve(q)
+        out = out.transpose(1, 2).reshape((B, T, H_q * D_v))
         out = self.o_norm(self.o_proj(out))
         return out
 
@@ -245,8 +245,8 @@ class RoPE(nn.Module):
             self.freqs /= rope_freqs
 
     def forward(self, *tensors: torch.Tensor, base_time_offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        T = tensors[0].shape[1]
-        assert all(t.shape[1] == T for t in tensors)
+        T = tensors[0].shape[-2]
+        assert all(t.shape[-2] == T for t in tensors)
 
         theta = torch.arange(base_time_offset, base_time_offset + T).reshape((T, 1)) * self.freqs
 
@@ -288,6 +288,7 @@ class DecoderLayer(nn.Module):
         mlp_down_proj: torch.Tensor,
         mlp_input_norm: RMSNorm,
         mlp_output_norm: RMSNorm,
+        ple_gate_proj: torch.Tensor,
         ple_out_proj: torch.Tensor,
         ple_out_norm: RMSNorm,
         rope_freqs: torch.Tensor,
@@ -309,7 +310,7 @@ class DecoderLayer(nn.Module):
             rope_freqs,
         )
         self.mlp = MLP(conf, mlp_up_proj, mlp_gate_proj, mlp_down_proj, mlp_input_norm, mlp_output_norm)
-        self.ple = PerLayerEmbeddings(conf, ple_out_proj, ple_out_norm)
+        self.ple = PerLayerEmbeddings(conf, ple_gate_proj, ple_out_proj, ple_out_norm)
         self.layer_output_scale = layer_output_scale
 
     def forward(self, x: torch.Tensor, ple: torch.Tensor, kv_cache: KVCaches):
@@ -339,6 +340,7 @@ class DecoderLayer(nn.Module):
             mlp_down_proj=by_name("ffn_down"),
             mlp_input_norm=RMSNorm(conf, by_name("ffn_norm")),
             mlp_output_norm=RMSNorm(conf, by_name("post_ffw_norm")),
+            ple_gate_proj=by_name("inp_gate"),
             ple_out_proj=by_name("proj"),
             ple_out_norm=RMSNorm(conf, by_name("post_norm")),
             rope_freqs=m["rope_freqs.weight"],
@@ -398,12 +400,12 @@ class Gemma4TextModel(nn.Module):
 class LayerKVCache:
     def __init__(self, conf: Gemma4Config, layer_idx: int):
         self.is_swa = conf.attention_sliding_window_pattern[layer_idx]
-        self.max_context_len = conf.context_length if self.is_swa else conf.attention_sliding_window
+        self.max_context_len = conf.attention_sliding_window if self.is_swa else conf.context_length
         self.buffer_t_size = 4 * self.max_context_len
         # batch size fixed to 1 for now
         B, H = 1, conf.attention_head_count_kv
-        D_k = conf.attention_key_length if self.is_swa else conf.attention_key_length_swa
-        D_v = conf.attention_value_length if self.is_swa else conf.attention_value_length_swa
+        D_k = conf.attention_key_length_swa if self.is_swa else conf.attention_key_length
+        D_v = conf.attention_value_length_swa if self.is_swa else conf.attention_value_length
         self.k_buf = torch.zeros((B, H, self.buffer_t_size, D_k))
         self.v_buf = torch.zeros((B, H, self.buffer_t_size, D_v))
         self.next_t_write_offset = 0
@@ -412,8 +414,10 @@ class LayerKVCache:
     def retrieve(self, q: torch.Tensor) -> torch.Tensor:
         t_end = self.next_t_write_offset
         t_start = max(t_end - self.max_context_len, 0)
-        k, v = self.k_buf[:, t_start:t_end], self.v_buf[:, t_start:t_end]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0, enable_gqa=True)
+        k, v = self.k_buf[:, :, t_start:t_end], self.v_buf[:, :, t_start:t_end]
+        # TODO for multiple tokens in q across time dim we need a custom mask here
+        # TODO implement attn manually
+        return F.scaled_dot_product_attention(q, k, v, scale=1.0, enable_gqa=True)
 
     def add(self, k: torch.Tensor, v: torch.Tensor):
         B, H, T_new, D_k = k.shape
@@ -424,21 +428,22 @@ class LayerKVCache:
 
         if T_new >= self.max_context_len:
             # cap T_new at max context len
-            k = k[:, -self.max_context_len :]
-            v = v[:, -self.max_context_len :]
+            k = k[:, :, -self.max_context_len :]
+            v = v[:, :, -self.max_context_len :]
             T_new = self.max_context_len
 
         if self.next_t_write_offset + T_new >= self.buffer_t_size:
             # buffer full - rotate to the beginning
             T_old = self.max_context_len - T_new
             if T_new != self.max_context_len:
-                self.k_buf[:, :T_old] = self.k_buf[:, -T_old:]
-                self.v_buf[:, :T_old] = self.v_buf[:, -T_old:]
+                self.k_buf[:, :, :T_old] = self.k_buf[:, :, -T_old:]
+                self.v_buf[:, :, :T_old] = self.v_buf[:, :, -T_old:]
             self.next_t_write_offset = T_old
+            self.completed_buffer_rotations += 1
 
         # append
-        self.k_buf[:, self.next_t_write_offset : self.next_t_write_offset + T_new] = k
-        self.v_buf[:, self.next_t_write_offset : self.next_t_write_offset + T_new] = v
+        self.k_buf[:, :, self.next_t_write_offset : self.next_t_write_offset + T_new] = k
+        self.v_buf[:, :, self.next_t_write_offset : self.next_t_write_offset + T_new] = v
         self.next_t_write_offset += T_new
 
     @property
@@ -583,6 +588,7 @@ def convert_to_fp32_tensor(tensor: gguf.GGUFTensor) -> torch.Tensor:
     return out.reshape(tuple(reversed(tensor.shape)))
 
 
+@torch.inference_mode()
 def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, SamplingConfig]:
     meta, tensors = gguf.load(Path("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf"))
     check_meta(meta)
@@ -594,15 +600,11 @@ def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, Sampli
         model_dict[t.name] = tensor
     del tensors
 
-    # TODO convert to nn.Module's instead and return
-    print("Model dict:")
-    for k, v in model_dict.items():
-        print(k, ":", None if v is None else v.std() if not v.std().isnan().item() else 0)
-
     conf, tokenizer_conf, sampling_conf = load_gemma4_conf(meta), load_tokenizer_conf(meta), load_sampling_conf(meta)
     return Gemma4TextModel.load_from_model_dict(conf, model_dict), conf, tokenizer_conf, sampling_conf
 
 
+@torch.inference_mode()
 def sample_model(
     model: Gemma4TextModel,
     conf: Gemma4Config,
@@ -610,22 +612,20 @@ def sample_model(
     sampling_conf: SamplingConfig,
     input_ids: list[int],
     seed: int,
-) -> str:
+):
     torch.random.manual_seed(seed)
     kv_cache = make_kv_caches(conf)
     token_ids = input_ids.copy()
+    # TODO handle prefill
 
     while token_ids[-1] != tokenizer_conf.eos_token_id:
-        logits = model(token_ids, kv_cache)
+        logits = model(torch.tensor([token_ids[-1]]).reshape((1, -1)), kv_cache)
         logits /= sampling_conf.temperature
-        samples = top_k_top_p_filtering(logits, sampling_conf.top_k, sampling_conf.top_p)
+        samples = top_k_top_p_filtering(logits.reshape((1, -1)), sampling_conf.top_k, sampling_conf.top_p)
         sample = samples.item()
         assert isinstance(sample, int)
         token_ids.append(sample)
-        print("new token", sample)
-
-    print(token_ids)
-    return detokenize(tokenizer_conf, token_ids)
+        yield detokenize(tokenizer_conf, [token_ids[-1]])
 
 
 def check_meta(meta: gguf.GGUFMeta):
@@ -745,9 +745,16 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")
 
 
 def detokenize(tokenizer_conf: TokenizerConfig, token_ids: list[int]) -> str:
-    return str(token_ids)
+    return "".join(map(lambda i: tokenizer_conf.tokens[i], token_ids))
+
+
+# TODO primitive slow tokenize function
 
 
 if __name__ == "__main__":
     model, gemma_config, tokenizer_config, sampling_config = load_model()
-    print(sample_model(model, gemma_config, tokenizer_config, sampling_config, [2], 42))
+    for tok in sample_model(
+        model, gemma_config, tokenizer_config, sampling_config, [tokenizer_config.bos_token_id], 42
+    ):
+        print(tok, end="")
+    print()
