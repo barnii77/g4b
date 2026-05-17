@@ -148,7 +148,6 @@ class MLP(nn.Module):
         return self.output_norm(y)
 
 
-# TODO this currently does not implement prefill correctly.
 class Attention(nn.Module):
     def __init__(
         self,
@@ -612,14 +611,15 @@ def sample_model(
     torch.random.manual_seed(seed)
     kv_cache = make_kv_caches(conf)
     token_ids = input_ids.copy()
-    # TODO handle prefill
+    prefilled_until = 0
 
     while token_ids[-1] != tokenizer_conf.eos_token_id:
-        logits = model(torch.tensor([token_ids[-1]]).reshape((1, -1)), kv_cache)
+        logits = model(torch.tensor([token_ids[prefilled_until:]]).reshape((1, -1)), kv_cache)[:, -1, :]
         logits /= sampling_conf.temperature
-        samples = top_k_top_p_filtering(logits.reshape((1, -1)), sampling_conf.top_k, sampling_conf.top_p)
+        samples = top_k_top_p_filtering(logits, sampling_conf.top_k, sampling_conf.top_p)
         sample = samples.item()
         assert isinstance(sample, int)
+        prefilled_until = len(token_ids)
         token_ids.append(sample)
         yield detokenize(tokenizer_conf, [token_ids[-1]])
 
@@ -749,8 +749,7 @@ def detokenize(tokenizer_conf: TokenizerConfig, token_ids: list[int]) -> str:
 
 if __name__ == "__main__":
     model, gemma_config, tokenizer_config, sampling_config = load_model()
-    for tok in sample_model(
-        model, gemma_config, tokenizer_config, sampling_config, [tokenizer_config.bos_token_id], 43
-    ):
+    input_ids = [tokenizer_config.bos_token_id, 6974, 496, 12323, 529, 506, 10308, 236761]
+    for tok in sample_model(model, gemma_config, tokenizer_config, sampling_config, input_ids, 42):
         print(tok, end="")
     print()
