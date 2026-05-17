@@ -852,6 +852,7 @@ if __name__ == "__main__":
     # TODO figure out how to restrict the api from providing special priviledged tokens to the model
     #  (<unused0>, <pad>, <|turn>, ... many more).
     #  I think I actually don't need any sanitization logic... see dump_gguf.py for more
+    # TODO if I end up writing an optimized tokenizer I have use the efficient priority queue BPE algorithm
     # TODO the detokenization here is not really correct, e.g. if the model outputs byte tokens <0xDE><0xAD><0xBE><0xEF>
     #  it will not correctly utf-8 decode this sequence.
     input_ids = [tokenizer_config.bos_token_id] + tokenizer.tokenize("Please let me know if")
