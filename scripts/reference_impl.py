@@ -657,9 +657,9 @@ class Tokenizer:
         seq = seq.replace(" ", "▁")  # sentencepiece whitespace normalization
 
         out: list[int] = []
-        for chunk in re.findall("[^\\n]+|[\\n]+", seq):
+        for chunk in re.findall(r"[^\n]+|\n+", seq):
             # gemma 4 tokenizer newline pre-bpe-merge special case
-            if chunk and set(chunk) == {"\n"} and chunk in vocab:
+            if chunk and set(chunk) == {"\n"} and chunk in self._str_to_tok:
                 out.append(self._str_to_tok[chunk])
                 continue
 
