@@ -4,6 +4,7 @@ It is inefficient in many ways, e.g.
     - it dequantizes everything to fp32 at load time.
     - it doesn't try to fuse any kernels.
     - it doesn't use any torch.nn prebuilt modules (except nn.Linear)
+It is also pretty hacky at times.
 """
 
 import torch
@@ -388,9 +389,6 @@ class Gemma4TextModel(nn.Module):
         )
 
 
-# TODO the implementation of SWA prefill here is slightly wrong actually because add truncates KVs with T > context_len,
-#  but since the context_len for SWA LayerKVCache's is actually not the global context len and global attn can
-#  absolutely see the truncated tokens, this breaks if you prefill more than 512 tokens.
 class LayerKVCache:
     def __init__(self, conf: Gemma4Config, layer_idx: int):
         self.is_swa = conf.attention_sliding_window_pattern[layer_idx]
