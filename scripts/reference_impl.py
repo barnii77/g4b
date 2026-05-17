@@ -388,6 +388,9 @@ class Gemma4TextModel(nn.Module):
         )
 
 
+# TODO the implementation of SWA prefill here is slightly wrong actually because add truncates KVs with T > context_len,
+#  but since the context_len for SWA LayerKVCache's is actually not the global context len and global attn can
+#  absolutely see the truncated tokens, this breaks if you prefill more than 512 tokens.
 class LayerKVCache:
     def __init__(self, conf: Gemma4Config, layer_idx: int):
         self.is_swa = conf.attention_sliding_window_pattern[layer_idx]
@@ -400,17 +403,40 @@ class LayerKVCache:
         self.k_buf = torch.zeros((B, H, self.buffer_t_size, D_k))
         self.v_buf = torch.zeros((B, H, self.buffer_t_size, D_v))
         self.next_t_write_offset = 0
-        self.completed_buffer_rotations = 0
+        self.absolute_t = 0
+        self.prefill = False
+        self.remembered_prefill_k = None
+        self.remembered_prefill_v = None
+
+    def set_prefill(self):
+        self.prefill = True
+
+    def set_decode(self):
+        self.prefill = False
+        self.remembered_prefill_k = None
+        self.remembered_prefill_v = None
 
     def retrieve(self, q: torch.Tensor) -> torch.Tensor:
-        t_end = self.next_t_write_offset
-        t_start = max(t_end - self.max_context_len, 0)
-        k, v = self.k_buf[:, :, t_start:t_end], self.v_buf[:, :, t_start:t_end]
+        if self.prefill and self.remembered_prefill_k is not None:
+            assert self.remembered_prefill_v is not None
+            k, v = self.remembered_prefill_k, self.remembered_prefill_v
+            t_start, t_end = self.absolute_t - self.remembered_prefill_k.shape[-2], self.absolute_t
+            needs_swa_mask = self.is_swa
+        else:
+            phys_t_end = self.next_t_write_offset
+            phys_t_start = max(phys_t_end - self.max_context_len, 0)
+            k, v = self.k_buf[:, :, phys_t_start:phys_t_end], self.v_buf[:, :, phys_t_start:phys_t_end]
+            t_start, t_end = self.absolute_t - min(self.max_context_len, self.next_t_write_offset), self.absolute_t
+            needs_swa_mask = False
 
         k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], 1)
         v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], 1)
 
-        mask = torch.arange(t_end - q.shape[-2], t_end)[:, None] < torch.arange(t_start, t_end)[None, :]
+        q_pos = torch.arange(t_end - q.shape[-2], t_end)[:, None]
+        k_pos = torch.arange(t_start, t_end)[None, :]
+        mask = q_pos < k_pos
+        if needs_swa_mask:
+            mask = torch.logical_or(mask, q_pos - k_pos >= self.max_context_len)
         mask = torch.where(mask, float("-inf"), 0)
         return (q @ k.transpose(-1, -2) + mask).softmax(-1) @ v
 
@@ -421,29 +447,34 @@ class LayerKVCache:
         assert self.k_buf.shape == (B, H, self.buffer_t_size, D_k)
         assert self.v_buf.shape == (B, H, self.buffer_t_size, D_v)
 
-        if T_new >= self.max_context_len:
+        if self.prefill and T_new > self.max_context_len:
+            self.remembered_prefill_k = k
+            self.remembered_prefill_v = v
+            self.absolute_t += T_new - self.max_context_len  # The rest is added during append
+
+        if T_new > self.max_context_len:
             # cap T_new at max context len
             k = k[:, :, -self.max_context_len :]
             v = v[:, :, -self.max_context_len :]
             T_new = self.max_context_len
 
-        if self.next_t_write_offset + T_new >= self.buffer_t_size:
+        if self.next_t_write_offset + T_new > self.buffer_t_size:
             # buffer full - rotate to the beginning
             T_old = self.max_context_len - T_new
             if T_new != self.max_context_len:
-                self.k_buf[:, :, :T_old] = self.k_buf[:, :, -T_old:]
-                self.v_buf[:, :, :T_old] = self.v_buf[:, :, -T_old:]
+                self.k_buf[:, :, :T_old] = self.k_buf[:, :, self.next_t_write_offset - T_old : self.next_t_write_offset]
+                self.v_buf[:, :, :T_old] = self.v_buf[:, :, self.next_t_write_offset - T_old : self.next_t_write_offset]
             self.next_t_write_offset = T_old
-            self.completed_buffer_rotations += 1
 
         # append
         self.k_buf[:, :, self.next_t_write_offset : self.next_t_write_offset + T_new] = k
         self.v_buf[:, :, self.next_t_write_offset : self.next_t_write_offset + T_new] = v
         self.next_t_write_offset += T_new
+        self.absolute_t += T_new
 
     @property
     def base_time_offset(self) -> int:
-        return self.next_t_write_offset + (self.buffer_t_size - self.max_context_len) * self.completed_buffer_rotations
+        return self.absolute_t
 
 
 type KVCaches = list[LayerKVCache]
@@ -611,15 +642,19 @@ def sample_model(
     torch.random.manual_seed(seed)
     kv_cache = make_kv_caches(conf)
     token_ids = input_ids.copy()
-    prefilled_until = 0
+
+    for kv in kv_cache:
+        kv.set_prefill()
+    model(torch.tensor([*token_ids[:-1]]).reshape((1, -1)), kv_cache)
+    for kv in kv_cache:
+        kv.set_decode()
 
     while token_ids[-1] != tokenizer_conf.eos_token_id:
-        logits = model(torch.tensor([token_ids[prefilled_until:]]).reshape((1, -1)), kv_cache)[:, -1, :]
+        logits = model(torch.tensor([token_ids[-1]]).reshape((1, -1)), kv_cache)[:, -1, :]
         logits /= sampling_conf.temperature
         samples = top_k_top_p_filtering(logits, sampling_conf.top_k, sampling_conf.top_p)
         sample = samples.item()
         assert isinstance(sample, int)
-        prefilled_until = len(token_ids)
         token_ids.append(sample)
         yield detokenize(tokenizer_conf, [token_ids[-1]])
 
@@ -749,7 +784,7 @@ def detokenize(tokenizer_conf: TokenizerConfig, token_ids: list[int]) -> str:
 
 if __name__ == "__main__":
     model, gemma_config, tokenizer_config, sampling_config = load_model()
-    input_ids = [tokenizer_config.bos_token_id, 6974, 496, 12323, 529, 506, 10308, 236761]
+    input_ids = [tokenizer_config.bos_token_id] + [6974, 496, 12323, 529, 506, 10308, 236761] * 200
     for tok in sample_model(model, gemma_config, tokenizer_config, sampling_config, input_ids, 42):
         print(tok, end="")
     print()
