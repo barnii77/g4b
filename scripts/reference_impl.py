@@ -244,29 +244,23 @@ class RoPE(nn.Module):
         if rope_freqs is not None:
             self.freqs /= rope_freqs
 
-    def forward(self, *tensors: torch.Tensor, base_time_offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def rotate_half(x: torch.Tensor):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def forward(self, *tensors: torch.Tensor, base_time_offset: int = 0) -> tuple[torch.Tensor, ...]:
         T = tensors[0].shape[-2]
         assert all(t.shape[-2] == T for t in tensors)
 
         theta = torch.arange(base_time_offset, base_time_offset + T).reshape((T, 1)) * self.freqs
+        theta = torch.cat([theta, theta], dim=-1)
 
-        sin = torch.sin(theta).unsqueeze(0)  # shape: (1, seq_len, head_dim/2)
-        cos = torch.cos(theta).unsqueeze(0)  # shape: (1, seq_len, head_dim/2)
+        sin = theta.sin()  # shape: (seq_len, head_dim)
+        cos = theta.cos()  # shape: (seq_len, head_dim)
 
-        out = []
-        for tensor in tensors:
-            t_even = tensor[..., ::2]
-            t_odd = tensor[..., 1::2]
-
-            rot_even = t_even * cos - t_odd * sin
-            rot_odd = t_even * sin + t_odd * cos
-
-            rotated = torch.empty_like(tensor)
-            rotated[..., ::2] = rot_even
-            rotated[..., 1::2] = rot_odd
-            out.append(rotated)
-
-        return tuple(out)
+        return tuple(tensor * cos + RoPE.rotate_half(tensor) * sin for tensor in tensors)
 
 
 class DecoderLayer(nn.Module):
@@ -754,7 +748,7 @@ def detokenize(tokenizer_conf: TokenizerConfig, token_ids: list[int]) -> str:
 if __name__ == "__main__":
     model, gemma_config, tokenizer_config, sampling_config = load_model()
     for tok in sample_model(
-        model, gemma_config, tokenizer_config, sampling_config, [tokenizer_config.bos_token_id], 42
+        model, gemma_config, tokenizer_config, sampling_config, [tokenizer_config.bos_token_id], 43
     ):
         print(tok, end="")
     print()
