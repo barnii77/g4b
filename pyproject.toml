@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools==82.0.1", "wheel==0.47.0"]
 build-backend = "setuptools.build_meta"
 
 
@@ -17,12 +17,13 @@ authors = [
 
 dependencies = [
     "triton==3.7.0",
+    "cuda-core[cu13]==1.0.1",
 ]
 
 
 [project.optional-dependencies]
 dev = [
-    "black>=24.0",
+    "black==26.5.1",
     "torch",
 ]
 

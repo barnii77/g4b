@@ -104,7 +104,7 @@ class GGUFType(IntEnum):
         return str(self)
 
 
-@dataclass
+@dataclass(frozen=True)
 class GGUFTensor:
     name: str
     shape: list[int]
