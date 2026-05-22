@@ -2,8 +2,11 @@
 #  autotune first and only then when that is done, record. Also, before recording, make sure to call stream.sync()
 #  on all streams.
 
+import importlib.util
+import sys
 from cuda.core import Device, Stream, Buffer
 from g4b.utils import runtime_error
+from g4b import _torch_stub
 
 device: Device
 compute_stream: Stream
@@ -53,7 +56,13 @@ def _init_cuda(device_id: int):
 def _init_triton():
     """Monkey patch the triton device and stream getters to avoid a torch dependency."""
     global _triton_current_device, _triton_current_stream
-    import triton.runtime.driver  # I import triton here to ensure evil magic can only happen after _init_cuda
+
+    # install torch stub first so even without pytorch, triton will register an active runtime driver for cuda
+    if not _real_torch_available():
+        sys.modules["torch"] = _torch_stub
+
+    # now we're all set up to allow evil magic
+    import triton.runtime.driver
 
     triton.runtime.driver.active.get_current_stream = lambda device_id: (
         int(_triton_current_stream.handle)
@@ -63,3 +72,7 @@ def _init_triton():
     triton.runtime.driver.active.get_current_device = lambda: int(_triton_current_device.device_id)
     _triton_current_device = device
     _triton_current_stream = compute_stream
+
+
+def _real_torch_available() -> bool:
+    return importlib.util.find_spec("torch") is not None
