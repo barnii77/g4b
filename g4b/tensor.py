@@ -37,16 +37,12 @@ q6_k = DType("q6_k", "uint8")
 @dataclass(frozen=True)
 class Tensor:
     buffer: Buffer
-    type: DType
+    dtype: DType
     shape: Sequence[int]
     stride: Sequence[int]
 
     def data_ptr(self) -> int:
         return int(self.buffer.handle)
-
-    @property
-    def dtype(self) -> tl.dtype:
-        return self.type.tl_dtype
 
     @classmethod
     def from_bytes(cls, data: bytes, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):

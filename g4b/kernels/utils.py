@@ -1,3 +1,5 @@
+from triton import language as tl
+from triton.experimental.gluon import language as gl
 from g4b import tensor
 
 
@@ -13,10 +15,34 @@ def _normalize_strides(t) -> list[int]:
     raise RuntimeError("Failed to normalize tensor stride into list[int]")
 
 
+class _TritonTensorAdapter:
+    def __init__(self, t: "tensor.Tensor"):
+        self.tensor = t
+
+    def data_ptr(self) -> int:
+        return self.tensor.data_ptr()
+
+    @property
+    def dtype(self) -> tl.dtype:
+        return self.tensor.dtype.tl_dtype
+
+
+class _GluonTensorAdapter:
+    def __init__(self, t: "tensor.Tensor"):
+        self.tensor = t
+
+    def data_ptr(self) -> int:
+        return self.tensor.data_ptr()
+
+    @property
+    def dtype(self) -> gl.dtype:
+        return self.tensor.dtype.gl_dtype
+
+
 def _unpack_tensors_for_kernel(kernel, kwargs):
     """
     Unpack all tensor arguments {k}={v} into:
-    - {k}_ptr={v} (auto converted by triton to pointer type),
+    - {k}_ptr={gluon_adapter(v) | triton_adapter(v)} (which itself is auto converted by triton to pointer type),
     - foreach dim N:
         - {k}_shape{N}
         - {k}_stride{N}
@@ -27,15 +53,18 @@ def _unpack_tensors_for_kernel(kernel, kwargs):
     """
 
     unpacked = {}
+    is_gluon = getattr(kernel, "is_gluon", lambda: False)()
 
     def add_if_needed(k, v):
         if k in kernel.signature.parameters:
             unpacked[k] = v
 
     for k, v in kwargs.items():
-        if isinstance(v, tensor.Tensor) or _is_tensor_like(v):  # _is_tensor_like(v) to allow torch Tensors
+        # Check _is_tensor_like(v) to allow torch Tensors as well for testing
+        if (is_g4b_tensor := isinstance(v, tensor.Tensor)) or _is_tensor_like(v):
             # unpack tensors into {k}_ptr, {k}_stride{N}, and {k}_shape{N}
-            add_if_needed(f"{k}_ptr", v)  # triton will turn it into a pointer using v.data_ptr()
+            v_ptr = _GluonTensorAdapter(v) if is_gluon else _TritonTensorAdapter(v) if is_g4b_tensor else v
+            add_if_needed(f"{k}_ptr", v_ptr)
             stride = _normalize_strides(v)
             assert len(v.shape) == len(stride)
             for dim, (shape, stride) in enumerate(zip(v.shape, stride)):

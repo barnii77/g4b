@@ -81,7 +81,7 @@ def _rmsnorm_x_4d_to_y(
     return launch[_rmsnorm_x_4d_to_y_kernel, grid_fn](
         y=y,
         x=x,
-        ACCUM_DTYPE=(accum_dtype or x.type).tl_dtype,
+        ACCUM_DTYPE=(accum_dtype or x.dtype).tl_dtype,
         OUTPUT_ACTION=output_action,
         # TODO autotune these
         BLOCKSIZE2=1,
