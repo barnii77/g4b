@@ -57,13 +57,17 @@ class Tensor:
     def to_bytes(self) -> bytes:
         return _copy_dtoh_sync(self.buffer, device.side_stream)
 
+    def is_contiguous(self) -> bool:
+        return self.stride == contiguous_strides_for_shape(self.shape)
+
     def reshape(self, shape: Sequence[int]) -> Tensor:
         # TODO validate if this reshape is actually possible given the strides and update strides properly
-        assert self.stride == contiguous_strides_for_shape(self.shape), "reshape of non-contiguous tensor unsupported"
+        assert self.is_contiguous(), "reshape of non-contiguous tensor unsupported"
+        shape = canonicalize_shape_for_size(shape, math.prod(self.shape))
         return Tensor(
             self.buffer,
             self.dtype,
-            canonicalize_shape_for_size(shape, math.prod(self.shape)),
+            shape,
             contiguous_strides_for_shape(shape),
         )
 

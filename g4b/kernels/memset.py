@@ -2,7 +2,6 @@ import triton
 from triton import language as tl
 from g4b.tensor import Tensor, uint8
 from g4b.kernels.utils import launch
-from g4b.utils import contiguous_strides_for_shape
 
 
 @triton.autotune(
@@ -24,7 +23,7 @@ def _memset_contiguous_kernel(x_ptr, x_shape0: tl.constexpr, value: tl.constexpr
 
 
 def memset_contiguous(x: Tensor, value: int):
-    assert x.stride == contiguous_strides_for_shape(x.shape)
+    assert x.is_contiguous()
     assert 0 <= value <= 255
     x = x.reshape((-1,)).view(uint8)
     grid_fn = lambda META: (triton.cdiv(x.shape[0], META["BLOCKSIZE"]),)
