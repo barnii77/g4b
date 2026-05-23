@@ -1,4 +1,5 @@
 import ctypes
+import math
 from triton import language as tl
 from triton.experimental.gluon import language as gl
 from cuda.core import Buffer
@@ -6,7 +7,7 @@ from cuda.bindings import runtime as cudart
 from dataclasses import dataclass
 from typing import Sequence
 from g4b import device
-from g4b.utils import cuda_check
+from g4b.utils import cuda_check, contiguous_strides_for_shape, canonicalize_shape_for_size, to_int_exact
 
 
 @dataclass(frozen=True)
@@ -48,16 +49,33 @@ class Tensor:
     @classmethod
     def from_bytes(cls, data: bytes, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):
         if strides is None:
-            strides = [1]
-            for s in reversed(shape[1:]):
-                strides.append(strides[-1] * s)
-            strides.reverse()
+            strides = contiguous_strides_for_shape(shape)
         buf = device.alloc(len(data))
         _copy_htod_sync(buf, data, device.side_stream)
         return cls(buf, dtype, shape, strides)
 
     def to_bytes(self) -> bytes:
         return _copy_dtoh_sync(self.buffer, device.side_stream)
+
+    def reshape(self, shape: Sequence[int]) -> Tensor:
+        # TODO validate if this reshape is actually possible given the strides and update strides properly
+        assert self.stride == contiguous_strides_for_shape(self.shape), "reshape of non-contiguous tensor unsupported"
+        return Tensor(
+            self.buffer,
+            self.dtype,
+            canonicalize_shape_for_size(shape, math.prod(self.shape)),
+            contiguous_strides_for_shape(shape),
+        )
+
+    def view(self, dtype: DType) -> Tensor:
+        # attempts to resize last dim, fails if shape[-1] or stride[-1] not divisible to cleanly fit new dtype
+        size_ratio = self.dtype.tl_dtype.itemsize / dtype.tl_dtype.itemsize
+        return Tensor(
+            self.buffer,
+            dtype,
+            (*self.shape[:-1], to_int_exact(self.shape[-1] * size_ratio)),
+            (*self.stride[:-1], to_int_exact(self.stride[-1] * size_ratio)),
+        )
 
 
 def _copy_htod_sync(dst, data: bytes | bytearray | memoryview, stream):

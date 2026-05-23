@@ -849,7 +849,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")
 
 if __name__ == "__main__":
     model, gemma_config, tokenizer_config, sampling_config, tokenizer = load_model()
-    # TODO figure out how to restrict the api from providing special priviledged tokens to the model
+    # TODO figure out how to restrict the api from providing special privileged tokens to the model
     #  (<unused0>, <pad>, <|turn>, ... many more).
     #  I think I actually don't need any sanitization logic... see dump_gguf.py for more
     # TODO if I end up writing an optimized tokenizer I have use the efficient priority queue BPE algorithm

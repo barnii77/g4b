@@ -1,4 +1,5 @@
 from triton import language as tl
+from triton.runtime import Autotuner, Heuristics
 from triton.experimental.gluon import language as gl
 from g4b import tensor
 
@@ -56,7 +57,12 @@ def _unpack_tensors_for_kernel(kernel, kwargs):
     is_gluon = getattr(kernel, "is_gluon", lambda: False)()
 
     def add_if_needed(k, v):
-        if k in kernel.signature.parameters:
+        unwrapped_kernel = kernel
+        if isinstance(unwrapped_kernel, Autotuner):
+            unwrapped_kernel = kernel.fn
+        if isinstance(kernel, Heuristics):
+            unwrapped_kernel = unwrapped_kernel.fn
+        if k in unwrapped_kernel.signature.parameters:
             unpacked[k] = v
 
     for k, v in kwargs.items():

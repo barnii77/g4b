@@ -5,6 +5,10 @@ from g4b.scheduler import Scheduler
 from g4b.tensor import Tensor
 from g4b.config import Config
 
+# TODO dtype suffix in addition to shape suffix
+# TODO I can specialize the kernels for literally the exact tensor shapes, i.e. make all shapes and strides constexpr
+# TODO make an explanation of all the different shape suffix letters
+
 # TODO I cannot bake in the ple_proj into ple_lookup because they are both quantized, so I'll need a kernel that
 #  computes both at the start of the forward pass.
 
