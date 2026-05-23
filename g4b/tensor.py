@@ -34,6 +34,7 @@ q5_k = DType("q5_k", "uint8")
 q6_k = DType("q6_k", "uint8")
 
 
+# TODO reshape, transpose, permute, view(dtype) methods... but no methods that would require kernel launches
 @dataclass(frozen=True)
 class Tensor:
     buffer: Buffer
