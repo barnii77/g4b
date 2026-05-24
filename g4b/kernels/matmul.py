@@ -24,10 +24,11 @@ def _make_config_pre_hook(split_k: int):
     def pre_hook(args):
         shape = [args["c_shape0"], args["c_shape1"], args["c_shape2"]]
         strides = [args["c_stride0"], args["c_stride1"], args["c_stride2"]]
-        shape_norm = shape[:-1]
-        strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
-        assert contiguous_strides_for_shape(shape_norm) == strides_norm, "sum of squares buffer must be contiguous"
-        memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape[:-1]), 0)
+        if "c_rmsnorm_sum_of_squares_stride0" in args:
+            shape_norm = shape[:-1]
+            strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
+            assert contiguous_strides_for_shape(shape_norm) == strides_norm, "sum of squares buffer must be contiguous"
+            memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape[:-1]), 0)
         if split_k > 1:
             # TODO: not inherently, but I don't want to write more memcpy kernels
             assert contiguous_strides_for_shape(shape) == strides, "split k requires contiguous output buffer"
@@ -101,12 +102,18 @@ def _matmul_3d_autotune_configs():
     configs=_matmul_3d_autotune_configs(),
     key=[
         # fmt: off
-        "c_shape0", "c_shape1", "c_shape2", "a_shape0", "a_shape1", "a_shape2",
-        "b_shape0", "b_shape1", "c_stride0", "c_stride1", "c_stride2",
+        # output / input problem shape
+        "c_shape0", "c_shape1", "c_shape2", "a_shape0", "a_shape1", "a_shape2", "b_shape0", "b_shape1",
+        # memory layout
+        "c_stride0", "c_stride1", "c_stride2", "a_stride0", "a_stride1", "a_stride2", "b_stride0", "b_stride1",
+        # optional fused rmsnorm output layout
         "c_rmsnorm_sum_of_squares_stride0", "c_rmsnorm_sum_of_squares_stride1",
-        "a_stride0", "a_stride1", "a_stride2", "b_stride0", "b_stride1",
-        "a_loader_fn", "b_loader_fn", "c_storer_fn",
-        "A_DTYPE", "B_DTYPE", "C_DTYPE", "ACCUM_DTYPE",
+        # optional second B matrix for SwiGLU / GeGLU-style fusion
+        "b2_stride0", "b2_stride1",
+        # codegen-affecting constexpr callables
+        "loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
+        # dtype / quantization specialization
+        "A_DTYPE", "B_DTYPE", "B2_DTYPE", "C_DTYPE", "ACCUM_DTYPE",
         # fmt: on
     ],
 )
@@ -132,8 +139,8 @@ def _matmul_a3d_b2d_kernel(
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
     b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
-    # this arg is here so when b2 = None and launch doesn't decompose tensor, it doesn't error
-    b2: None = None,
+    # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
+    b2: None = None, c_rmsnorm_sum_of_squares: None = None
     # fmt: on
 ):
     tl.device_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
@@ -217,7 +224,7 @@ def _matmul_a3d_b2d_kernel(
 
 
 @triton.jit
-def matmul_a3d_b2d_loader_fn(name: tl.constexpr, desc, off0, off1, off2, conceptual_dtype: tl.constexpr):
+def matmul_a3d_b2d_loader_jfn(name: tl.constexpr, desc, off0, off1, off2, conceptual_dtype: tl.constexpr):
     tile = desc.load((off0, off1, off2))
     # TODO
     if conceptual_dtype == tensor.q4_k.name:
@@ -230,7 +237,7 @@ def matmul_a3d_b2d_loader_fn(name: tl.constexpr, desc, off0, off1, off2, concept
 
 
 @triton.jit
-def matmul_a3d_b2d_partial_rmsnorm_storer_fn(
+def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     name: tl.constexpr,
     desc,
     tile,
@@ -267,8 +274,8 @@ def matmul_a3d_b2d(
     a: Tensor,
     b: Tensor,
     b2: Tensor | None = None,
-    loader_fn: tl.constexpr = matmul_a3d_b2d_loader_fn,
-    storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_fn,
+    loader_fn: tl.constexpr = matmul_a3d_b2d_loader_jfn,
+    storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     accum_dtype: DType | None = None,
 ):
