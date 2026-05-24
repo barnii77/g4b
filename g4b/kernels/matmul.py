@@ -7,6 +7,9 @@ from g4b.kernels.utils import launch
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.utils import contiguous_strides_for_shape
 
+# TODO it appears that torch's matmul (without sum of squares fusion) using fp16 + fp32 accum is ~10% faster than mine.
+#  With fp16 + fp16 accum, mine is significantly faster though. Maybe torch with set_float32_matmul_precision("high") is
+#  not quite doing the same computation as my kernel? The docs do say something about it using either tf32 or 2x bf16...
 # TODO INT8 on SM89 gives you ~4.5x the tensor core throughput of FP16, so I absolutely need to add support for INT8,
 #  like llama.cpp does it:
 #  Q4_K packed nibbles -> widened integer codes arranged as int8 MMA operands
@@ -55,7 +58,7 @@ def _cfg(
         },
         num_warps=warps,
         num_stages=stages,
-        pre_hook=_make_config_pre_hook(split_k)
+        pre_hook=_make_config_pre_hook(split_k),
     )
 
 
@@ -114,6 +117,7 @@ def _matmul_a3d_b2d_kernel(
     c_shape0: tl.constexpr, c_shape1: tl.constexpr, c_shape2: tl.constexpr,
     a_shape0: tl.constexpr, a_shape1: tl.constexpr, a_shape2: tl.constexpr,
     b_shape0: tl.constexpr, b_shape1: tl.constexpr,
+    # b2_shape0 = b_shape0, b2_shape1 = b_shape1
     c_stride0: tl.constexpr, c_stride1: tl.constexpr, c_stride2: tl.constexpr,
     a_stride0: tl.constexpr, a_stride1: tl.constexpr, a_stride2: tl.constexpr,
     b_stride0: tl.constexpr, b_stride1: tl.constexpr,
@@ -121,15 +125,23 @@ def _matmul_a3d_b2d_kernel(
     B_BLOCKSIZE1: tl.constexpr,  # B_BLOCKSIZE0 = A_BLOCKSIZE2
     # C_BLOCKSIZE0 = A_BLOCKSIZE0, C_BLOCKSIZE1 = A_BLOCKSIZE1, C_BLOCKSIZE2 = B_BLOCKSIZE1
     GROUPSIZE1: tl.constexpr, NUM_K_SPLITS: tl.constexpr,
-    a_loader_fn: tl.constexpr, b_loader_fn: tl.constexpr, c_storer_fn: tl.constexpr,
-    A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, C_DTYPE: tl.constexpr,  # e.g. q4_k
+    loader_fn: tl.constexpr, storer_fn: tl.constexpr,
+    A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, B2_DTYPE: tl.constexpr | None, C_DTYPE: tl.constexpr,  # e.g. q4_k
     ACCUM_DTYPE: tl.constexpr,
-    c_rmsnorm_sum_of_squares_ptr = None,
+    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None,  # the b2_ptr mechanism can be used for GeGLU fusion
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
+    b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
+    c_c2_merge_tiles_fn: tl.constexpr | None = None,
+    # this arg is here so when b2 = None and launch doesn't decompose tensor, it doesn't error
+    b2: None = None,
     # fmt: on
 ):
     tl.device_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
     tl.device_assert(a_shape2 % NUM_K_SPLITS == 0)
+
+    if b2_ptr is not None:
+        # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2)
+        NUM_K_SPLITS = 1
 
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
     N = tl.cdiv(b_shape1, B_BLOCKSIZE1)
@@ -156,12 +168,30 @@ def _matmul_a3d_b2d_kernel(
         (0, b_stride0, b_stride1),
         (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
     )
+    has_b2: tl.constexpr = b2_ptr is not None
+    b2_desc = (
+        tl.make_tensor_descriptor(
+            b2_ptr,
+            (1, b_shape0, b_shape1),
+            (0, b2_stride0, b2_stride1),
+            (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
+        )
+        if has_b2
+        else None
+    )
 
     c = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
+    c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
     for off_k in tl.range(k_split_start, k_split_start + k_split_step, A_BLOCKSIZE2):
-        a = a_loader_fn(a_desc, off_b, off_row, off_k, A_DTYPE)
-        b = b_loader_fn(b_desc, 0, off_k, off_col, B_DTYPE)
+        a = loader_fn("a", a_desc, off_b, off_row, off_k, A_DTYPE)
+        b = loader_fn("b", b_desc, 0, off_k, off_col, B_DTYPE)
         c = tl.dot(a, b.broadcast_to(A_BLOCKSIZE0, A_BLOCKSIZE2, B_BLOCKSIZE1), c, out_dtype=c.dtype)
+        if has_b2:
+            b2_tile = loader_fn("b2", b2_desc, 0, off_k, off_col, B2_DTYPE)
+            c2 = tl.dot(a, b2_tile.broadcast_to(A_BLOCKSIZE0, A_BLOCKSIZE2, B_BLOCKSIZE1), c2, out_dtype=c.dtype)
+
+    if has_b2:
+        c = c_c2_merge_tiles_fn(c, c2, off_b, off_row, off_col, NUM_K_SPLITS, C_DTYPE)
 
     c_desc = tl.make_tensor_descriptor(
         c_ptr,
@@ -169,7 +199,8 @@ def _matmul_a3d_b2d_kernel(
         (c_stride0, c_stride1, c_stride2),
         (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1),
     )
-    c_storer_fn(
+    storer_fn(
+        "c",
         c_desc,
         c,
         off_b,
@@ -186,8 +217,9 @@ def _matmul_a3d_b2d_kernel(
 
 
 @triton.jit
-def matmul_a3d_b2d_loader_fn(desc, off0, off1, off2, conceptual_dtype: tl.constexpr):
+def matmul_a3d_b2d_loader_fn(name: tl.constexpr, desc, off0, off1, off2, conceptual_dtype: tl.constexpr):
     tile = desc.load((off0, off1, off2))
+    # TODO
     if conceptual_dtype == tensor.q4_k.name:
         ...
     elif conceptual_dtype == tensor.q5_k.name:
@@ -199,6 +231,7 @@ def matmul_a3d_b2d_loader_fn(desc, off0, off1, off2, conceptual_dtype: tl.conste
 
 @triton.jit
 def matmul_a3d_b2d_partial_rmsnorm_storer_fn(
+    name: tl.constexpr,
     desc,
     tile,
     off0,
@@ -233,15 +266,20 @@ def matmul_a3d_b2d(
     c_rmsnorm_sum_of_squares: Tensor | None,
     a: Tensor,
     b: Tensor,
-    a_loader_fn: tl.constexpr = matmul_a3d_b2d_loader_fn,
-    b_loader_fn: tl.constexpr = matmul_a3d_b2d_loader_fn,
-    c_storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_fn,
+    b2: Tensor | None = None,
+    loader_fn: tl.constexpr = matmul_a3d_b2d_loader_fn,
+    storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_fn,
+    c_c2_merge_tiles_fn: tl.constexpr | None = None,
     accum_dtype: DType | None = None,
 ):
+    assert (b2 is None) == (c_c2_merge_tiles_fn is None)
+
+    k_split_allowed = b2 is None
+
     grid_fn = lambda META: (
         triton.cdiv(META["a_shape1"], META["A_BLOCKSIZE1"]) * triton.cdiv(META["b_shape1"], META["B_BLOCKSIZE1"]),
         triton.cdiv(META["a_shape0"], META["A_BLOCKSIZE0"]),
-        META["NUM_K_SPLITS"],
+        META["NUM_K_SPLITS"] if k_split_allowed else 1,
     )
 
     if accum_dtype is None:
@@ -255,11 +293,13 @@ def matmul_a3d_b2d(
         c_rmsnorm_sum_of_squares=c_rmsnorm_sum_of_squares,
         a=a,
         b=b,
-        a_loader_fn=a_loader_fn,
-        b_loader_fn=b_loader_fn,
-        c_storer_fn=c_storer_fn,
+        b2=b2,
+        loader_fn=loader_fn,
+        storer_fn=storer_fn,
+        c_c2_merge_tiles_fn=c_c2_merge_tiles_fn,
         A_DTYPE=_dtype_name(a.dtype),
         B_DTYPE=_dtype_name(b.dtype),
+        B2_DTYPE=_dtype_name(b2.dtype) if b2 is not None else None,
         C_DTYPE=_dtype_name(c.dtype),
         ACCUM_DTYPE=accum_dtype,
     )
