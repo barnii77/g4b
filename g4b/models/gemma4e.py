@@ -19,14 +19,16 @@ from g4b.config import Config
 #  3) new_resid = residual.load() + last_matmul_out.load() * inv_rms * last_rmsnorm_w.load(); residual.store(new_resid)
 #  4) immediately also computes a reduce-sum over new_resid and computes the new_resid_inv_rms from that
 #  5) prologue-fuses new_resid_inv_rms scaling before the next matmul after dequant, using block-scaled mma if avail.
-#  The end result of this is that you do 2 RMSNorms with 1 reduction kernel and get the rest for ~free.
+#  The end result of this is that you do 2 RMSNorms with 1 resid_stream_combine kernel and get the rest for ~free.
 #  This method can (and also kinda has to) be applied as well to the lm_head, since the lm head will receive not a clean
 #  residual stream but rather the second-to-last layer's residual stream plus the last layer's matmul output and sum of
-#  squares. Then you can again run this reduction kernel instead of the lm head norm, and prologue fuse the scaling
+#  squares. Then you can again run this resid_stream_combine kernel instead of the lm head norm, and prologue fuse the scaling
 #  into the logits matmul. Then you just write out the logits to a bit tensor and run your sampling kernel.
 #  Also, in all this, I must not forget about DecoderLayer.layer_output_scale, so I guess I need a special case after
 #  the PLE layer. Remember, the layer output scale scales the entire residual stream, not just the decoder layer delta.
 #  I think this optimization needs to be documented somewhere.
+# TODO I can fuse the rmsnorm w mul into the epilogue which computes the sum of squares too or, for input rmsnorms,
+#  fuse it into the resid_stream_combine kernel. (just make sure to compute the sum of squares from the original values).
 
 # TODO think about RoPE fusion and SwiGLU fusion.
 #  SwiGLU fusion works by having a single for loop over K in your kernel that MMAs both the up proj and gate proj, and
@@ -50,8 +52,7 @@ class Attention:
     k_rmsnorm_w_k: Tensor
     v_rmsnorm_w_v: Tensor
     o_rmsnorm_w_D: Tensor
-    # TODO ensure this is all 1s IN THE ATTENTION MODULE TOO because that would enable the rmsnorm fusion explained above
-    #input_rmsnorm_w_D: Tensor
+    input_rmsnorm_w_D: Tensor
     rope_freqs_H: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
     rope_freq_base: float  # TODO make sure I assign this correctly with `conf.rope_freq_base_swa if is_swa else conf.rope_freq_base`. See ref impl -> class RoPE.
     sliding_window_size: int | None  # global attention if None
@@ -76,8 +77,7 @@ class MLP:
     up_proj_DU: Tensor
     gate_proj_DU: Tensor
     down_proj_UD: Tensor
-    # TODO ensure this is all 1s because that would enable the rmsnorm fusion explained above
-    #input_rmsnorm_w_D: Tensor
+    input_rmsnorm_w_D: Tensor
     output_rmsnorm_w_D: Tensor
 
     # runtime state

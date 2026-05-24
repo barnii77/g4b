@@ -5,21 +5,19 @@ from g4b.kernels.utils import launch
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCKSIZE": 64}),
-        triton.Config({"BLOCKSIZE": 128}),
-        triton.Config({"BLOCKSIZE": 256}),
-        triton.Config({"BLOCKSIZE": 512}),
-        triton.Config({"BLOCKSIZE": 1024}),
-        triton.Config({"BLOCKSIZE": 2048}),
-        triton.Config({"BLOCKSIZE": 4096}),
-    ],
+    configs=[triton.Config({"BLOCKSIZE": 2**i}) for i in range(6, 13)],
     key=["x_shape0"],
 )
 @triton.jit
 def _memset_contiguous_kernel(x_ptr, x_shape0: tl.constexpr, value: tl.constexpr, BLOCKSIZE: tl.constexpr):
     offsets = tl.program_id(0) * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
     tl.store(x_ptr + offsets, value, mask=offsets < x_shape0)
+
+
+def memset_contiguous_by_ptr(x_ptr, x_size, value: int):
+    assert 0 <= value <= 255
+    grid_fn = lambda META: (triton.cdiv(x_size, META["BLOCKSIZE"]),)
+    return _memset_contiguous_kernel[grid_fn](x_ptr, x_size, value)
 
 
 def memset_contiguous(x: Tensor, value: int):
