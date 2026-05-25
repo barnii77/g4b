@@ -10,7 +10,7 @@ from g4b import _torch_stub
 
 device: Device
 compute_stream: Stream
-side_stream: Stream
+side_stream: Stream  # TODO do I even need this? I think DtoH memcpy is fast enough that this is unnecessary... would allow me to simplify token embedding and sampling kernels if I could strip this because it would remove the need for ring buffers for token ids
 
 _buffers: list[Buffer] = []
 _triton_current_stream = None

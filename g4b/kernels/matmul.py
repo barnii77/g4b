@@ -143,8 +143,8 @@ def _matmul_a3d_b2d_kernel(
     b2: None = None, c_rmsnorm_sum_of_squares: None = None
     # fmt: on
 ):
-    tl.device_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
-    tl.device_assert(a_shape2 % NUM_K_SPLITS == 0)
+    tl.static_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
+    tl.static_assert(a_shape2 % NUM_K_SPLITS == 0)
 
     if b2_ptr is not None:
         # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2)
