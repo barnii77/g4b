@@ -4,7 +4,71 @@ from g4b.tensor import Tensor
 from g4b.kernels.utils import launch
 
 
-# TODO autotune
+def _cfg(
+    b0: int,
+    b1: int,
+    b2: int,
+    b3: int,
+    *,
+    warps: int,
+    stages: int = 3,
+):
+    return triton.Config(
+        {
+            "BLOCKSIZE0": b0,
+            "BLOCKSIZE1": b1,
+            "BLOCKSIZE2": b2,
+            "BLOCKSIZE3": b3,
+        },
+        num_warps=warps,
+        num_stages=stages,
+    )
+
+
+@triton.autotune(
+    # fmt: off
+    configs=[
+        # ---- decode / tiny token count ----
+        _cfg(1, 1, 1, 64, warps=1),
+        _cfg(1, 1, 1, 128, warps=2),
+        _cfg(1, 1, 1, 256, warps=4),
+        _cfg(1, 2, 1, 64, warps=1),
+        _cfg(1, 2, 1, 128, warps=2),
+        _cfg(1, 2, 1, 256, warps=4),
+        _cfg(1, 4, 1, 64, warps=2),
+        _cfg(1, 4, 1, 128, warps=4),
+        _cfg(1, 4, 1, 256, warps=4),
+        # ---- small prefill / a few positions per program ----
+        _cfg(1, 1, 2, 64, warps=1),
+        _cfg(1, 1, 2, 128, warps=2),
+        _cfg(1, 1, 2, 256, warps=4),
+        _cfg(1, 2, 2, 64, warps=2),
+        _cfg(1, 2, 2, 128, warps=4),
+        _cfg(1, 1, 4, 64, warps=2),
+        _cfg(1, 1, 4, 128, warps=4),
+        _cfg(1, 2, 4, 64, warps=4),
+        # ---- more position batching ----
+        _cfg(1, 1, 8, 64, warps=4),
+        _cfg(1, 1, 8, 128, warps=4),
+        # ---- batch batching ----
+        _cfg(2, 1, 1, 64, warps=1),
+        _cfg(2, 1, 1, 128, warps=2),
+        _cfg(2, 1, 1, 256, warps=4),
+        _cfg(2, 2, 1, 64, warps=2),
+        _cfg(4, 1, 1, 64, warps=2),
+    ],
+    # fmt: on
+    key=[
+        # fmt: off
+        "x_shape0", "x_shape1", "x_shape2", "x_shape3",
+        "cache_shape0", "cache_shape1", "cache_shape2", "cache_shape3",
+        "cache_offsets_shape0",
+        "x_stride0", "x_stride1", "x_stride2", "x_stride3",
+        "cache_stride0", "cache_stride1", "cache_stride2", "cache_stride3",
+        "cache_offsets_stride0",
+        # fmt: on
+    ],
+)
 @triton.jit
 def _add_kv_to_cache_kernel(
     x_ptr,
@@ -34,13 +98,13 @@ def _add_kv_to_cache_kernel(
     BLOCKSIZE3: tl.constexpr,
 ):
     tl.static_assert(x_shape0 == cache_shape0)
-    tl.static_assert(x_shape2 == cache_shape2)
+    tl.static_assert(x_shape1 == cache_shape1)
     tl.static_assert(x_shape3 == cache_shape3)
     tl.static_assert(x_shape0 == cache_offsets_shape0)
 
     B: tl.constexpr = x_shape0
     t: tl.constexpr = x_shape2
-    T: tl.constexpr = cache_shape1
+    T: tl.constexpr = cache_shape2
     G: tl.constexpr = x_shape1  # grouped-query attention
     d: tl.constexpr = x_shape3
     tl.static_assert(t <= T)  # otherwise we would try to fill more tokens than we have kv cache
@@ -74,7 +138,7 @@ def _add_kv_to_cache_kernel(
         + ((off_t + cache_offsets[:, None, None, None]) % T) * cache_stride2
         + off_d * cache_stride3
     )
-    tl.store(cache_ptr + cache_offs, x, mask=(off_b < B) & (off_g < G) & (off_d < d))
+    tl.store(cache_ptr + cache_offs, x, mask=(off_b < B) & (off_g < G) & (off_t < t) & (off_d < d))
 
 
 def add_kv_to_cache(x: Tensor, cache: Tensor, cache_offsets: Tensor):
