@@ -43,7 +43,6 @@ q5_k = DType("q5_k", "uint8")
 q6_k = DType("q6_k", "uint8")
 
 
-# TODO reshape, transpose, permute, view(dtype) methods... but no methods that would require kernel launches
 @dataclass(frozen=True)
 class Tensor:
     buffer: Buffer
@@ -89,9 +88,21 @@ class Tensor:
         return Tensor(
             self.buffer,
             dtype,
-            (*self.shape[:-1], to_int_exact(self.shape[-1] * size_ratio)),
-            (*self.stride[:-1], to_int_exact(self.stride[-1] * size_ratio)),
+            [*self.shape[:-1], to_int_exact(self.shape[-1] * size_ratio)],
+            [*self.stride[:-1], to_int_exact(self.stride[-1] * size_ratio)],
         )
+
+    def permute(self, dims: Sequence[int]) -> Tensor:
+        dims = list(dims)
+        if sorted(dims) != list(range(len(self.shape))):
+            raise RuntimeError(f"incomplete dim list {dims}")
+        return Tensor(self.buffer, self.dtype, [self.shape[i] for i in dims], [self.stride[i] for i in dims])
+
+    def transpose(self, dim1: int, dim2: int) -> Tensor:
+        permute_seq = list(range(len(self.shape)))
+        permute_seq[dim1] = dim2
+        permute_seq[dim2] = dim1
+        return self.permute(permute_seq)
 
 
 def _copy_htod_sync(dst, data: bytes | bytearray | memoryview):
