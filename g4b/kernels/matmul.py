@@ -135,6 +135,7 @@ def _matmul_a3d_b2d_kernel(
     loader_fn: tl.constexpr, storer_fn: tl.constexpr,
     A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, B2_DTYPE: tl.constexpr | None, C_DTYPE: tl.constexpr,  # e.g. q4_k
     ACCUM_DTYPE: tl.constexpr,
+    KEEP_C: tl.constexpr,  # if true, init c = c_desc.load(...)
     # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr is used for the PLE layers.
     c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
@@ -187,9 +188,20 @@ def _matmul_a3d_b2d_kernel(
         if has_b2
         else None
     )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        (c_shape0, c_shape1, c_shape2),
+        (c_stride0, c_stride1, c_stride2),
+        (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1),
+    )
 
-    c = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
+    c = (
+        c_desc.load((off_b, off_row, off_col)).to(ACCUM_DTYPE)
+        if KEEP_C
+        else tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
+    )
     c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
+
     for off_k in tl.range(k_split_start, k_split_start + k_split_step, A_BLOCKSIZE2):
         a = loader_fn("a", a_desc, off_b, off_row, off_k, A_DTYPE)
         b = loader_fn("b", b_desc, 0, off_k, off_col, B_DTYPE)
@@ -201,12 +213,6 @@ def _matmul_a3d_b2d_kernel(
     if has_b2:
         c = c_c2_merge_tiles_fn(c, c2, off_b, off_row, off_col, NUM_K_SPLITS, C_DTYPE)
 
-    c_desc = tl.make_tensor_descriptor(
-        c_ptr,
-        (c_shape0, c_shape1, c_shape2),
-        (c_stride0, c_stride1, c_stride2),
-        (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1),
-    )
     storer_fn(
         "c",
         c_desc,
@@ -282,6 +288,7 @@ def matmul_a3d_b2d(
     storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     accum_dtype: DType | None = None,
+    keep_c: bool = False,
 ):
     assert (b2 is None) == (c_c2_merge_tiles_fn is None)
 
@@ -314,6 +321,7 @@ def matmul_a3d_b2d(
         B2_DTYPE=_dtype_name(b2.dtype) if b2 is not None else None,
         C_DTYPE=_dtype_name(c.dtype),
         ACCUM_DTYPE=accum_dtype,
+        KEEP_C=keep_c,
     )
 
 
