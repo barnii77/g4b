@@ -74,39 +74,35 @@ def _gather_cfg(
 @triton.jit
 def _gather_token_embeddings_kernel(
     # fmt: off
-    z_ptr, embed_ptr, token_ids_rb_ptr, token_ids_rb_offset_ptr,
+    z_ptr, embed_ptr, token_ids_ptr,
     z_shape0: tl.constexpr, z_shape1: tl.constexpr, z_shape2: tl.constexpr,
     embed_shape0: tl.constexpr, embed_shape1: tl.constexpr,
-    token_ids_rb_shape0: tl.constexpr, token_ids_rb_shape1: tl.constexpr,
-    token_ids_rb_offset_shape0: tl.constexpr,
+    token_ids_shape0: tl.constexpr, token_ids_shape1: tl.constexpr,
     z_stride0: tl.constexpr, z_stride1: tl.constexpr, z_stride2: tl.constexpr,
     embed_stride0: tl.constexpr, embed_stride1: tl.constexpr,
-    token_ids_rb_stride0: tl.constexpr, token_ids_rb_stride1: tl.constexpr,
+    token_ids_stride0: tl.constexpr, token_ids_stride1: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
     tl.static_assert(z_shape2 == embed_shape1)  # residual size
-    tl.static_assert(token_ids_rb_offset_shape0 == 1)  # scalar
-    tl.static_assert(token_ids_rb_shape1 == z_shape0)  # batch size
-
-    next_token_id_rb_time_offset = tl.load(token_ids_rb_offset_ptr)
+    tl.static_assert(token_ids_shape1 == z_shape0)  # batch size
 
     pid_d = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_t = tl.program_id(2)
+    pid_t = tl.program_id(1)
+    pid_b = tl.program_id(2)
 
     pid_off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)
     pid_off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)
     pid_off_d = pid_d * BLOCKSIZE2 + tl.arange(0, BLOCKSIZE2)
 
     # TODO does this layout give me gmem coalesced loads?
-    rb_off_t = next_token_id_rb_time_offset + pid_off_t[None, :]
+    rb_off_t = pid_off_t[None, :]
     rb_off_b = pid_off_b[:, None]
-    rb_off = rb_off_t * token_ids_rb_stride0 + rb_off_b * token_ids_rb_stride1
+    rb_off = rb_off_t * token_ids_stride0 + rb_off_b * token_ids_stride1
 
     token_ids = tl.load(
-        token_ids_rb_ptr + rb_off,
-        mask=(rb_off_t < token_ids_rb_shape0) & (rb_off_b < token_ids_rb_shape1),
+        token_ids_ptr + rb_off,
+        mask=(rb_off_t < token_ids_shape0) & (rb_off_b < token_ids_shape1),
         other=embed_shape0,
     )
 
@@ -127,15 +123,13 @@ def _gather_token_embeddings_kernel(
     tl.store(z_ptr + z_off, embeddings, mask=(z_off_b < z_shape0) & (z_off_t < z_shape1) & (z_off_d < z_shape2))
 
 
-def gather_token_embeddings(z: Tensor, embed: Tensor, token_ids_rb: Tensor, token_ids_rb_offset: Tensor):
+def gather_token_embeddings(z: Tensor, embed: Tensor, token_ids: Tensor):
     grid_fn = lambda META: (
         triton.cdiv(z.shape[2], META["BLOCKSIZE2"]),
         triton.cdiv(z.shape[1], META["BLOCKSIZE1"]),
         triton.cdiv(z.shape[0], META["BLOCKSIZE0"]),
     )
-    return launch[_gather_token_embeddings_kernel, grid_fn](
-        z=z, embed=embed, token_ids_rb=token_ids_rb, token_ids_rb_offset=token_ids_rb_offset
-    )
+    return launch[_gather_token_embeddings_kernel, grid_fn](z=z, embed=embed, token_ids=token_ids)
 
 
 @cache
