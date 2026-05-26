@@ -8,6 +8,7 @@ from g4b.kernels.geglu import gelu_jfn
 
 # TODO fix this kernel
 # TODO how do I use this to load ple_lookup?
+# TODO gemma4e embeddings require scaling... fuse that into the kernel directly
 
 
 def _gather_cfg(
