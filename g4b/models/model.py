@@ -11,7 +11,10 @@ class Model(ABC):
     def load(cls, gguf_meta: GGUFMeta, gguf_tensors: list[GGUFTensor], config: Config): ...
 
     @abstractmethod
-    def step(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
+    def prefill_chunk(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
+
+    @abstractmethod
+    def decode(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
 
 
 # TODO this assumes a static schedule for the forward pass where no kernels are launched conditionally...

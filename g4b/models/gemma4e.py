@@ -151,4 +151,7 @@ class Gemma4E(Model):
     def load(cls, gguf_meta: GGUFMeta, gguf_tensors: list[GGUFTensor], config: Config): ...  # TODO
 
     @record_static_cuda_graph
-    def step(self, sched: Scheduler): ...  # TODO
+    def prefill_chunk(self, sched: "scheduler.Scheduler"): ...  # TODO
+
+    @record_static_cuda_graph
+    def decode(self, sched: Scheduler): ...  # TODO
