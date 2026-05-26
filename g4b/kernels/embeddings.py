@@ -11,7 +11,7 @@ from g4b.kernels.geglu import gelu_jfn
 # TODO gemma4e embeddings require scaling... fuse that into the kernel directly
 
 
-def _gather_cfg(
+def _cfg(
     b0: int,
     b1: int,
     b2: int,
@@ -35,28 +35,28 @@ def _gather_cfg(
     configs=[
         # ---- decode / tiny token count ----
         # One token row per program, varying embedding-dim tile.
-        _gather_cfg(1, 1, 64, warps=1),
-        _gather_cfg(1, 1, 128, warps=2),
-        _gather_cfg(1, 1, 256, warps=4),
+        _cfg(1, 1, 64, warps=1),
+        _cfg(1, 1, 128, warps=2),
+        _cfg(1, 1, 256, warps=4),
         # ---- small prefill / a few positions per program ----
-        _gather_cfg(1, 2, 64, warps=1),
-        _gather_cfg(1, 2, 128, warps=2),
-        _gather_cfg(1, 2, 256, warps=4),
-        _gather_cfg(1, 4, 64, warps=2),
-        _gather_cfg(1, 4, 128, warps=4),
-        _gather_cfg(1, 4, 256, warps=4),
+        _cfg(1, 2, 64, warps=1),
+        _cfg(1, 2, 128, warps=2),
+        _cfg(1, 2, 256, warps=4),
+        _cfg(1, 4, 64, warps=2),
+        _cfg(1, 4, 128, warps=4),
+        _cfg(1, 4, 256, warps=4),
         # ---- more position batching ----
         # Useful if token_ids are reasonably contiguous / output write is nicely laid out.
-        _gather_cfg(1, 8, 64, warps=4),
-        _gather_cfg(1, 8, 128, warps=4),
+        _cfg(1, 8, 64, warps=4),
+        _cfg(1, 8, 128, warps=4),
         # ---- batch batching ----
         # Useful if z batch dimension is small-but-nontrivial and z_stride0/z_stride1 are sane.
-        _gather_cfg(2, 1, 64, warps=1),
-        _gather_cfg(2, 1, 128, warps=2),
-        _gather_cfg(2, 2, 64, warps=2),
-        _gather_cfg(2, 2, 128, warps=4),
-        _gather_cfg(4, 1, 64, warps=2),
-        _gather_cfg(4, 1, 128, warps=4),
+        _cfg(2, 1, 64, warps=1),
+        _cfg(2, 1, 128, warps=2),
+        _cfg(2, 2, 64, warps=2),
+        _cfg(2, 2, 128, warps=4),
+        _cfg(4, 1, 64, warps=2),
+        _cfg(4, 1, 128, warps=4),
     ],
     # fmt: on
     key=[
