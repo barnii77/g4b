@@ -66,7 +66,10 @@ def _cfg(
 
 def _matmul_3d_autotune_configs():
     # AI slop configs
+    # TODO better configs, enable all configs, proper warmup mechanism (see todo.md)
     return [
+        _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
+        ] + 0*[
         # ---- small / skinny-N / decode-ish ----
         # Effective MxN: 16x16, 16x32, 32x16, 32x32
         _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
@@ -153,6 +156,7 @@ def _matmul_a3d_b2d_kernel(
         # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2)
         NUM_K_SPLITS = 1
 
+    # TODO I think this indexing is actually wrong when GROUPSIZE does not evenly divide the number of tiles
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
     N = tl.cdiv(b_shape1, B_BLOCKSIZE1)
     pid = tl.program_id(0)
@@ -204,12 +208,17 @@ def _matmul_a3d_b2d_kernel(
     c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
 
     for off_k in tl.range(k_split_start, k_split_start + k_split_step, A_BLOCKSIZE2):
-        a = loader_fn("a", a_desc, off_b, off_row, off_k, A_DTYPE)
-        b = loader_fn("b", b_desc, 0, off_k, off_col, B_DTYPE)
-        c = tl.dot(a, b.broadcast_to(A_BLOCKSIZE0, A_BLOCKSIZE2, B_BLOCKSIZE1), c, out_dtype=c.dtype)
+        BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
+        BLOCK_K: tl.constexpr = A_BLOCKSIZE2
+        BLOCK_N: tl.constexpr = B_BLOCKSIZE1
+        a = loader_fn("a", a_desc, off_b, off_row, off_k, A_DTYPE).reshape((BLOCK_M, BLOCK_K))
+        b = loader_fn("b", b_desc, 0, off_k, off_col, B_DTYPE).reshape((BLOCK_K, BLOCK_N))
+        c = tl.dot(a, b, c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
+            (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1)
+        )
         if has_b2:
-            b2_tile = loader_fn("b2", b2_desc, 0, off_k, off_col, B2_DTYPE)
-            c2 = tl.dot(a, b2_tile.broadcast_to(A_BLOCKSIZE0, A_BLOCKSIZE2, B_BLOCKSIZE1), c2, out_dtype=c.dtype)
+            b2_tile = loader_fn("b2", b2_desc, 0, off_k, off_col, B2_DTYPE).reshape(b.shape)
+            c2 = tl.dot(a, b2_tile, c2.reshape(BLOCK_M, BLOCK_N), out_dtype=c.dtype).reshape(c.shape)
 
     if has_b2:
         c = c_c2_merge_tiles_fn(c, c2, off_b, off_row, off_col, NUM_K_SPLITS, C_DTYPE)
