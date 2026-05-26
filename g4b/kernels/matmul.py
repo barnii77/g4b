@@ -135,12 +135,13 @@ def _matmul_a3d_b2d_kernel(
     loader_fn: tl.constexpr, storer_fn: tl.constexpr,
     A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, B2_DTYPE: tl.constexpr | None, C_DTYPE: tl.constexpr,  # e.g. q4_k
     ACCUM_DTYPE: tl.constexpr,
-    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None,  # the b2_ptr mechanism can be used for GeGLU fusion
+    # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr is used for the PLE layers.
+    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
     b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
-    b2: None = None, c_rmsnorm_sum_of_squares: None = None
+    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None
     # fmt: on
 ):
     tl.static_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
@@ -214,6 +215,7 @@ def _matmul_a3d_b2d_kernel(
         off_row,
         off_col,
         c_rmsnorm_sum_of_squares_ptr,
+        storer_extra_ptr,
         c_shape0,
         c_shape1,
         c_rmsnorm_sum_of_squares_stride0,
@@ -245,6 +247,7 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     off1,
     off2,
     rsos_ptr,
+    extra_ptr,
     rsos_shape0: tl.constexpr,
     rsos_shape1: tl.constexpr,
     rsos_stride0: tl.constexpr,
@@ -274,6 +277,7 @@ def matmul_a3d_b2d(
     a: Tensor,
     b: Tensor,
     b2: Tensor | None = None,
+    storer_extra: Tensor | None = None,
     loader_fn: tl.constexpr = matmul_a3d_b2d_loader_jfn,
     storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
@@ -301,6 +305,7 @@ def matmul_a3d_b2d(
         a=a,
         b=b,
         b2=b2,
+        storer_extra=storer_extra,
         loader_fn=loader_fn,
         storer_fn=storer_fn,
         c_c2_merge_tiles_fn=c_c2_merge_tiles_fn,
