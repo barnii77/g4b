@@ -4,15 +4,18 @@
 
 import importlib.util
 import sys
-from cuda.core import Device, Stream, Buffer
+from cuda.core import Device, Stream, Buffer, Event, EventOptions, PinnedMemoryResource
+
 from g4b.utils import runtime_error
 from g4b import _torch_stub
 
 device: Device
-compute_stream: Stream
-side_stream: Stream  # TODO do I even need this? I think DtoH memcpy is fast enough that this is unnecessary... would allow me to simplify token embedding and sampling kernels if I could strip this because it would remove the need for ring buffers for token ids
+stream: Stream
+_alloc_stream: Stream
+_pinned_mr: PinnedMemoryResource
 
 _buffers: list[Buffer] = []
+_events: list[Event] = []
 _triton_current_stream = None
 _triton_current_device = None
 
@@ -23,9 +26,16 @@ def init(device_id: int = 0):
 
 
 def alloc(size: int) -> Buffer:
-    buf = device.allocate(size, stream=side_stream)
+    buf = device.allocate(size, stream=_alloc_stream)
     _buffers.append(buf)
     return buf
+
+
+def alloc_pinned_host(size: int) -> Buffer:
+    h_buf = _pinned_mr.allocate(size, stream=_alloc_stream)
+    assert h_buf.is_host_accessible
+    _buffers.append(h_buf)
+    return h_buf
 
 
 def free(buf: Buffer):
@@ -33,24 +43,41 @@ def free(buf: Buffer):
     buf.close()
 
 
+def event(timing_enabled: bool = False) -> Event:
+    evt = device.create_event(options=EventOptions(timing_enabled=timing_enabled))
+    _events.append(evt)
+    return evt
+
+
+def free_event(evt: Event):
+    _events.remove(evt)
+    evt.close()
+
+
 def teardown():
     global _triton_current_device, _triton_current_stream
     _triton_current_device = None
     _triton_current_stream = None
-    compute_stream.sync()
+    stream.sync()
     for buf in _buffers:
         buf.close()
-    side_stream.sync()
-    compute_stream.close()
-    side_stream.close()
+    _buffers.clear()
+    for evt in _events:
+        evt.close()
+    _events.clear()
+    _alloc_stream.sync()
+    stream.close()
+    _alloc_stream.close()
+    _pinned_mr.close()
 
 
 def _init_cuda(device_id: int):
-    global device, compute_stream, side_stream
+    global device, stream, _alloc_stream, _pinned_mr
     device = Device(device_id)
     device.set_current()
-    compute_stream = device.create_stream()
-    side_stream = device.create_stream()
+    stream = device.create_stream()
+    _alloc_stream = device.create_stream()
+    _pinned_mr = PinnedMemoryResource()
 
 
 def _init_triton():
@@ -71,7 +98,7 @@ def _init_triton():
     )
     triton.runtime.driver.active.get_current_device = lambda: int(_triton_current_device.device_id)
     _triton_current_device = device
-    _triton_current_stream = compute_stream
+    _triton_current_stream = stream
 
 
 def _real_torch_available() -> bool:

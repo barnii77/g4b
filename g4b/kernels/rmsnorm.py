@@ -4,7 +4,7 @@ from typing import Literal
 from g4b.tensor import Tensor, DType
 from g4b.kernels.utils import launch
 
-# TODO kernel needs to handle dynamic time shapes (each entry along time dim being a different length)
+# TODO this kernel is kinda useless actually but my test of resource management is entangled with it... REMOVE!
 
 
 # TODO autotune block sizes

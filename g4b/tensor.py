@@ -2,7 +2,7 @@ import ctypes
 import math
 from triton import language as tl
 from triton.experimental.gluon import language as gl
-from cuda.core import Buffer
+from cuda.core import Buffer, Event
 from cuda.bindings import runtime as cudart
 from dataclasses import dataclass
 from typing import Sequence
@@ -55,15 +55,19 @@ class Tensor:
         return int(self.buffer.handle)
 
     @classmethod
-    def from_bytes(cls, data: bytes, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):
+    def from_bytes_sync(cls, data: bytes, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):
         if strides is None:
             strides = contiguous_strides_for_shape(shape)
         buf = device.alloc(len(data))
-        _copy_htod_sync(buf, data, device.side_stream)
+        _copy_htod_sync(buf, data)
         return cls(buf, dtype, shape, strides)
 
-    def to_bytes(self) -> bytes:
-        return _copy_dtoh_sync(self.buffer, device.side_stream)
+    def to_bytes_sync(self) -> bytes:
+        return _copy_dtoh_sync(self.buffer)
+
+    def copy_to(self, dst: Buffer, event: Event):
+        self.buffer.copy_to(dst, stream=device.stream)
+        return device.stream.record(event)
 
     def is_contiguous(self) -> bool:
         return self.stride == contiguous_strides_for_shape(self.shape)
@@ -90,7 +94,8 @@ class Tensor:
         )
 
 
-def _copy_htod_sync(dst, data: bytes | bytearray | memoryview, stream):
+def _copy_htod_sync(dst, data: bytes | bytearray | memoryview):
+    stream = device.stream
     data = bytes(data)
 
     n = len(data)
@@ -110,7 +115,8 @@ def _copy_htod_sync(dst, data: bytes | bytearray | memoryview, stream):
     stream.sync()
 
 
-def _copy_dtoh_sync(src, stream) -> bytes:
+def _copy_dtoh_sync(src) -> bytes:
+    stream = device.stream
     copy_dst = ctypes.create_string_buffer(src.size)
     cuda_check(
         cudart.cudaMemcpyAsync(
