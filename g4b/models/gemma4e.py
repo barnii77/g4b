@@ -66,6 +66,8 @@ class Attention:
     k_cache_Bg__T_or_W__k: Tensor
     v_cache_Bg__T_or_W__v: Tensor
     shared_q_scratchpad_Bhtk: Tensor
+    shared_k_scratchpad_Bgtk: Tensor
+    shared_v_scratchpad_Bgtk: Tensor
     shared_o_proj_input_scratchpad_Bhtv: Tensor
     shared_last_and_this_layer_output_scratchpad_BtD: Tensor
     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt: Tensor
