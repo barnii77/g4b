@@ -32,7 +32,8 @@ def _make_config_pre_hook(split_k: int):
         if split_k > 1:
             # TODO: not inherently, but I don't want to write more memcpy kernels
             assert contiguous_strides_for_shape(shape) == strides, "split k requires contiguous output buffer"
-            memset_contiguous_by_ptr(args["c_ptr"], math.prod(shape), 0)
+            if not args["KEEP_C"]:
+                memset_contiguous_by_ptr(args["c_ptr"], math.prod(shape), 0)
 
     return pre_hook
 
