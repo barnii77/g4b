@@ -28,15 +28,20 @@ def _cfg(
 @triton.jit
 def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
     # TODO technically I could reverse bitonic sort `tile` only, and then do a single bitonic iter on the joined tile.
-    x = tl.cat(accum, tile, dim=-1)
-    x_idx = tl.cat(accum_idx, tile_offs, dim=-1)
-    BLOCKSIZE: tl.constexpr = x.shape[-1]
+    tl.static_assert(tile_offs.shape[0] == 1)
+    tl.static_assert(tile_offs.shape[1] == accum_idx.shape[1])
+    tl.static_assert(tile_offs.shape[2] == accum_idx.shape[2])
 
-    n_bitonic_iters: tl.constexpr = to_int_exact(math.log2(x.shape[-1]))
+    x = tl.cat(accum, tile, dim=-1)
+    x_idx = tl.cat(accum_idx, tile_offs.broadcast_to(accum_idx.shape), dim=-1)
+    TILESIZE: tl.constexpr = accum.shape[-1]
+
+    n_bitonic_iters: tl.constexpr = int(math.log2(x.shape[-1]))
     for it in tl.static_range(0, n_bitonic_iters):
-        is_reversed_desc = (tl.arange(0, BLOCKSIZE) & ((1 << it + 1) - 1)) >= (1 << it)  # `<` -> ascending sort
+        cmp_idx_pattern = tl.arange(0, TILESIZE)[None, None, :] & ((1 << it + 1) - 1)
+        is_reversed_desc = cmp_idx_pattern >= (1 << it)  # `<` -> ascending sort
         for inner_it in tl.static_range(0, it + 1):
-            a_idx = tl.arange(0, BLOCKSIZE, 2)
+            a_idx = (tl.arange(0, TILESIZE)[None, None, :] * 2).broadcast_to((accum.shape[0], accum.shape[1], TILESIZE))
             b_idx = a_idx + (1 << inner_it)
             a = x.gather(a_idx, axis=-1)
             b = x.gather(b_idx, axis=-1)
@@ -48,8 +53,9 @@ def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
             x = x.gather(reorder_idx, axis=-1)
             x_idx = x_idx.gather(reorder_idx, axis=-1)
 
-    accum = x[x.shape[0], x.shape[1], : accum.shape[2]]
-    accum_idx = x_idx[x.shape[0], x.shape[1], : accum_idx.shape[2]]
+    split_shape: tl.constexpr = x.shape[0], x.shape[1], accum.shape[2], 2
+    accum, _ = tl.split(x.reshape(split_shape))
+    accum_idx, _ = tl.split(x_idx.reshape(split_shape))
     return accum, accum_idx
 
 
@@ -84,18 +90,19 @@ def _bitonic_scan_find_top_k_logits_jfn(
 @triton.autotune(
     # fmt: off
     configs=[
-        # ---- decode / one sample row per program ----
-        _cfg(1, 1, 128, warps=4),
-        _cfg(1, 1, 256, warps=8),
-        _cfg(1, 1, 512, warps=8),
-        # ---- small token batching ----
-        _cfg(1, 2, 128, warps=4),
-        _cfg(1, 2, 256, warps=8),
-        _cfg(1, 4, 128, warps=4),
-        _cfg(1, 4, 256, warps=8),
-        # ---- batch batching ----
-        _cfg(2, 1, 128, warps=4),
-        _cfg(2, 1, 256, warps=8),
+        # TODO comment back in
+        # # ---- decode / one sample row per program ----
+        # _cfg(1, 1, 128, warps=4),
+        # _cfg(1, 1, 256, warps=8),
+        # _cfg(1, 1, 512, warps=8),
+        # # ---- small token batching ----
+        # _cfg(1, 2, 128, warps=4),
+        # _cfg(1, 2, 256, warps=8),
+        # _cfg(1, 4, 128, warps=4),
+        # _cfg(1, 4, 256, warps=8),
+        # # ---- batch batching ----
+        # _cfg(2, 1, 128, warps=4),
+        # _cfg(2, 1, 256, warps=8),
         _cfg(4, 1, 128, warps=4),
     ],
     # fmt: on
@@ -121,6 +128,7 @@ def _sample_logits_kernel(
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
+    # TODO this kernel could (and probably should) allow split-D processing
     tl.static_assert(logits_shape0 == out_token_ids_shape0)
     tl.static_assert(logits_shape1 == out_token_ids_shape1)
     tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
@@ -141,27 +149,32 @@ def _sample_logits_kernel(
         BLOCKSIZE1,
         BLOCKSIZE2,
     )
-    top_k_logits = top_BS2_logits[:, :, :top_k]
-    top_k_idx = top_BS2_idx[:, :, :top_k]
+    gather_top_k_idx = tl.arange(0, top_k)[None, None, :].broadcast_to((BLOCKSIZE0, BLOCKSIZE1, top_k))
+    top_k_logits = top_BS2_logits.gather(gather_top_k_idx, axis=-1)
+    top_k_idx = top_BS2_idx.gather(gather_top_k_idx, axis=-1)
 
-    probs = tl.softmax(top_k_logits / temperature, dim=-1)
-    p_cumsum = probs.cumsum(axis=-1)
-    within_top_p = p_cumsum <= top_p
+    probs = tl.softmax(top_k_logits / temperature, dim=-1, keep_dims=True)
+
+    # apply top-p sampling
+    p_inclusive_cumsum = probs.cumsum(axis=-1)
+    within_top_p = (p_inclusive_cumsum - probs) <= top_p  # include the token which crosses top_p as well
     probs = tl.where(within_top_p, probs, 0.0)  # top-p masking
-    probs /= probs.sum(axis=-1, keepdim=True)  # renormalize
-    p_cumsum = probs.cumsum(axis=-1)
+    probs /= probs.sum(axis=-1, keep_dims=True)  # renormalize
+    p_inclusive_cumsum = probs.cumsum(axis=-1)
 
+    # sample the probability distribution
     pid_t = tl.program_id(0)
     pid_b = tl.program_id(1)
     off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None]
     off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :]
     offs = off_b * T + off_t  # sampling grid with fake-contiguous striding (-> samples independent of mem layout)
-    rands = tl.rand(seed, offs)
+    rands = tl.rand(seed, offs).reshape((BLOCKSIZE0, BLOCKSIZE1, 1))
 
-    accept_mask = rands <= p_cumsum  # transition from ...,False,False -> True,True,... at the sampled token
-    amin_mask = accept_mask * float("inf")
-    token_ids_tile_idx = tl.argmin(p_cumsum + amin_mask, axis=-1)
-    token_ids = top_k_idx.gather(token_ids_tile_idx, axis=-1)
+    accept_mask = rands <= p_inclusive_cumsum  # transition from ...,False,False -> True,True,... at the sampled token
+    token_ids_tile_idx = tl.argmin(p_inclusive_cumsum + (1 - accept_mask) * float("inf"), axis=-1, keep_dims=True)
+    token_ids = top_k_idx.gather(token_ids_tile_idx.broadcast_to((BLOCKSIZE0, BLOCKSIZE1, 1)), axis=-1).reshape(
+        (BLOCKSIZE0, BLOCKSIZE1)
+    )
 
     out_token_ids_offs = off_b * out_token_ids_stride0 + off_t * out_token_ids_stride1
     tl.store(out_token_ids_ptr + out_token_ids_offs, token_ids, mask=(off_b < B) & (off_t < T))
