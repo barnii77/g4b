@@ -130,11 +130,8 @@ class LmHead:
     # runtime state
     logits_BtV: Tensor
     logits_token_ids_BtV: Tensor
-    logit_softcap: float
+    logit_softcap: float  # TODO don't forget to epilogue fuse this into the residual->logits matmul
     temperature: float
-    # TODO how does sampling work with top-k and top-p together?
-    #  -> softmax -> keep top-k -> out of those keep until sum(kept_toks) > p * sum(topk_toks) -> renormalize -> sample.
-    #  also, how much of this can I fuse?
 
 
 @dataclass(frozen=True)
