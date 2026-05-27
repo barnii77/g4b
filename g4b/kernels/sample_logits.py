@@ -6,6 +6,25 @@ from g4b.kernels.utils import launch
 from g4b.utils import to_int_exact
 
 
+def _cfg(
+    b0: int,
+    b1: int,
+    b2: int,
+    *,
+    warps: int,
+    stages: int = 3,
+):
+    return triton.Config(
+        {
+            "BLOCKSIZE0": b0,
+            "BLOCKSIZE1": b1,
+            "BLOCKSIZE2": b2,
+        },
+        num_warps=warps,
+        num_stages=stages,
+    )
+
+
 @triton.jit
 def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
     # TODO technically I could reverse bitonic sort `tile` only, and then do a single bitonic iter on the joined tile.
@@ -62,17 +81,43 @@ def _bitonic_scan_find_top_k_logits_jfn(
     return accum, accum_idx
 
 
-# TODO autotune
+@triton.autotune(
+    # fmt: off
+    configs=[
+        # ---- decode / one sample row per program ----
+        _cfg(1, 1, 128, warps=4),
+        _cfg(1, 1, 256, warps=8),
+        _cfg(1, 1, 512, warps=8),
+        # ---- small token batching ----
+        _cfg(1, 2, 128, warps=4),
+        _cfg(1, 2, 256, warps=8),
+        _cfg(1, 4, 128, warps=4),
+        _cfg(1, 4, 256, warps=8),
+        # ---- batch batching ----
+        _cfg(2, 1, 128, warps=4),
+        _cfg(2, 1, 256, warps=8),
+        _cfg(4, 1, 128, warps=4),
+    ],
+    # fmt: on
+    key=[
+        # fmt: off
+        "logits_shape0", "logits_shape1", "logits_shape2",
+        "out_token_ids_shape0", "out_token_ids_shape1",
+        "logits_stride0", "logits_stride1", "logits_stride2",
+        "out_token_ids_stride0", "out_token_ids_stride1",
+        "temperature", "top_k", "top_p",
+        # fmt: on
+    ],
+)
 @triton.jit
 def _sample_logits_kernel(
     # fmt: off
-    logits_ptr, out_token_ids_ptr,
+    logits_ptr, out_token_ids_ptr, seed,
     logits_shape0: tl.constexpr, logits_shape1: tl.constexpr, logits_shape2: tl.constexpr,
     out_token_ids_shape0: tl.constexpr, out_token_ids_shape1: tl.constexpr,
     logits_stride0: tl.constexpr, logits_stride1: tl.constexpr, logits_stride2: tl.constexpr,
     out_token_ids_stride0: tl.constexpr, out_token_ids_stride1: tl.constexpr,
-    temperature: tl.constexpr, top_k: tl.constexpr, top_p: tl.constexpr, seed: tl.constexpr,
-    # TODO the best config is probably BLOCKSIZE0 = BLOCKSIZE1 = 1, maximize BLOCKSIZE2
+    temperature: tl.constexpr, top_k: tl.constexpr, top_p: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
