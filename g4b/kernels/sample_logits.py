@@ -149,7 +149,6 @@ def _sample_logits_kernel(
     gather_top_k_idx = tl.arange(0, top_k)[None, None, :].broadcast_to((BLOCKSIZE0, BLOCKSIZE1, top_k))
     top_k_logits = top_BS2_logits.gather(gather_top_k_idx, axis=-1)
     top_k_idx = top_BS2_idx.gather(gather_top_k_idx, axis=-1)
-    print("top k idx", top_k_idx)
 
     probs = tl.softmax(top_k_logits / temperature, dim=-1, keep_dims=True)
 
