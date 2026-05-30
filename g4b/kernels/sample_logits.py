@@ -60,23 +60,18 @@ def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
 def _bitonic_scan_find_top_k_logits_jfn(
     # fmt: off
     logits_ptr,
+    off_b, off_t, split_off_v,
     B: tl.constexpr, T: tl.constexpr, V: tl.constexpr,
     stride_b: tl.constexpr, stride_t: tl.constexpr, stride_v: tl.constexpr,
     BLOCKSIZE_B: tl.constexpr, BLOCKSIZE_T: tl.constexpr, BLOCKSIZE_V: tl.constexpr,
+    ELEMS_PER_SPLIT: tl.constexpr,
     # fmt: on
 ):
-    pid_t = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    # processing across V dimension is sequential within each program
-
-    off_b = pid_b * BLOCKSIZE_B + tl.arange(0, BLOCKSIZE_B)[:, None, None]
-    off_t = pid_t * BLOCKSIZE_T + tl.arange(0, BLOCKSIZE_T)[None, :, None]
-
     accum = tl.full((BLOCKSIZE_B, BLOCKSIZE_T, BLOCKSIZE_V), float("-inf"), dtype=logits_ptr.dtype.element_ty)
     accum_idx = tl.full((BLOCKSIZE_B, BLOCKSIZE_T, BLOCKSIZE_V), -1, dtype=tl.int32)
 
-    for v in tl.range(0, V, BLOCKSIZE_V):
-        off_v = v + tl.arange(0, BLOCKSIZE_V)[None, None, :]
+    for v in tl.range(0, ELEMS_PER_SPLIT, BLOCKSIZE_V):
+        off_v = split_off_v + v
         logits_offs = off_b * stride_b + off_t * stride_t + off_v * stride_v
         logits = tl.load(logits_ptr + logits_offs, mask=(off_b < B) & (off_t < T) & (off_v < V), other=float("-inf"))
         accum, accum_idx = _bitonic_reduce_jfn(accum, accum_idx, logits, off_v)
@@ -106,40 +101,61 @@ def _bitonic_scan_find_top_k_logits_jfn(
     key=[
         # fmt: off
         "logits_shape0", "logits_shape1", "logits_shape2",
-        "out_token_ids_shape0", "out_token_ids_shape1",
+        "out_top_k_logits_shape0", "out_top_k_logits_shape1", "out_top_k_logits_shape2",
+        "out_top_k_idx_shape0", "out_top_k_idx_shape1", "out_top_k_idx_shape2",
         "logits_stride0", "logits_stride1", "logits_stride2",
-        "out_token_ids_stride0", "out_token_ids_stride1",
-        "temperature", "top_k", "top_p",
+        "out_top_k_logits_stride0", "out_top_k_logits_stride1", "out_top_k_logits_stride2",
+        "out_top_k_idx_stride0", "out_top_k_idx_stride1", "out_top_k_idx_stride2",
+        "top_k", "NUM_V_SPLITS",
         # fmt: on
     ],
 )
 @triton.jit
-def _sample_logits_kernel(
+def _sample_logits_parallel_reduce_kernel(
     # fmt: off
-    logits_ptr, out_token_ids_ptr, seed_ptr,
+    logits_ptr, out_top_k_logits_ptr, out_top_k_idx_ptr,
     logits_shape0: tl.constexpr, logits_shape1: tl.constexpr, logits_shape2: tl.constexpr,
-    out_token_ids_shape0: tl.constexpr, out_token_ids_shape1: tl.constexpr,
-    seed_shape0: tl.constexpr,
+    out_top_k_logits_shape0: tl.constexpr, out_top_k_logits_shape1: tl.constexpr, out_top_k_logits_shape2: tl.constexpr, out_top_k_logits_shape3: tl.constexpr,
+    out_top_k_idx_shape0: tl.constexpr, out_top_k_idx_shape1: tl.constexpr, out_top_k_idx_shape2: tl.constexpr, out_top_k_idx_shape3: tl.constexpr,
     logits_stride0: tl.constexpr, logits_stride1: tl.constexpr, logits_stride2: tl.constexpr,
-    out_token_ids_stride0: tl.constexpr, out_token_ids_stride1: tl.constexpr,
-    seed_stride0: tl.constexpr,
-    temperature: tl.constexpr, top_k: tl.constexpr, top_p: tl.constexpr,
+    out_top_k_logits_stride0: tl.constexpr, out_top_k_logits_stride1: tl.constexpr, out_top_k_logits_stride2: tl.constexpr, out_top_k_logits_stride3: tl.constexpr,
+    out_top_k_idx_stride0: tl.constexpr, out_top_k_idx_stride1: tl.constexpr, out_top_k_idx_stride2: tl.constexpr, out_top_k_idx_stride3: tl.constexpr,
+    top_k: tl.constexpr, NUM_V_SPLITS: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
-    # TODO this kernel must allow split-D processing... it's measurably slow for big tensors
     # TODO this kernel needs a loader mixin which can prologue-fuse rmsnorm application (given sum-of-squares)
-    tl.static_assert(logits_shape0 == out_token_ids_shape0)
-    tl.static_assert(logits_shape1 == out_token_ids_shape1)
-    tl.static_assert(seed_shape0 == 2)
+    tl.static_assert(logits_shape0 == out_top_k_logits_shape0)
+    tl.static_assert(logits_shape0 == out_top_k_idx_shape0)
+    tl.static_assert(logits_shape1 == out_top_k_logits_shape1)
+    tl.static_assert(logits_shape1 == out_top_k_idx_shape1)
+    tl.static_assert(out_top_k_logits_shape2 == NUM_V_SPLITS)
+    tl.static_assert(out_top_k_idx_shape2 == NUM_V_SPLITS)
+    tl.static_assert(out_top_k_logits_shape3 == top_k)
+    tl.static_assert(out_top_k_idx_shape3 == top_k)
     tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
+    tl.static_assert(logits_shape2 % NUM_V_SPLITS == 0)
+
     B: tl.constexpr = logits_shape0
     T: tl.constexpr = logits_shape1
     V: tl.constexpr = logits_shape2
+    ELEMS_PER_SPLIT: tl.constexpr = V // NUM_V_SPLITS
+    tl.static_assert(ELEMS_PER_SPLIT % BLOCKSIZE2 == 0)
+
+    pid_split_v = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
+    off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
+    off_v = pid_split_v * ELEMS_PER_SPLIT + tl.arange(0, BLOCKSIZE2)[None, None, :]
 
     # sorted in descending order
     top_BS2_logits, top_BS2_idx = _bitonic_scan_find_top_k_logits_jfn(
         logits_ptr,
+        off_b,
+        off_t,
+        off_v,
         B,
         T,
         V,
@@ -149,10 +165,150 @@ def _sample_logits_kernel(
         BLOCKSIZE0,
         BLOCKSIZE1,
         BLOCKSIZE2,
+        ELEMS_PER_SPLIT,
     )
     gather_top_k_idx = tl.arange(0, top_k)[None, None, :].broadcast_to((BLOCKSIZE0, BLOCKSIZE1, top_k))
     top_k_logits = top_BS2_logits.gather(gather_top_k_idx, axis=-1)
     top_k_idx = top_BS2_idx.gather(gather_top_k_idx, axis=-1)
+
+    # write partial top-k reduction result out to intermediate buffer
+    off_v_top_k = pid_split_v * top_k + tl.arange(0, top_k)[None, None, :]
+    logits_offs = (
+        off_b * out_top_k_logits_stride0
+        + off_t * out_top_k_logits_stride1
+        + pid_split_v * out_top_k_logits_stride2
+        + tl.arange(0, top_k)[None, None, :] * out_top_k_logits_stride3
+    )
+    tl.store(
+        out_top_k_logits_ptr + logits_offs,
+        top_k_logits,
+        mask=(off_b < B) & (off_t < T) & (off_v_top_k < top_k * NUM_V_SPLITS),
+    )
+    idx_offs = (
+        off_b * out_top_k_idx_stride0
+        + off_t * out_top_k_idx_stride1
+        + pid_split_v * out_top_k_idx_stride2
+        + tl.arange(0, top_k)[None, None, :] * out_top_k_idx_stride3
+    )
+    tl.store(
+        out_top_k_idx_ptr + idx_offs,
+        top_k_idx,
+        mask=(off_b < B) & (off_t < T) & (off_v_top_k < top_k * NUM_V_SPLITS),
+    )
+
+
+@triton.autotune(
+    # fmt: off
+    configs=[
+        # ---- decode / one sample row per program ----
+        # TODO one of these configs seems to be triggering a triton bug?
+        # _cfg(1, 1, 128, warps=4),
+        _cfg(1, 1, 256, warps=8),
+        # _cfg(1, 1, 512, warps=8),
+        # ---- small token batching ----
+        # _cfg(1, 2, 128, warps=4),
+        _cfg(1, 2, 256, warps=8),
+        # _cfg(1, 4, 128, warps=4),
+        _cfg(1, 4, 256, warps=8),
+        # ---- batch batching ----
+        # _cfg(2, 1, 128, warps=4),
+        _cfg(2, 1, 256, warps=8),
+        # _cfg(4, 1, 128, warps=4),
+    ],
+    # fmt: on
+    key=[
+        # fmt: off
+        "top_k_logits_shape0", "top_k_logits_shape1", "top_k_logits_shape2", "top_k_logits_shape3",
+        "top_k_idx_shape0", "top_k_idx_shape1", "top_k_idx_shape2", "top_k_idx_shape3",
+        "out_token_ids_shape0", "out_token_ids_shape1",
+        "seed_shape0",
+        "top_k_logits_stride0", "top_k_logits_stride1", "top_k_logits_stride2", "top_k_logits_stride3",
+        "top_k_idx_stride0", "top_k_idx_stride1", "top_k_idx_stride2", "top_k_idx_stride3",
+        "out_token_ids_stride0", "out_token_ids_stride1",
+        "seed_stride0",
+        "temperature", "top_k", "top_p",
+        "NUM_V_SPLITS",
+        # fmt: on
+    ],
+)
+@triton.jit
+def _sample_logits_finalize_kernel(
+    # fmt: off
+    top_k_logits_ptr, top_k_idx_ptr,
+    out_token_ids_ptr, seed_ptr,
+    top_k_logits_shape0: tl.constexpr, top_k_logits_shape1: tl.constexpr, top_k_logits_shape2: tl.constexpr, top_k_logits_shape3: tl.constexpr,
+    top_k_idx_shape0: tl.constexpr, top_k_idx_shape1: tl.constexpr, top_k_idx_shape2: tl.constexpr, top_k_idx_shape3: tl.constexpr,
+    out_token_ids_shape0: tl.constexpr, out_token_ids_shape1: tl.constexpr,
+    seed_shape0: tl.constexpr,
+    top_k_logits_stride0: tl.constexpr, top_k_logits_stride1: tl.constexpr, top_k_logits_stride2: tl.constexpr, top_k_logits_stride3: tl.constexpr,
+    top_k_idx_stride0: tl.constexpr, top_k_idx_stride1: tl.constexpr, top_k_idx_stride2: tl.constexpr, top_k_idx_stride3: tl.constexpr,
+    out_token_ids_stride0: tl.constexpr, out_token_ids_stride1: tl.constexpr,
+    seed_stride0: tl.constexpr,
+    temperature: tl.constexpr, top_k: tl.constexpr, top_p: tl.constexpr,
+    NUM_V_SPLITS: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
+    # fmt: on
+):
+    tl.static_assert(top_k_logits_shape0 == top_k_idx_shape0)
+    tl.static_assert(top_k_logits_shape1 == top_k_idx_shape1)
+    tl.static_assert(top_k_logits_shape2 == top_k_idx_shape2)
+    tl.static_assert(top_k_logits_shape3 == top_k_idx_shape3)
+    tl.static_assert(top_k_logits_shape0 == out_token_ids_shape0)
+    tl.static_assert(top_k_logits_shape1 == out_token_ids_shape1)
+    tl.static_assert(top_k_logits_shape2 == NUM_V_SPLITS)
+    tl.static_assert(top_k_logits_shape3 == top_k)
+    tl.static_assert(top_k_idx_shape3 == top_k)
+    tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
+    # contiguity requirements
+    tl.static_assert(top_k_logits_stride3 == 1)
+    tl.static_assert(top_k_logits_stride2 == top_k_logits_shape3)
+    tl.static_assert(top_k_idx_stride3 == 1)
+    tl.static_assert(top_k_idx_stride2 == top_k_idx_shape3)
+
+    B: tl.constexpr = top_k_logits_shape0
+    T: tl.constexpr = top_k_logits_shape1
+
+    ### do the final reduction across partial top-k's -> final top-k logits/idx
+
+    pid_t = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    reduce_off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
+    reduce_off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
+    reduce_off_v = tl.arange(0, BLOCKSIZE2)[None, None, :]
+
+    # sorted in descending order
+    top_BS2_logits, top_BS2_idx_idx = _bitonic_scan_find_top_k_logits_jfn(
+        top_k_logits_ptr,
+        reduce_off_b,
+        reduce_off_t,
+        reduce_off_v,
+        B,
+        T,
+        top_k_logits_shape2 * top_k_logits_shape3,
+        top_k_logits_stride0,
+        top_k_logits_stride1,
+        1,
+        BLOCKSIZE0,
+        BLOCKSIZE1,
+        BLOCKSIZE2,
+        top_k_logits_shape2 * top_k_logits_shape3,
+    )
+
+    # since we reduced over partial reduction results, the indices reference the partial reduction result and must be
+    #  remapped to token ids.
+    top_k_idx_offs = reduce_off_b * top_k_idx_stride0 + reduce_off_t * top_k_idx_stride1 + top_BS2_idx_idx
+    top_BS2_idx = tl.load(
+        top_k_idx_ptr + top_k_idx_offs,
+        mask=(reduce_off_b < B) & (reduce_off_t < T) & (top_BS2_idx_idx != -1),
+        other=-1,
+    )
+
+    gather_top_k_idx = tl.arange(0, top_k)[None, None, :].broadcast_to((BLOCKSIZE0, BLOCKSIZE1, top_k))
+    top_k_logits = top_BS2_logits.gather(gather_top_k_idx, axis=-1)
+    top_k_idx = top_BS2_idx.gather(gather_top_k_idx, axis=-1)
+
+    ### final reduction done - sample now
 
     probs = tl.softmax(top_k_logits / temperature, dim=-1, keep_dims=True)
 
@@ -164,8 +320,6 @@ def _sample_logits_kernel(
     p_inclusive_cumsum = probs.cumsum(axis=-1)
 
     # sample the probability distribution
-    pid_t = tl.program_id(0)
-    pid_b = tl.program_id(1)
     off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None]
     off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :]
     offs = off_b * T + off_t  # sampling grid with fake-contiguous striding (-> samples independent of mem layout)
@@ -206,22 +360,54 @@ def sample_logits(
     logits: Tensor,
     out_token_ids: Tensor,
     seed: Tensor,
+    tmp_top_k_logits_scratchpad: Tensor,
+    tmp_top_k_idx_scratchpad: Tensor,
     temperature: float,
     top_k: int,
     top_p: float,
+    NUM_V_SPLITS: int,
 ):
     assert list(seed.shape) == [2]
-    grid_fn = lambda META: (
+    grid_fn_parallel_reduce = lambda META: (
+        NUM_V_SPLITS,
         triton.cdiv(logits.shape[1], META["BLOCKSIZE1"]),
         triton.cdiv(logits.shape[0], META["BLOCKSIZE0"]),
     )
-    k1 = launch[_sample_logits_kernel, grid_fn](
+    grid_fn_finalize = lambda META: (
+        triton.cdiv(logits.shape[1], META["BLOCKSIZE1"]),
+        triton.cdiv(logits.shape[0], META["BLOCKSIZE0"]),
+    )
+    k1 = launch[_sample_logits_parallel_reduce_kernel, grid_fn_parallel_reduce](
         logits=logits,
+        out_top_k_logits=tmp_top_k_logits_scratchpad,
+        out_top_k_idx=tmp_top_k_idx_scratchpad,
+        top_k=to_int_exact(top_k),
+        NUM_V_SPLITS=NUM_V_SPLITS,
+    )
+    k2 = launch[_sample_logits_finalize_kernel, grid_fn_finalize](
+        top_k_logits=tmp_top_k_logits_scratchpad,
+        top_k_idx=tmp_top_k_idx_scratchpad,
         out_token_ids=out_token_ids,
         seed=seed,
         temperature=float(temperature),
         top_k=to_int_exact(top_k),
         top_p=float(top_p),
+        NUM_V_SPLITS=NUM_V_SPLITS,
     )
-    k2 = launch[_sample_logits_update_seed_kernel, (1,)](seed=seed, logits=logits)
-    return k1, k2
+    k3 = launch[_sample_logits_update_seed_kernel, (1,)](seed=seed, logits=logits)
+    return k1, k2, k3
+
+
+def sample_logits_get_recommended_num_v_splits(V: int) -> int:
+    # TODO autotune this
+    return (
+        # fmt: off
+        128 if V >= 32768 else
+        64 if V >= 16384 else
+        32 if V >= 8192 else
+        16 if V >= 4096 else
+        8 if V >= 2048 else
+        2 if V >= 512 else
+        1
+        # fmt: on
+    )
