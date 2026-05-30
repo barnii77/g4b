@@ -48,9 +48,9 @@ def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
             x = tl.where(should_swap, other, x)
             x_idx = tl.where(should_swap, other_idx, x_idx)
 
-    split_shape: tl.constexpr = x.shape[0], x.shape[1], accum.shape[2], 2
-    accum, _ = tl.split(x.reshape(split_shape))
-    accum_idx, _ = tl.split(x_idx.reshape(split_shape))
+    split_shape: tl.constexpr = x.shape[0], x.shape[1], 2, accum.shape[2]
+    accum, _ = tl.split(x.reshape(split_shape).trans(0, 1, 3, 2))
+    accum_idx, _ = tl.split(x_idx.reshape(split_shape).trans(0, 1, 3, 2))
     return accum, accum_idx
 
 
