@@ -60,26 +60,26 @@ def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
 def _bitonic_scan_find_top_k_logits_jfn(
     # fmt: off
     logits_ptr,
-    B: tl.constexpr, T: tl.constexpr, D: tl.constexpr,
-    stride_b: tl.constexpr, stride_t: tl.constexpr, stride_d: tl.constexpr,
-    BLOCKSIZE_B: tl.constexpr, BLOCKSIZE_T: tl.constexpr, BLOCKSIZE_D: tl.constexpr,
+    B: tl.constexpr, T: tl.constexpr, V: tl.constexpr,
+    stride_b: tl.constexpr, stride_t: tl.constexpr, stride_v: tl.constexpr,
+    BLOCKSIZE_B: tl.constexpr, BLOCKSIZE_T: tl.constexpr, BLOCKSIZE_V: tl.constexpr,
     # fmt: on
 ):
     pid_t = tl.program_id(0)
     pid_b = tl.program_id(1)
-    # processing across D dimension is sequential within each program
+    # processing across V dimension is sequential within each program
 
     off_b = pid_b * BLOCKSIZE_B + tl.arange(0, BLOCKSIZE_B)[:, None, None]
     off_t = pid_t * BLOCKSIZE_T + tl.arange(0, BLOCKSIZE_T)[None, :, None]
 
-    accum = tl.full((BLOCKSIZE_B, BLOCKSIZE_T, BLOCKSIZE_D), float("-inf"), dtype=logits_ptr.dtype.element_ty)
-    accum_idx = tl.full((BLOCKSIZE_B, BLOCKSIZE_T, BLOCKSIZE_D), -1, dtype=tl.int32)
+    accum = tl.full((BLOCKSIZE_B, BLOCKSIZE_T, BLOCKSIZE_V), float("-inf"), dtype=logits_ptr.dtype.element_ty)
+    accum_idx = tl.full((BLOCKSIZE_B, BLOCKSIZE_T, BLOCKSIZE_V), -1, dtype=tl.int32)
 
-    for d in tl.range(0, D, BLOCKSIZE_D):
-        off_d = d + tl.arange(0, BLOCKSIZE_D)[None, None, :]
-        logits_offs = off_b * stride_b + off_t * stride_t + off_d * stride_d
-        logits = tl.load(logits_ptr + logits_offs, mask=(off_b < B) & (off_t < T) & (off_d < D), other=float("-inf"))
-        accum, accum_idx = _bitonic_reduce_jfn(accum, accum_idx, logits, off_d)
+    for v in tl.range(0, V, BLOCKSIZE_V):
+        off_v = v + tl.arange(0, BLOCKSIZE_V)[None, None, :]
+        logits_offs = off_b * stride_b + off_t * stride_t + off_v * stride_v
+        logits = tl.load(logits_ptr + logits_offs, mask=(off_b < B) & (off_t < T) & (off_v < V), other=float("-inf"))
+        accum, accum_idx = _bitonic_reduce_jfn(accum, accum_idx, logits, off_v)
 
     return accum, accum_idx
 
@@ -135,14 +135,14 @@ def _sample_logits_kernel(
     tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
     B: tl.constexpr = logits_shape0
     T: tl.constexpr = logits_shape1
-    D: tl.constexpr = logits_shape2  # TODO this should really be called V across the file, not D
+    V: tl.constexpr = logits_shape2
 
     # sorted in descending order
     top_BS2_logits, top_BS2_idx = _bitonic_scan_find_top_k_logits_jfn(
         logits_ptr,
         B,
         T,
-        D,
+        V,
         logits_stride0,
         logits_stride1,
         logits_stride2,
