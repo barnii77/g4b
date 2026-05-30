@@ -125,8 +125,10 @@ def _sample_logits_kernel(
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
-    # TODO this kernel could (and probably should) allow split-D processing... it's measurably slow for big tensors
-    #  (though this doesn't matter much because it only ever runs on input tensors with T = 1 and B = small number)
+    # TODO FIXME this kernel needs a notion of time (a B-sized int32 vector where each sampling step it increments) so
+    #  it can use that time in the random number sampling. otherwise, due to fixed seed, every step will sample the same
+    #  `rand` and that will lead to weird output distributions.
+    # TODO this kernel must allow split-D processing... it's measurably slow for big tensors
     tl.static_assert(logits_shape0 == out_token_ids_shape0)
     tl.static_assert(logits_shape1 == out_token_ids_shape1)
     tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
