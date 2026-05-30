@@ -41,10 +41,12 @@ def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
         for inner_it in tl.static_range(0, it + 1):
             phase = it - inner_it
             idx = tl.arange(0, BLOCKSIZE)[None, None, :]
-            other_idx = idx ^ (1 << phase)
-            other = x.gather(other_idx.broadcast_to(x.shape), axis=-1)
+            other_offs = (idx ^ (1 << phase)).broadcast_to(x.shape)
+            other = x.gather(other_offs, axis=-1)
+            other_idx = x_idx.gather(other_offs, axis=-1)
             is_reversed = ((idx >> it + 1) ^ (idx >> phase)) & 1  # 0 -> asc, 1 -> desc cas sort for pair
             should_swap = ((x < other) ^ is_reversed) != 0
+            should_swap &= x != other  # without this, x_idx would not be preserved correctly
             x = tl.where(should_swap, other, x)
             x_idx = tl.where(should_swap, other_idx, x_idx)
 
@@ -147,6 +149,7 @@ def _sample_logits_kernel(
     gather_top_k_idx = tl.arange(0, top_k)[None, None, :].broadcast_to((BLOCKSIZE0, BLOCKSIZE1, top_k))
     top_k_logits = top_BS2_logits.gather(gather_top_k_idx, axis=-1)
     top_k_idx = top_BS2_idx.gather(gather_top_k_idx, axis=-1)
+    print("top k idx", top_k_idx)
 
     probs = tl.softmax(top_k_logits / temperature, dim=-1, keep_dims=True)
 
