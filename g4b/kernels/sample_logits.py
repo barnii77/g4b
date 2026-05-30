@@ -29,29 +29,24 @@ def _cfg(
 def _bitonic_reduce_jfn(accum, accum_idx, tile, tile_offs):
     # TODO technically I could reverse bitonic sort `tile` only, and then do a single bitonic iter on the joined tile.
     tl.static_assert(tile_offs.shape[0] == 1)
-    tl.static_assert(tile_offs.shape[1] == accum_idx.shape[1])
+    tl.static_assert(tile_offs.shape[1] == 1)
     tl.static_assert(tile_offs.shape[2] == accum_idx.shape[2])
 
     x = tl.cat(accum, tile, dim=-1)
     x_idx = tl.cat(accum_idx, tile_offs.broadcast_to(accum_idx.shape), dim=-1)
-    TILESIZE: tl.constexpr = accum.shape[-1]
+    BLOCKSIZE: tl.constexpr = x.shape[-1]
 
-    n_bitonic_iters: tl.constexpr = int(math.log2(x.shape[-1]))
+    n_bitonic_iters: tl.constexpr = int(math.log2(x.shape[-1]) + 0.5)  # round(log2(shape[-1]))
     for it in tl.static_range(0, n_bitonic_iters):
-        cmp_idx_pattern = tl.arange(0, TILESIZE)[None, None, :] & ((1 << it + 1) - 1)
-        is_reversed_desc = cmp_idx_pattern >= (1 << it)  # `<` -> ascending sort
         for inner_it in tl.static_range(0, it + 1):
-            a_idx = (tl.arange(0, TILESIZE)[None, None, :] * 2).broadcast_to((accum.shape[0], accum.shape[1], TILESIZE))
-            b_idx = a_idx + (1 << inner_it)
-            a = x.gather(a_idx, axis=-1)
-            b = x.gather(b_idx, axis=-1)
-            cmp_mask = (a < b) ^ is_reversed_desc
-            d_idx = (b_idx - a_idx) * cmp_mask
-            a_idx += d_idx
-            b_idx -= d_idx
-            reorder_idx = tl.cat(a_idx, b_idx, dim=-1)
-            x = x.gather(reorder_idx, axis=-1)
-            x_idx = x_idx.gather(reorder_idx, axis=-1)
+            phase = it - inner_it
+            idx = tl.arange(0, BLOCKSIZE)[None, None, :]
+            other_idx = idx ^ (1 << phase)
+            other = x.gather(other_idx.broadcast_to(x.shape), axis=-1)
+            is_reversed = ((idx >> it + 1) ^ (idx >> phase)) & 1  # 0 -> asc, 1 -> desc cas sort for pair
+            should_swap = ((x < other) ^ is_reversed) != 0
+            x = tl.where(should_swap, other, x)
+            x_idx = tl.where(should_swap, other_idx, x_idx)
 
     split_shape: tl.constexpr = x.shape[0], x.shape[1], accum.shape[2], 2
     accum, _ = tl.split(x.reshape(split_shape))
@@ -90,19 +85,18 @@ def _bitonic_scan_find_top_k_logits_jfn(
 @triton.autotune(
     # fmt: off
     configs=[
-        # TODO comment back in
-        # # ---- decode / one sample row per program ----
+        # ---- decode / one sample row per program ----
         # _cfg(1, 1, 128, warps=4),
         # _cfg(1, 1, 256, warps=8),
         # _cfg(1, 1, 512, warps=8),
-        # # ---- small token batching ----
-        # _cfg(1, 2, 128, warps=4),
-        # _cfg(1, 2, 256, warps=8),
-        # _cfg(1, 4, 128, warps=4),
-        # _cfg(1, 4, 256, warps=8),
-        # # ---- batch batching ----
-        # _cfg(2, 1, 128, warps=4),
-        # _cfg(2, 1, 256, warps=8),
+        # ---- small token batching ----
+        _cfg(1, 2, 128, warps=4),
+        _cfg(1, 2, 256, warps=8),
+        _cfg(1, 4, 128, warps=4),
+        _cfg(1, 4, 256, warps=8),
+        # ---- batch batching ----
+        _cfg(2, 1, 128, warps=4),
+        _cfg(2, 1, 256, warps=8),
         _cfg(4, 1, 128, warps=4),
     ],
     # fmt: on
@@ -128,7 +122,8 @@ def _sample_logits_kernel(
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
-    # TODO this kernel could (and probably should) allow split-D processing
+    # TODO this kernel could (and probably should) allow split-D processing... it's measurably slow for big tensors
+    #  (though this doesn't matter much because it only ever runs on input tensors with T = 1 and B = small number)
     tl.static_assert(logits_shape0 == out_token_ids_shape0)
     tl.static_assert(logits_shape1 == out_token_ids_shape1)
     tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
