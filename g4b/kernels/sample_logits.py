@@ -88,9 +88,9 @@ def _bitonic_scan_find_top_k_logits_jfn(
     # fmt: off
     configs=[
         # ---- decode / one sample row per program ----
-        # _cfg(1, 1, 128, warps=4),
-        # _cfg(1, 1, 256, warps=8),
-        # _cfg(1, 1, 512, warps=8),
+        _cfg(1, 1, 128, warps=4),
+        _cfg(1, 1, 256, warps=8),
+        _cfg(1, 1, 512, warps=8),
         # ---- small token batching ----
         _cfg(1, 2, 128, warps=4),
         _cfg(1, 2, 256, warps=8),
@@ -168,10 +168,8 @@ def _sample_logits_kernel(
     rands = tl.rand(seed, offs).reshape((BLOCKSIZE0, BLOCKSIZE1, 1))
 
     accept_mask = rands <= p_inclusive_cumsum  # transition from ...,False,False -> True,True,... at the sampled token
-    token_ids_tile_idx = tl.argmin(p_inclusive_cumsum + (1 - accept_mask) * float("inf"), axis=-1, keep_dims=True)
-    token_ids = top_k_idx.gather(token_ids_tile_idx.broadcast_to((BLOCKSIZE0, BLOCKSIZE1, 1)), axis=-1).reshape(
-        (BLOCKSIZE0, BLOCKSIZE1)
-    )
+    token_ids_tile_idx = tl.argmax(accept_mask, axis=-1, tie_break_left=True, keep_dims=True)
+    token_ids = top_k_idx.gather(token_ids_tile_idx, axis=-1).reshape((BLOCKSIZE0, BLOCKSIZE1))
 
     out_token_ids_offs = off_b * out_token_ids_stride0 + off_t * out_token_ids_stride1
     tl.store(out_token_ids_ptr + out_token_ids_offs, token_ids, mask=(off_b < B) & (off_t < T))
