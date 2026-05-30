@@ -116,25 +116,26 @@ def _bitonic_scan_find_top_k_logits_jfn(
 @triton.jit
 def _sample_logits_kernel(
     # fmt: off
-    logits_ptr, out_token_ids_ptr, seed,
+    logits_ptr, out_token_ids_ptr, seed_ptr,
     logits_shape0: tl.constexpr, logits_shape1: tl.constexpr, logits_shape2: tl.constexpr,
     out_token_ids_shape0: tl.constexpr, out_token_ids_shape1: tl.constexpr,
+    seed_shape0: tl.constexpr,
     logits_stride0: tl.constexpr, logits_stride1: tl.constexpr, logits_stride2: tl.constexpr,
     out_token_ids_stride0: tl.constexpr, out_token_ids_stride1: tl.constexpr,
+    seed_stride0: tl.constexpr,
     temperature: tl.constexpr, top_k: tl.constexpr, top_p: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
-    # TODO FIXME this kernel needs a notion of time (a B-sized int32 vector where each sampling step it increments) so
-    #  it can use that time in the random number sampling. otherwise, due to fixed seed, every step will sample the same
-    #  `rand` and that will lead to weird output distributions.
     # TODO this kernel must allow split-D processing... it's measurably slow for big tensors
+    # TODO this kernel needs a loader mixin which can prologue-fuse rmsnorm application (given sum-of-squares)
     tl.static_assert(logits_shape0 == out_token_ids_shape0)
     tl.static_assert(logits_shape1 == out_token_ids_shape1)
+    tl.static_assert(seed_shape0 == 2)
     tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
     B: tl.constexpr = logits_shape0
     T: tl.constexpr = logits_shape1
-    D: tl.constexpr = logits_shape2
+    D: tl.constexpr = logits_shape2  # TODO this should really be called V across the file, not D
 
     # sorted in descending order
     top_BS2_logits, top_BS2_idx = _bitonic_scan_find_top_k_logits_jfn(
@@ -168,7 +169,11 @@ def _sample_logits_kernel(
     off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None]
     off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :]
     offs = off_b * T + off_t  # sampling grid with fake-contiguous striding (-> samples independent of mem layout)
-    rands = tl.rand(seed, offs).reshape((BLOCKSIZE0, BLOCKSIZE1, 1))
+
+    # use 2-part seed (rng seed, offsets base)
+    seed_tile = tl.load(seed_ptr + tl.arange(0, seed_shape0) * seed_stride0)
+    seed, offs_base = tl.split(seed_tile)
+    rands = tl.rand(seed, offs_base + offs).reshape((BLOCKSIZE0, BLOCKSIZE1, 1))
 
     accept_mask = rands <= p_inclusive_cumsum  # transition from ...,False,False -> True,True,... at the sampled token
     token_ids_tile_idx = tl.argmax(accept_mask, axis=-1, tie_break_left=True, keep_dims=True)
@@ -178,16 +183,45 @@ def _sample_logits_kernel(
     tl.store(out_token_ids_ptr + out_token_ids_offs, token_ids, mask=(off_b < B) & (off_t < T))
 
 
-def sample_logits(logits: Tensor, out_token_ids: Tensor, temperature: float, top_k: int, top_p: float, seed: int):
+@triton.jit
+def _sample_logits_update_seed_kernel(
+    # fmt: off
+    seed_ptr,
+    logits_shape1: tl.constexpr,
+    seed_shape0: tl.constexpr,
+    seed_stride0: tl.constexpr,
+    SEED_UPDATE: tl.constexpr = 7, OFFS_BASE_UPDATE: tl.constexpr = 11,
+    # fmt: on
+):
+    # update 2-part seed
+    T: tl.constexpr = logits_shape1
+    seed_ptrs = seed_ptr + tl.arange(0, seed_shape0) * seed_stride0
+    seed_tile = tl.load(seed_ptrs)
+    seed, offs_base = tl.split(seed_tile)
+    seed_tile = tl.join(seed + SEED_UPDATE * T, offs_base + OFFS_BASE_UPDATE * T).reshape((seed_shape0,))
+    tl.store(seed_ptrs, seed_tile)
+
+
+def sample_logits(
+    logits: Tensor,
+    out_token_ids: Tensor,
+    seed: Tensor,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+):
+    assert list(seed.shape) == [2]
     grid_fn = lambda META: (
         triton.cdiv(logits.shape[1], META["BLOCKSIZE1"]),
         triton.cdiv(logits.shape[0], META["BLOCKSIZE0"]),
     )
-    return launch[_sample_logits_kernel, grid_fn](
+    k1 = launch[_sample_logits_kernel, grid_fn](
         logits=logits,
         out_token_ids=out_token_ids,
+        seed=seed,
         temperature=float(temperature),
         top_k=to_int_exact(top_k),
         top_p=float(top_p),
-        seed=to_int_exact(seed),
     )
+    k2 = launch[_sample_logits_update_seed_kernel, (1,)](seed=seed, logits=logits)
+    return k1, k2
