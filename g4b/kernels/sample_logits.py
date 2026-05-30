@@ -88,18 +88,19 @@ def _bitonic_scan_find_top_k_logits_jfn(
     # fmt: off
     configs=[
         # ---- decode / one sample row per program ----
-        _cfg(1, 1, 128, warps=4),
+        # TODO one of these configs seems to be triggering a triton bug?
+        # _cfg(1, 1, 128, warps=4),
         _cfg(1, 1, 256, warps=8),
-        _cfg(1, 1, 512, warps=8),
+        # _cfg(1, 1, 512, warps=8),
         # ---- small token batching ----
-        _cfg(1, 2, 128, warps=4),
+        # _cfg(1, 2, 128, warps=4),
         _cfg(1, 2, 256, warps=8),
-        _cfg(1, 4, 128, warps=4),
+        # _cfg(1, 4, 128, warps=4),
         _cfg(1, 4, 256, warps=8),
         # ---- batch batching ----
-        _cfg(2, 1, 128, warps=4),
+        # _cfg(2, 1, 128, warps=4),
         _cfg(2, 1, 256, warps=8),
-        _cfg(4, 1, 128, warps=4),
+        # _cfg(4, 1, 128, warps=4),
     ],
     # fmt: on
     key=[
