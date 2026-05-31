@@ -85,6 +85,8 @@ def _bitonic_scan_find_top_k_logits_jfn(
     configs=[
         # ---- decode / one sample row per program ----
         # TODO one of these configs seems to be triggering a triton bug?
+        _cfg(1, 1, 64, warps=1),
+        _cfg(1, 1, 64, warps=2),
         _cfg(1, 1, 64, warps=4),
         # _cfg(1, 1, 128, warps=4),
         # _cfg(1, 1, 256, warps=8),
@@ -205,6 +207,8 @@ def _sample_logits_parallel_reduce_kernel(
     configs=[
         # ---- decode / one sample row per program ----
         # TODO one of these configs seems to be triggering a triton bug?
+        _cfg(1, 1, 64, warps=1),
+        _cfg(1, 1, 64, warps=2),
         _cfg(1, 1, 64, warps=4),
         # _cfg(1, 1, 128, warps=4),
         # _cfg(1, 1, 256, warps=8),
