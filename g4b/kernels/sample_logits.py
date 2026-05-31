@@ -402,12 +402,9 @@ def sample_logits_get_recommended_num_v_splits(V: int) -> int:
     # TODO autotune this
     return (
         # fmt: off
-        128 if V >= 32768 else
-        64 if V >= 16384 else
-        32 if V >= 8192 else
-        16 if V >= 4096 else
-        8 if V >= 2048 else
-        2 if V >= 512 else
+        32 if V >= 65536 else
+        8 if V >= 16384 else
+        2 if V >= 4096 else
         1
         # fmt: on
     )
