@@ -79,22 +79,24 @@ def _bitonic_scan_find_top_k_logits_jfn(
     return accum, accum_idx
 
 
+# TODO these configs assume top_k <= 64, but really I should filter them based on whether this is true
 @triton.autotune(
     # fmt: off
     configs=[
         # ---- decode / one sample row per program ----
         # TODO one of these configs seems to be triggering a triton bug?
+        _cfg(1, 1, 64, warps=4),
         # _cfg(1, 1, 128, warps=4),
-        _cfg(1, 1, 256, warps=8),
+        # _cfg(1, 1, 256, warps=8),
         # _cfg(1, 1, 512, warps=8),
         # ---- small token batching ----
         # _cfg(1, 2, 128, warps=4),
-        _cfg(1, 2, 256, warps=8),
+        # _cfg(1, 2, 256, warps=8),
         # _cfg(1, 4, 128, warps=4),
-        _cfg(1, 4, 256, warps=8),
+        # _cfg(1, 4, 256, warps=8),
         # ---- batch batching ----
         # _cfg(2, 1, 128, warps=4),
-        _cfg(2, 1, 256, warps=8),
+        # _cfg(2, 1, 256, warps=8),
         # _cfg(4, 1, 128, warps=4),
     ],
     # fmt: on
@@ -133,7 +135,7 @@ def _sample_logits_parallel_reduce_kernel(
     tl.static_assert(out_top_k_idx_shape2 == NUM_V_SPLITS)
     tl.static_assert(out_top_k_logits_shape3 == top_k)
     tl.static_assert(out_top_k_idx_shape3 == top_k)
-    tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
+    tl.static_assert(top_k <= BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
     tl.static_assert(logits_shape2 % NUM_V_SPLITS == 0)
 
     B: tl.constexpr = logits_shape0
@@ -197,22 +199,24 @@ def _sample_logits_parallel_reduce_kernel(
     )
 
 
+# TODO these configs assume top_k <= 64, but really I should filter them based on whether this is true
 @triton.autotune(
     # fmt: off
     configs=[
         # ---- decode / one sample row per program ----
         # TODO one of these configs seems to be triggering a triton bug?
+        _cfg(1, 1, 64, warps=4),
         # _cfg(1, 1, 128, warps=4),
-        _cfg(1, 1, 256, warps=8),
+        # _cfg(1, 1, 256, warps=8),
         # _cfg(1, 1, 512, warps=8),
         # ---- small token batching ----
         # _cfg(1, 2, 128, warps=4),
-        _cfg(1, 2, 256, warps=8),
+        # _cfg(1, 2, 256, warps=8),
         # _cfg(1, 4, 128, warps=4),
-        _cfg(1, 4, 256, warps=8),
+        # _cfg(1, 4, 256, warps=8),
         # ---- batch batching ----
         # _cfg(2, 1, 128, warps=4),
-        _cfg(2, 1, 256, warps=8),
+        # _cfg(2, 1, 256, warps=8),
         # _cfg(4, 1, 128, warps=4),
     ],
     # fmt: on
@@ -258,7 +262,7 @@ def _sample_logits_finalize_kernel(
     tl.static_assert(top_k_logits_shape2 == NUM_V_SPLITS)
     tl.static_assert(top_k_logits_shape3 == top_k)
     tl.static_assert(top_k_idx_shape3 == top_k)
-    tl.static_assert(top_k < BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
+    tl.static_assert(top_k <= BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
     # contiguity requirements
     tl.static_assert(top_k_logits_stride3 == 1)
     tl.static_assert(top_k_logits_stride2 == top_k_logits_shape3)
