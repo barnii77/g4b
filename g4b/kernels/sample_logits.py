@@ -128,7 +128,6 @@ def _sample_logits_parallel_reduce_kernel(
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     # fmt: on
 ):
-    # TODO this kernel needs a loader mixin which can prologue-fuse rmsnorm application (given sum-of-squares)
     tl.static_assert(logits_shape0 == out_top_k_logits_shape0)
     tl.static_assert(logits_shape0 == out_top_k_idx_shape0)
     tl.static_assert(logits_shape1 == out_top_k_logits_shape1)
