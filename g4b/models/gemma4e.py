@@ -5,8 +5,6 @@ from g4b.scheduler import Scheduler
 from g4b.tensor import Tensor, float32, bfloat16, int8, q4_k, q5_k, q6_k
 from g4b.config import Config
 
-# TODO I can specialize the kernels for literally the exact tensor shapes, i.e. make all shapes and strides constexpr
-
 # TODO I cannot bake in the ple_proj into ple_lookup because they are both quantized, so I'll need a kernel that
 #  computes both at the start of the forward pass.
 
