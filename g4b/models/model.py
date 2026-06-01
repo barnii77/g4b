@@ -6,15 +6,15 @@ from g4b import scheduler
 
 
 class Model(ABC):
-    @classmethod
     @abstractmethod
-    def load(cls, gguf_meta: GGUFMeta, gguf_tensors: list[GGUFTensor], config: Config): ...
+    def decode(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
 
     @abstractmethod
     def prefill_chunk(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
 
+    @classmethod
     @abstractmethod
-    def decode(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
+    def load(cls, meta: GGUFMeta, tensors: list[GGUFTensor], config: Config) -> Model: ...
 
 
 # TODO this assumes a static schedule for the forward pass where no kernels are launched conditionally...

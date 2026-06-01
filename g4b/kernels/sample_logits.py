@@ -405,7 +405,7 @@ def sample_logits(
     return k1, k2, k3
 
 
-def sample_logits_get_recommended_num_v_splits(V: int) -> int:
+def get_recommended_num_v_splits(V: int) -> int:
     # TODO autotune this
     return (
         # fmt: off

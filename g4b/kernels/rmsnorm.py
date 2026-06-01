@@ -4,7 +4,7 @@ from typing import Literal
 from g4b.tensor import Tensor, DType
 from g4b.kernels.utils import launch
 
-# TODO this kernel is kinda useless actually but my test of resource management is entangled with it... REMOVE!
+# TODO take epsilon parameter
 
 
 # TODO autotune block sizes

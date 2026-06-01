@@ -1,6 +1,7 @@
 import math
 from cuda.bindings import runtime as cudart
 from typing import Sequence
+from g4b.gguf import GGUFTensor
 
 
 def runtime_error(msg):
@@ -43,3 +44,18 @@ def to_int_exact(x: int | float) -> int:
     if int(x) != x:
         raise RuntimeError("exact conversion not possible")
     return int(x)
+
+
+def gguf_shape_from_conventional(conventional_shape: Sequence[int]) -> list[int]:
+    return list(reversed(conventional_shape))
+
+
+def conventional_shape_from_gguf(gguf_shape: Sequence[int]) -> list[int]:
+    return list(reversed(gguf_shape))
+
+
+def gguf_tensors_by_name(tensors: list[GGUFTensor]) -> dict[str, GGUFTensor]:
+    out = {}
+    for tensor in tensors:
+        out[tensor.name] = tensor
+    return out
