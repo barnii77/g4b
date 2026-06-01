@@ -2,12 +2,11 @@ from dataclasses import dataclass
 from g4b.gguf import GGUFMeta, GGUFTensor
 from g4b.models.model import Model, record_static_cuda_graph
 from g4b.scheduler import Scheduler
-from g4b.tensor import Tensor
+from g4b.tensor import Tensor, float32, int8
 from g4b.config import Config
 
 # TODO dtype suffix in addition to shape suffix
 # TODO I can specialize the kernels for literally the exact tensor shapes, i.e. make all shapes and strides constexpr
-# TODO make an explanation of all the different shape suffix letters
 
 # TODO I cannot bake in the ple_proj into ple_lookup because they are both quantized, so I'll need a kernel that
 #  computes both at the start of the forward pass.
@@ -40,6 +39,29 @@ from g4b.config import Config
 #  Hmm, actually I think I need a ring buffer KV cache for global attention too.
 #  Also how do I keep track of time (index in T dim) for RoPE?
 
+################
+# Tensors names below are suffixed with shape and dtype annotations.
+# The dtypes refer to the following:
+DTR = float32  # DType for Residual stream
+DTA = float32  # DType for Attention
+DTMM = int8  # DType for MatMul
+# TODO more dtypes?
+# The shape names, explained:
+#   - B: batch size
+#   - T: context window size
+#   - t: number of decode tokens (typically 1 for standard autoregressive generation, t=T for prefill)
+#   - W: window size for sliding window attention
+#   - D: residual stream/embedding size
+#   - k: query/key size (of a single key)
+#   - v: value size (of a single value)
+#   - h: number of query heads (WARNING: may differ between MHA and SWA)
+#   - g: number of GQA key/value heads (WARNING: may differ between MHA and SWA)
+#   - U: the MLP hidden size (up-projection size)
+#   - P: per-layer embedding size (e.g. 256 for gemma 4 e4b)
+#   - V: vocab size
+#   - L: number of layers
+################
+
 
 @dataclass(frozen=True)
 class Attention:
@@ -53,7 +75,7 @@ class Attention:
     v_rmsnorm_w_v: Tensor
     o_rmsnorm_w_D: Tensor
     input_rmsnorm_w_D: Tensor
-    rope_freqs_H: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
+    rope_freqs_k: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
     rope_freq_base: float  # TODO make sure I assign this correctly with `conf.rope_freq_base_swa if is_swa else conf.rope_freq_base`. See ref impl -> class RoPE.
     sliding_window_size: int | None  # global attention if None
     owns_kv_cache: bool  # model's late layers share KV cache with earlier ones. If true, must not write to KV cache.
@@ -142,7 +164,7 @@ class Gemma4E(Model):
     lm_head: LmHead
 
     # runtime state
-    residual_BtD: Tensor
+    residual_BtD_dtr: Tensor
     context_window_sizes_B_int32: Tensor  # time dim is dynamically sized
     out_token_ids_Bt_int32: Tensor
     out_top_k_logits_scratchpad_Bt__num_splits__top_k__fp32: Tensor
