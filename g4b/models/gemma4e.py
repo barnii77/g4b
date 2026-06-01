@@ -143,6 +143,10 @@ class Gemma4E(Model):
 
     # runtime state
     residual_BtD: Tensor
+    context_window_sizes_B_int32: Tensor  # time dim is dynamically sized
+    out_token_ids_Bt_int32: Tensor
+    out_top_k_logits_scratchpad_Bt__num_splits__top_k__fp32: Tensor
+    out_top_k_idx_scratchpad_Bt__num_splits__top_k__int32: Tensor
 
     @classmethod
     def load(cls, gguf_meta: GGUFMeta, gguf_tensors: list[GGUFTensor], config: Config): ...  # TODO
