@@ -2,10 +2,9 @@ from dataclasses import dataclass
 from g4b.gguf import GGUFMeta, GGUFTensor
 from g4b.models.model import Model, record_static_cuda_graph
 from g4b.scheduler import Scheduler
-from g4b.tensor import Tensor, float32, int8
+from g4b.tensor import Tensor, float32, bfloat16, int8, q4_k, q5_k, q6_k
 from g4b.config import Config
 
-# TODO dtype suffix in addition to shape suffix
 # TODO I can specialize the kernels for literally the exact tensor shapes, i.e. make all shapes and strides constexpr
 
 # TODO I cannot bake in the ple_proj into ple_lookup because they are both quantized, so I'll need a kernel that
@@ -44,18 +43,25 @@ from g4b.config import Config
 # The dtypes refer to the following:
 DTR = float32  # DType for Residual stream
 DTA = float32  # DType for Attention
-DTMM = int8  # DType for MatMul
-# TODO more dtypes?
+DTH = bfloat16  # DType for (pre-)activations inside mlp
+DTKV = bfloat16  # DType for KV cache
+DTMM = int8  # DType for MatMul tensor core ops
+DTSS = float32  # DType for Sum-of-Squares accumulation for rmsnorm
+DTPLE = float32  # DType for computations in the per-layer-embeddings low-rank space
+DTSAMP = float32
 # The shape names, explained:
 #   - B: batch size
 #   - T: context window size
 #   - t: number of decode tokens (typically 1 for standard autoregressive generation, t=T for prefill)
+#       - WARNING: this one differs between chunked prefill and decode
 #   - W: window size for sliding window attention
 #   - D: residual stream/embedding size
 #   - k: query/key size (of a single key)
 #   - v: value size (of a single value)
-#   - h: number of query heads (WARNING: may differ between MHA and SWA)
-#   - g: number of GQA key/value heads (WARNING: may differ between MHA and SWA)
+#   - h: number of query heads
+#       - WARNING: may differ between MHA and SWA
+#   - g: number of GQA key/value heads
+#       - WARNING: may differ between MHA and SWA
 #   - U: the MLP hidden size (up-projection size)
 #   - P: per-layer embedding size (e.g. 256 for gemma 4 e4b)
 #   - V: vocab size
@@ -66,16 +72,16 @@ DTMM = int8  # DType for MatMul
 @dataclass(frozen=True)
 class Attention:
     # parameters
-    q_proj_Dhk: Tensor
-    k_proj_Dgk: Tensor
-    v_proj_Dgv: Tensor
-    o_proj_hvD: Tensor
-    q_rmsnorm_w_k: Tensor
-    k_rmsnorm_w_k: Tensor
-    v_rmsnorm_w_v: Tensor
-    o_rmsnorm_w_D: Tensor
-    input_rmsnorm_w_D: Tensor
-    rope_freqs_k: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
+    q_proj_Dhk_q4: Tensor
+    k_proj_Dgk_q6: Tensor
+    v_proj_Dgv_q6: Tensor
+    o_proj_hvD_q4: Tensor
+    q_rmsnorm_w_k_fp32: Tensor
+    k_rmsnorm_w_k_fp32: Tensor
+    v_rmsnorm_w_v_fp32: Tensor
+    o_rmsnorm_w_D_fp32: Tensor
+    input_rmsnorm_w_D_fp32: Tensor
+    rope_freqs_k_fp32: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
     rope_freq_base: float  # TODO make sure I assign this correctly with `conf.rope_freq_base_swa if is_swa else conf.rope_freq_base`. See ref impl -> class RoPE.
     sliding_window_size: int | None  # global attention if None
     owns_kv_cache: bool  # model's late layers share KV cache with earlier ones. If true, must not write to KV cache.
@@ -85,42 +91,42 @@ class Attention:
     head_size_v: int
 
     # runtime state
-    k_cache_Bg__T_or_W__k: Tensor
-    v_cache_Bg__T_or_W__v: Tensor
-    shared_q_scratchpad_Bhtk: Tensor
-    shared_k_scratchpad_Bgtk: Tensor
-    shared_v_scratchpad_Bgtk: Tensor
-    shared_o_proj_input_scratchpad_Bhtv: Tensor
-    shared_last_and_this_layer_output_scratchpad_BtD: Tensor
-    shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt: Tensor
+    k_cache_Bg__T_or_W__k__dtkv: Tensor
+    v_cache_Bg__T_or_W__v__dtkv: Tensor
+    shared_q_scratchpad_Bhtk_dta: Tensor
+    shared_k_scratchpad_Bgtk_dta: Tensor
+    shared_v_scratchpad_Bgtk_dta: Tensor
+    shared_o_proj_input_scratchpad_Bhtv_dta: Tensor
+    shared_last_and_this_layer_output_scratchpad_BtD_dtr: Tensor
+    shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss: Tensor
 
 
 @dataclass(frozen=True)
 class MLP:
     # parameters
-    up_proj_DU: Tensor
-    gate_proj_DU: Tensor
-    down_proj_UD: Tensor
-    input_rmsnorm_w_D: Tensor
-    output_rmsnorm_w_D: Tensor
+    up_proj_DU_q4: Tensor
+    gate_proj_DU_q4: Tensor
+    down_proj_UD_q6: Tensor
+    input_rmsnorm_w_D_fp32: Tensor
+    output_rmsnorm_w_D_fp32: Tensor
 
     # runtime state
-    shared_down_proj_input_scratchpad_BtU: Tensor
-    shared_last_and_this_layer_output_scratchpad_BtD: Tensor
-    shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt: Tensor
+    shared_down_proj_input_scratchpad_BtU_dth: Tensor
+    shared_last_and_this_layer_output_scratchpad_BtD_dtr: Tensor
+    shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss: Tensor
 
 
 @dataclass(frozen=True)
 class PerLayerEmbeddings:
     # parameters
-    gate_proj_DP: Tensor
-    out_proj_PD: Tensor
-    output_rmsnorm_w_D: Tensor
+    gate_proj_DP_fp32: Tensor
+    out_proj_PD_fp32: Tensor
+    output_rmsnorm_w_D_fp32: Tensor
 
     # runtime state
-    shared_out_proj_input_scratchpad_BtP: Tensor
-    shared_last_and_this_layer_output_scratchpad_BtD: Tensor
-    shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt: Tensor
+    shared_out_proj_input_scratchpad_BtP_dtple: Tensor
+    shared_last_and_this_layer_output_scratchpad_BtD_dtr: Tensor
+    shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss: Tensor
 
 
 @dataclass(frozen=True)
@@ -135,23 +141,22 @@ class DecoderLayer:
 @dataclass(frozen=True)
 class Embeddings:
     # parameters
-    embeddings_VD: Tensor
-    ple_table_VLP: Tensor
-    ple_proj_DLP: Tensor
+    embeddings_VD_q5: Tensor
+    ple_table_VLP_q5: Tensor
+    ple_proj_DLP_bf16: Tensor
 
     # runtime state
-    ple_LBtP: Tensor
+    ple_LBtP_dtr: Tensor
 
 
 @dataclass(frozen=True)
 class LmHead:
     # parameters
-    rmsnorm_w_D: Tensor
-    embeddings_DV: Tensor
+    rmsnorm_w_D_fp32: Tensor
+    embeddings_DV_q5: Tensor
 
     # runtime state
-    logits_BtV: Tensor
-    logits_token_ids_BtV: Tensor
+    logits_BtV_dtsamp: Tensor
     logit_softcap: float  # TODO don't forget to epilogue fuse this into the residual->logits matmul
     temperature: float
 
@@ -167,8 +172,8 @@ class Gemma4E(Model):
     residual_BtD_dtr: Tensor
     context_window_sizes_B_int32: Tensor  # time dim is dynamically sized
     out_token_ids_Bt_int32: Tensor
-    out_top_k_logits_scratchpad_Bt__num_splits__top_k__fp32: Tensor
-    out_top_k_idx_scratchpad_Bt__num_splits__top_k__int32: Tensor
+    top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp: Tensor
+    top_k_idx_scratchpad_Bt__num_splits__top_k__int32: Tensor
 
     @classmethod
     def load(cls, gguf_meta: GGUFMeta, gguf_tensors: list[GGUFTensor], config: Config): ...  # TODO
