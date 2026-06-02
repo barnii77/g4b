@@ -430,15 +430,17 @@ class Gemma4E(Model):
             layers=layers,
             lm_head=lm_head,
             sampling_state=sampling_state,
+            rmsnorm_epsilon=rmsnorm_epsilon,
             residual_BtD_dtr=residual,
             context_window_sizes_B_int32=context_window_sizes,
         )
 
 
 def _compute_rope_freqs(rope_freqs: GGUFTensor | None, freq_base: float, rope_dim_count: int) -> Tensor:
-    # TODO make sure I assign this correctly with `conf.rope_freq_base_swa if is_swa else conf.rope_freq_base`.
-    #  See ref impl -> class RoPE.
-    ...
+    freqs = Tensor.from_gguf_tensor(rope_freqs) if rope_freqs is not None else None
+    out = Tensor.alloc_empty(float32, [rope_dim_count])
+    kernels.rope.populate_rope_frequencies(out, freqs, freq_base)
+    return out
 
 
 def _check_meta(meta: GGUFMeta):
