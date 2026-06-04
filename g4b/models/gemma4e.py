@@ -437,8 +437,10 @@ class Gemma4E(Model):
 
 
 def _compute_rope_freqs(rope_freqs: GGUFTensor | None, freq_base: float, rope_dim_count: int) -> Tensor:
+    assert rope_dim_count % 2 == 0
+    assert rope_freqs is None or rope_freqs.shape[-1] == rope_dim_count // 2
     freqs = Tensor.from_gguf_tensor(rope_freqs) if rope_freqs is not None else None
-    out = Tensor.alloc_empty(float32, [rope_dim_count])
+    out = Tensor.alloc_empty(float32, [rope_dim_count // 2])
     kernels.rope.populate_rope_frequencies(out, freqs, freq_base)
     return out
 
