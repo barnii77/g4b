@@ -183,7 +183,7 @@ class Gemma4E(Model):
     # runtime state
     residual_BtD_dtr: Tensor
     # TODO update this in separate kernel after sampling!
-    context_window_sizes_B_int32: Tensor  # time dim is dynamically sized
+    time_dim_offsets_B_int32: Tensor  # time dim is dynamically sized
 
     @record_static_cuda_graph
     def decode(self, sched: Scheduler): ...  # TODO
@@ -272,7 +272,7 @@ class Gemma4E(Model):
 
         # create global state tensors
         residual = Tensor.alloc_empty(DTR, [B, t, D])
-        context_window_sizes = Tensor.alloc_empty(int32, [B])
+        time_dim_offsets = Tensor.alloc_empty(int32, [B])
         rmsnorm_epsilon = meta["gemma4.attention.layer_norm_rms_epsilon"]
         assert isinstance(rmsnorm_epsilon, float)
 
@@ -432,7 +432,7 @@ class Gemma4E(Model):
             sampling_state=sampling_state,
             rmsnorm_epsilon=rmsnorm_epsilon,
             residual_BtD_dtr=residual,
-            context_window_sizes_B_int32=context_window_sizes,
+            time_dim_offsets_B_int32=time_dim_offsets,
         )
 
 
