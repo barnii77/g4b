@@ -38,7 +38,7 @@ def _populate_rope_frequencies_kernel(
     pid = tl.program_id(0)
     offs = pid * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
 
-    idx = ((pid * BLOCKSIZE + tl.arange(0, BLOCKSIZE)) % (out_shape0 // 2)) * 2  # cat([x := arange(0, N, 2), x])
+    idx = pid * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
     powers = idx.to(tl.float32) / out_shape0
     out = 1.0 / tl.exp2(math.log2(freq_base) * powers)  # 1 / freq_base ** powers
 
