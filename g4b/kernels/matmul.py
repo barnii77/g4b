@@ -156,14 +156,19 @@ def _matmul_a3d_b2d_kernel(
         # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2)
         NUM_K_SPLITS = 1
 
-    # TODO I think this indexing is actually wrong when GROUPSIZE does not evenly divide the number of tiles
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
-    N = tl.cdiv(b_shape1, B_BLOCKSIZE1)
+    num_tile_rows = tl.cdiv(a_shape1, A_BLOCKSIZE1)
+    num_tile_cols = tl.cdiv(b_shape1, B_BLOCKSIZE1)
     pid = tl.program_id(0)
     tile_b = tl.program_id(1)
     tile_k_split = tl.program_id(2)
-    tile_row = pid % GROUPSIZE1 + (pid // (N * GROUPSIZE1)) * GROUPSIZE1
-    tile_col = pid // GROUPSIZE1 % N
+    num_tiles_per_group = GROUPSIZE1 * num_tile_cols
+    group_id = pid // num_tiles_per_group
+    first_tile_row = group_id * GROUPSIZE1
+    group_size_rows = tl.minimum(num_tile_rows - first_tile_row, GROUPSIZE1)
+    pid_in_group = pid % num_tiles_per_group
+    tile_row = first_tile_row + pid_in_group % group_size_rows
+    tile_col = pid_in_group // group_size_rows
 
     off_b = tile_b * A_BLOCKSIZE0
     off_row = tile_row * A_BLOCKSIZE1
