@@ -218,7 +218,7 @@ def _matmul_a3d_b2d_kernel(
         )
         if has_b2:
             b2_tile = loader_fn("b2", b2_desc, 0, off_k, off_col, B2_DTYPE).reshape(b.shape)
-            c2 = tl.dot(a, b2_tile, c2.reshape(BLOCK_M, BLOCK_N), out_dtype=c.dtype).reshape(c.shape)
+            c2 = tl.dot(a, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
 
     if has_b2:
         c = c_c2_merge_tiles_fn(c, c2, off_b, off_row, off_col, NUM_K_SPLITS, C_DTYPE)
