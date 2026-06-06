@@ -3,7 +3,7 @@ import triton
 from triton import language as tl
 from g4b import tensor
 from g4b.tensor import Tensor, DType
-from g4b.kernels.utils import launch
+from g4b.kernels.utils import launch, default_bencher
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.utils import contiguous_strides_for_shape
 
@@ -66,11 +66,11 @@ def _cfg(
 
 def _matmul_3d_autotune_configs():
     # AI slop configs
-    # TODO better configs, enable all configs, proper warmup mechanism (see todo.md)
     return [
+        # ---- aggressive ----
         _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
         _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
-        ] + 0*[
+        # TODO even more aggressive configs for stronger hardware like 4090/5090/H100/B200
         # ---- small / skinny-N / decode-ish ----
         # Effective MxN: 16x16, 16x32, 32x16, 32x32
         _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
@@ -121,6 +121,7 @@ def _matmul_3d_autotune_configs():
         "A_DTYPE", "B_DTYPE", "B2_DTYPE", "C_DTYPE", "ACCUM_DTYPE",
         # fmt: on
     ],
+    do_bench=default_bencher,
 )
 @triton.jit
 def _matmul_a3d_b2d_kernel(

@@ -1,7 +1,7 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch
+from g4b.kernels.utils import launch, default_bencher
 from kernels.memset import memset_contiguous_by_ptr
 
 
@@ -68,6 +68,7 @@ def _cfg(
         "rmsnorm_w_stride0",
         # fmt: on
     ],
+    do_bench=default_bencher,
 )
 @triton.jit
 def _update_residual_stream_kernel(

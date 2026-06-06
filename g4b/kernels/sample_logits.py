@@ -2,7 +2,7 @@ import math
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch
+from g4b.kernels.utils import launch, default_bencher
 from g4b.utils import to_int_exact
 
 
@@ -113,6 +113,7 @@ def _bitonic_scan_find_top_k_logits_jfn(
         "top_k", "NUM_V_SPLITS",
         # fmt: on
     ],
+    do_bench=default_bencher,
 )
 @triton.jit
 def _sample_logits_parallel_reduce_kernel(

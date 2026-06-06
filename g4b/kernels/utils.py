@@ -1,3 +1,5 @@
+import triton
+import triton.testing
 from triton import language as tl
 from triton.runtime import Autotuner, Heuristics
 from triton.experimental.gluon import language as gl
@@ -103,3 +105,14 @@ class _Launch:
 
 
 launch = _Launch()
+
+
+def default_bencher(fn, quantiles):
+    """Benchmarker wrapper function to make triton benchmark longer to make results not completely random."""
+    return triton.testing.do_bench(
+        fn,
+        warmup=500,  # ms
+        rep=1000,  # ms
+        quantiles=quantiles,
+        return_mode="median",
+    )

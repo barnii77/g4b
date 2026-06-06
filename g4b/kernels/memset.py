@@ -1,12 +1,13 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor, uint8
-from g4b.kernels.utils import launch
+from g4b.kernels.utils import launch, default_bencher
 
 
 @triton.autotune(
     configs=[triton.Config({"BLOCKSIZE": 2**i}) for i in range(6, 13)],
     key=["x_shape0"],
+    do_bench=default_bencher,
 )
 @triton.jit
 def _memset_contiguous_kernel(x_ptr, x_shape0: tl.constexpr, value: tl.constexpr, BLOCKSIZE: tl.constexpr):

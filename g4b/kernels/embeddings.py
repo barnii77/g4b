@@ -2,7 +2,7 @@ import triton
 from triton import language as tl
 from functools import cache
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch
+from g4b.kernels.utils import launch, default_bencher
 from g4b.kernels.matmul import matmul_a3d_b2d_partial_rmsnorm_storer_jfn
 from g4b.kernels.geglu import gelu_jfn
 
@@ -70,6 +70,7 @@ def _cfg(
         "token_ids_rb_stride0", "token_ids_rb_stride1",
         # fmt: on
     ],
+    do_bench=default_bencher,
 )
 @triton.jit
 def _gather_token_embeddings_kernel(
