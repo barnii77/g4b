@@ -5,8 +5,6 @@ where g4b can register its hooks and take over triton's stream and device manage
 
 from cuda.core import Device
 
-# TODO ensure triton autotuning not only imports but also actually runs *correctly* with stream syncs actually syncing
-
 
 # torch.cuda stub
 class cuda:

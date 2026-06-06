@@ -1,5 +1,5 @@
+import math
 import triton
-import triton.testing
 from triton import language as tl
 from triton.runtime import Autotuner, Heuristics
 from triton.experimental.gluon import language as gl
@@ -107,12 +107,53 @@ class _Launch:
 launch = _Launch()
 
 
+# Fuck triton autotuner, it needs torch and we don't want torch. So we roll our own, hell yeah.
 def default_bencher(fn, quantiles):
-    """Benchmarker wrapper function to make triton benchmark longer to make results not completely random."""
-    return triton.testing.do_bench(
-        fn,
-        warmup=500,  # ms
-        rep=1000,  # ms
-        quantiles=quantiles,
-        return_mode="median",
-    )
+    """Benchmark Triton launches on the same cuda.core stream that g4b gives Triton."""
+    from cuda.core import EventOptions
+    import g4b.device
+
+    warmup_ms = 300
+    rep_ms = 500
+
+    def time_n(n: int) -> float:
+        start = g4b.device.device.create_event(options=EventOptions(timing_enabled=True))
+        end = g4b.device.device.create_event(options=EventOptions(timing_enabled=True))
+        g4b.device.stream.record(start)
+        for _ in range(n):
+            fn()
+        g4b.device.stream.record(end)
+        end.sync()
+        return end - start
+
+    fn()
+    g4b.device.stream.sync()
+
+    estimate_ms = max(time_n(5) / 5, 1e-6)
+    n_warmup = max(1, int(warmup_ms / estimate_ms))
+    n_repeat = max(1, int(rep_ms / estimate_ms))
+
+    for _ in range(n_warmup):
+        fn()
+    g4b.device.stream.sync()
+
+    n_batches = min(20, n_repeat)
+    n_per_batch = max(1, math.ceil(n_repeat / n_batches))
+    times = [time_n(n_per_batch) / n_per_batch for _ in range(n_batches)]
+
+    if quantiles is not None:
+        return [_quantile(times, q) for q in quantiles]
+    return sum(times) / len(times)
+
+
+def _quantile(values, q: float):
+    values = sorted(values)
+    if len(values) == 1:
+        return values[0]
+    pos = q * (len(values) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return values[lo]
+    frac = pos - lo
+    return values[lo] * (1 - frac) + values[hi] * frac
