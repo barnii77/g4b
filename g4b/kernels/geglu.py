@@ -19,8 +19,6 @@ def gelu_jfn(x):
     return 0.5 * x * (1 + tanh_jfn(coef1 * (x + coef2 * x * x * x)))
 
 
-# TODO this combined with the matmul into a full fused geglu is ~3x slower than naive torch and I don't know why.
-#  I'll have to investigate.
 @triton.jit
 def geglu_fusion_matmul_merge_tiles_mixin_jfn(up_tile, gate_tile, _, __, ___, ____, _____):
     return up_tile * gelu_jfn(gate_tile)

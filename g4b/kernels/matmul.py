@@ -68,6 +68,7 @@ def _matmul_3d_autotune_configs():
     # AI slop configs
     # TODO better configs, enable all configs, proper warmup mechanism (see todo.md)
     return [
+        _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
         _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
         ] + 0*[
         # ---- small / skinny-N / decode-ish ----
