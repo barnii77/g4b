@@ -1,4 +1,3 @@
-import functools
 from abc import ABC, abstractmethod
 from g4b.gguf import GGUFMeta, GGUFTensor
 from g4b.config import Config
@@ -15,35 +14,3 @@ class Model(ABC):
     @classmethod
     @abstractmethod
     def load(cls, meta: GGUFMeta, tensors: list[GGUFTensor], config: Config) -> Model: ...
-
-
-# TODO after the engine's automatic warmup sequences, this should be enabled. I may want to assert that no kernels
-#  trigger a recompile after this. I may need to add my own triton.jit decorator wrapper for that or something...
-ready_to_record_graphs = False
-
-
-# TODO this assumes a static schedule for the forward pass where no kernels are launched conditionally...
-#  ensure my use-case actually matches this.
-def record_static_cuda_graph(step_fn):
-    """This function assumes a static schedule for the forward pass where no kernels are launched conditionally."""
-    # first call does not record cuda graph because triton kernels need to compile.
-    # second call then records cuda graph.
-    # subsequent calls use the cuda graph instead of the normal method.
-
-    has_compiled = False  # TODO this should not be needed anymore with the introduction of ready_to_record_graphs
-    cuda_graph = None
-
-    @functools.wraps(step_fn)
-    def wrapper(self, sched: "scheduler.Scheduler"):
-        nonlocal has_compiled, cuda_graph
-        if not has_compiled:
-            has_compiled = True
-            return step_fn(self, sched)
-        elif cuda_graph is None:
-            # TODO record cuda graph
-            return step_fn(self, sched)
-        else:
-            # TODO launch cuda graph
-            ...
-
-    return wrapper

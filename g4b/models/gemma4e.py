@@ -1,10 +1,11 @@
 import warnings
 from dataclasses import dataclass
 from g4b.gguf import GGUFMeta, GGUFTensor, GGUFType
-from g4b.models.model import Model, record_static_cuda_graph
+from g4b.models.model import Model
 from g4b.scheduler import Scheduler
 from g4b.tensor import Tensor, float32, bfloat16, int8, int32
 from g4b.config import Config
+from g4b.lifecycle import record_static_cuda_graph
 from g4b.utils import gguf_tensors_by_name
 from g4b import kernels
 
