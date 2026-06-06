@@ -38,6 +38,14 @@ from g4b import kernels
 # TODO think about how to handle sliding window attention... do I need a ring buffer KV cache?
 #  Hmm, actually I think I need a ring buffer KV cache for global attention too.
 #  Also how do I keep track of time (index in T dim) for RoPE?
+# TODO I need a temporary KV buffer for when the SWA window size is < chunked prefill size, from which I then memcpy to
+#  the actual KV cache (which is only 512 tokens long for SWA layers)
+
+# TODO if I wanted to support MoE models:
+#  I could allocate a tensor for every expert host-side, then build a cuda graph where the router kernel produces
+#  expert IDs and then there's cuda graph switch nodes over the produced token IDs which issue a memcpy of the relevant
+#  experts to device mem from pinned host mem. This should side-step python and linux latency, though it restricts how
+#  advanced the device-side expert caching and prefetch logic can be.
 
 ################
 # Tensors names below are suffixed with shape and dtype annotations.
