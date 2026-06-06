@@ -69,6 +69,7 @@ def _cfg(
         # fmt: on
     ],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _add_kv_to_cache_kernel(

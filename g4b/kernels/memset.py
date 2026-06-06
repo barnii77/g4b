@@ -8,6 +8,7 @@ from g4b.kernels.utils import launch, default_bencher
     configs=[triton.Config({"BLOCKSIZE": 2**i}) for i in range(6, 13)],
     key=["x_shape0"],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _memset_contiguous_kernel(x_ptr, x_shape0: tl.constexpr, value: tl.constexpr, BLOCKSIZE: tl.constexpr):
@@ -24,6 +25,14 @@ def memset_contiguous_by_ptr(x_ptr, x_size, value: int):
 def memset_contiguous(x: Tensor, value: int):
     assert x.is_contiguous()
     assert 0 <= value <= 255
-    x = x.reshape((-1,)).view(uint8)
+
+    x = x.reshape((-1,))
+    if isinstance(x, Tensor):
+        x = x.view(uint8)
+    else:
+        import torch
+        assert isinstance(x, torch.Tensor)
+        x = x.view(torch.uint8)
+
     grid_fn = lambda META: (triton.cdiv(x.shape[0], META["BLOCKSIZE"]),)
     return launch[_memset_contiguous_kernel, grid_fn](x=x, value=value)

@@ -114,6 +114,7 @@ def _bitonic_scan_find_top_k_logits_jfn(
         # fmt: on
     ],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _sample_logits_parallel_reduce_kernel(
@@ -238,6 +239,7 @@ def _sample_logits_parallel_reduce_kernel(
         "NUM_V_SPLITS",
         # fmt: on
     ],
+    cache_results=True,
 )
 @triton.jit
 def _sample_logits_finalize_kernel(

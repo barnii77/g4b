@@ -92,6 +92,7 @@ def _cfg(
         # fmt: on
     ],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _apply_rope_kernel(

@@ -2,7 +2,7 @@ import triton
 from triton import language as tl
 from g4b.tensor import Tensor
 from g4b.kernels.utils import launch, default_bencher
-from kernels.memset import memset_contiguous_by_ptr
+from g4b.kernels.memset import memset_contiguous
 
 
 def _cfg(
@@ -21,9 +21,6 @@ def _cfg(
         },
         num_warps=warps,
         num_stages=stages,
-        pre_hook=lambda args: memset_contiguous_by_ptr(
-            args["out_rsos_ptr"], args["out_rsos_shape0"] * args["out_rsos_shape1"], 0
-        ),
     )
 
 
@@ -69,6 +66,7 @@ def _cfg(
         # fmt: on
     ],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _update_residual_stream_kernel(
@@ -157,7 +155,8 @@ def update_residual_stream(
         triton.cdiv(residual.shape[1], META["BLOCKSIZE1"]),
         triton.cdiv(residual.shape[0], META["BLOCKSIZE0"]),
     )
-    return launch[_update_residual_stream_kernel, grid_fn](
+    k1 = memset_contiguous(out_rsos, 0)
+    k2 = launch[_update_residual_stream_kernel, grid_fn](
         residual=residual,
         act_buf=act_buf,
         act_rsos=act_rsos,
@@ -165,3 +164,4 @@ def update_residual_stream(
         rmsnorm_w=rmsnorm_w,
         eps=float(eps),
     )
+    return k1, k2

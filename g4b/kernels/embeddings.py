@@ -71,6 +71,7 @@ def _cfg(
         # fmt: on
     ],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _gather_token_embeddings_kernel(

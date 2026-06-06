@@ -20,22 +20,20 @@ from g4b.utils import contiguous_strides_for_shape
 #  bf16 mma to do the trick during decode.
 
 
-def _make_config_pre_hook(split_k: int):
-    def pre_hook(args):
-        shape = [args["c_shape0"], args["c_shape1"], args["c_shape2"]]
-        strides = [args["c_stride0"], args["c_stride1"], args["c_stride2"]]
-        if "c_rmsnorm_sum_of_squares_stride0" in args:
-            shape_norm = shape[:-1]
-            strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
-            assert contiguous_strides_for_shape(shape_norm) == strides_norm, "sum of squares buffer must be contiguous"
-            memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape[:-1]), 0)
-        if split_k > 1:
-            # TODO: not inherently, but I don't want to write more memcpy kernels
-            assert contiguous_strides_for_shape(shape) == strides, "split k requires contiguous output buffer"
-            if not args["KEEP_C"]:
-                memset_contiguous_by_ptr(args["c_ptr"], math.prod(shape), 0)
-
-    return pre_hook
+def _pre_hook(args):
+    split_k = args["NUM_K_SPLITS"]
+    shape = [args["c_shape0"], args["c_shape1"], args["c_shape2"]]
+    strides = [args["c_stride0"], args["c_stride1"], args["c_stride2"]]
+    if args["c_rmsnorm_sum_of_squares"] is not None:
+        shape_norm = shape[:-1]
+        strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
+        assert contiguous_strides_for_shape(shape_norm) == strides_norm, "sum of squares buffer must be contiguous"
+        memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape[:-1]), 0)
+    if split_k > 1:
+        # TODO not inherently, but I don't want to write more memcpy kernels
+        assert contiguous_strides_for_shape(shape) == strides, "split k requires contiguous output buffer"
+        if not args["KEEP_C"]:
+            memset_contiguous_by_ptr(args["c_ptr"], math.prod(shape), 0)
 
 
 def _cfg(
@@ -60,17 +58,12 @@ def _cfg(
         },
         num_warps=warps,
         num_stages=stages,
-        pre_hook=_make_config_pre_hook(split_k),
     )
 
 
 def _matmul_3d_autotune_configs():
     # AI slop configs
     return [
-        # ---- aggressive ----
-        _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
-        _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
-        # TODO even more aggressive configs for stronger hardware like 4090/5090/H100/B200
         # ---- small / skinny-N / decode-ish ----
         # Effective MxN: 16x16, 16x32, 32x16, 32x32
         _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
@@ -100,6 +93,13 @@ def _matmul_3d_autotune_configs():
         _cfg(4, 16, 128, 64, 8, split_k=2, warps=4, stages=4),
         _cfg(2, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
         _cfg(4, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
+        # ---- aggressive ----
+        _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
+        _cfg(1, 64, 32, 128, 8, split_k=2, warps=4, stages=3),
+        _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
+        # TODO even more aggressive configs for stronger hardware like 4090/5090/H100/B200
+        # TODO moving this to the bottom is a dirty hack because for some reason the selected autotune config still
+        #  does not correlate with execution time as much as position in the autotune config list... sigh
     ]
 
 
@@ -122,6 +122,7 @@ def _matmul_3d_autotune_configs():
         # fmt: on
     ],
     do_bench=default_bencher,
+    cache_results=True,
 )
 @triton.jit
 def _matmul_a3d_b2d_kernel(
@@ -311,7 +312,10 @@ def matmul_a3d_b2d(
 
     k_split_allowed = b2 is None
 
-    grid_fn = lambda META: (
+    # TODO this grid_fn is hacky and I'm not sure launching the pre-hook in the grid_fn is ideal because it is part of
+    #  the measurement of the autotuner, but I guess zeroing is a real downside and so it being measured by the
+    #  autotuner isn't actually that undesirable?
+    grid_fn = lambda META: _pre_hook(META) or (
         triton.cdiv(META["a_shape1"], META["A_BLOCKSIZE1"]) * triton.cdiv(META["b_shape1"], META["B_BLOCKSIZE1"]),
         triton.cdiv(META["a_shape0"], META["A_BLOCKSIZE0"]),
         META["NUM_K_SPLITS"] if k_split_allowed else 1,
