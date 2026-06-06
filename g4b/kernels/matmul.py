@@ -3,7 +3,7 @@ import triton
 from triton import language as tl
 from g4b import tensor
 from g4b.tensor import Tensor, DType
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, jfn_cache_key
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.utils import contiguous_strides_for_shape
 
@@ -113,13 +113,14 @@ def _matmul_3d_autotune_configs():
         # optional second B matrix for SwiGLU / GeGLU-style fusion
         "b2_stride0", "b2_stride1",
         # codegen-affecting constexpr callables
-        "loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
+        # "loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
+        "_loader_fn_key", "_storer_fn_key", "_c_c2_merge_tiles_fn_key",  # hack so autotune results are cacheable to disk
         # dtype / quantization specialization
-        "A_DTYPE", "B_DTYPE", "B2_DTYPE", "C_DTYPE", "ACCUM_DTYPE",
+        "A_DTYPE", "B_DTYPE", "B2_DTYPE", "C_DTYPE", "_ACCUM_DTYPE_CACHE_KEY",
         # fmt: on
     ],
     do_bench=default_bencher,
-    # cache_results=True,
+    cache_results=True,
 )
 @triton.jit
 def _matmul_a3d_b2d_kernel(
@@ -140,13 +141,16 @@ def _matmul_a3d_b2d_kernel(
     A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, B2_DTYPE: tl.constexpr | None, C_DTYPE: tl.constexpr,  # e.g. q4_k
     ACCUM_DTYPE: tl.constexpr,
     KEEP_C: tl.constexpr,  # if true, init c = c_desc.load(...)
+    # make caching to disk work (hacky)
+    _loader_fn_key: tl.constexpr, _storer_fn_key: tl.constexpr, _c_c2_merge_tiles_fn_key: tl.constexpr,
+    _ACCUM_DTYPE_CACHE_KEY: tl.constexpr,
     # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr is used for the PLE layers.
     c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
     b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
-    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None
+    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None,
     # fmt: on
 ):
     tl.static_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
@@ -340,6 +344,10 @@ def matmul_a3d_b2d(
         C_DTYPE=_dtype_name(c.dtype),
         ACCUM_DTYPE=accum_dtype,
         KEEP_C=keep_c,
+        _loader_fn_key=jfn_cache_key(loader_fn),
+        _storer_fn_key=jfn_cache_key(storer_fn),
+        _c_c2_merge_tiles_fn_key=jfn_cache_key(c_c2_merge_tiles_fn),
+        _ACCUM_DTYPE_CACHE_KEY=accum_dtype.name,
     )
 
 

@@ -157,3 +157,7 @@ def _quantile(values, q: float):
         return values[lo]
     frac = pos - lo
     return values[lo] * (1 - frac) + values[hi] * frac
+
+
+def jfn_cache_key(jfn):
+    return "none" if jfn is None else f"{jfn.module}:{jfn.fn.__qualname__}:{jfn.cache_key}"
