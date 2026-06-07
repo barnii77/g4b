@@ -372,7 +372,7 @@ def matmul_a3d_b2d_loader_jfn(
         SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
         SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
 
-        rows: tl.constexpr = shape1 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        rows: tl.constexpr = shape1
         cols: tl.constexpr = shape2 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
         tl.static_assert(not is_quantized or cols % SUPERBLOCK_SIZE_ELEMS == 0)
 
