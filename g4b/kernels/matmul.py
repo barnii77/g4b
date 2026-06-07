@@ -71,6 +71,7 @@ def _matmul_3d_autotune_configs():
         _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
         _cfg(1, 64, 32, 128, 8, split_k=2, warps=4, stages=3),
         _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
+        _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
         # ---- small / skinny-N / decode-ish ----
         # Effective MxN: 16x16, 16x32, 32x16, 32x32
         _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
@@ -326,7 +327,11 @@ def matmul_a3d_b2d_loader_jfn(
     BLOCKSIZE2: tl.constexpr,
     conceptual_dtype: tl.constexpr,
 ):
-    is_quantized: tl.constexpr = conceptual_dtype == tensor.q4_k.name or conceptual_dtype == tensor.q5_k.name or conceptual_dtype == tensor.q6_k.name
+    is_quantized: tl.constexpr = (
+        conceptual_dtype == tensor.q4_k.name
+        or conceptual_dtype == tensor.q5_k.name
+        or conceptual_dtype == tensor.q6_k.name
+    )
     if not is_quantized:
         return desc.load((off0, off1, off2))
 
@@ -345,7 +350,9 @@ def matmul_a3d_b2d_loader_jfn(
     tl.static_assert(not is_quantized or shape0 == 1)
     tl.static_assert(not is_quantized or stride0 == 0)
     tl.static_assert(not is_quantized or BLOCKSIZE0 == 1)
-    tl.static_assert(not is_quantized or stride2 == 1)  # superblocks are physically laid out as contiguous 256-byte arrays
+    tl.static_assert(
+        not is_quantized or stride2 == 1
+    )  # superblocks are physically laid out as contiguous 256-byte arrays
     tl.static_assert(not is_quantized or BLOCKSIZE2 >= 16)  # hacky assert but makes my life easier below
 
     stride_row: tl.constexpr = stride1
@@ -387,8 +394,8 @@ def matmul_a3d_b2d_loader_jfn(
         sc = tl.cat(d_frags & 0x3F, ((d_frags & 0xC0) >> 2) | (mixed_frags & 0x0F), dim=-1)
         mins = tl.cat(m_frags & 0x3F, ((m_frags & 0xC0) >> 2) | (mixed_frags >> 4), dim=-1)
 
-        ds = sc.to(UPCAST_DTYPE) * dd
-        ms = mins.to(UPCAST_DTYPE) * md
+        all_ds = sc.to(UPCAST_DTYPE) * dd
+        all_ms = mins.to(UPCAST_DTYPE) * md
 
         Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN: tl.constexpr = BLOCKSIZE_COL <= SUBBLOCK_SIZE_ELEMS
         n_subblocks_to_load: tl.constexpr = (
@@ -411,21 +418,35 @@ def matmul_a3d_b2d_loader_jfn(
         )
 
         # pull high 4 bits and low 4 bits apart into 2 values (order: low then high)
-        qs_unpacked = qs_packed.reshape((-1, 1, 2 * SUBBLOCK_SIZE_BYTES)) >> (tl.arange(0, 1).to(tl.uint8) * 4).reshape(
-            (1, 2, 1)
-        )
+        group_scale: tl.constexpr = 2 if BLOCKSIZE_COL == 16 else 1
+        qs_unpacked = qs_packed.reshape(
+            (BLOCKSIZE_ROW, n_subblocks_to_load * group_scale // 2, 1, 32 // group_scale)
+        ) >> (tl.arange(0, 2).to(tl.uint8) * 4).reshape((1, 1, 2, 1))
         qs_unpacked &= 0x0F
-        qs_reshaped = qs_unpacked.reshape((n_subblocks_to_load, 32))
+        qs_reshaped = qs_unpacked.reshape((BLOCKSIZE_ROW, n_subblocks_to_load * group_scale, 32 // group_scale))
         if Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN:
             # discard either the top or bottom half (had to be loaded though for dequant because K-quants are dumb)
-            required_idx = first_col % 64 // 32
+            required_idx_val = first_col % 64 // 32
+            required_idx = tl.full((qs_reshaped.shape[0], 1, qs_reshaped.shape[2]), required_idx_val, dtype=tl.int32)
+            required_idx_dm_offs = tl.full((1, 1), required_idx_val, dtype=tl.int32)
             assert required_idx <= 1
-            qs_selected = qs_reshaped.gather(required_idx, dim=0, keepdim=True)
+            qs_selected = qs_reshaped.gather(required_idx, axis=1)
+            dm_offs = (
+                (first_subblock_id + tl.arange(0, n_subblocks_to_load)[None, :])
+                .gather(required_idx_dm_offs, axis=1)
+                .broadcast_to((BLOCKSIZE_ROW, required_idx_dm_offs.shape[1]))
+            )
         else:
             qs_selected = qs_reshaped
+            dm_offs = (first_subblock_id + tl.arange(0, n_subblocks_to_load)[None, :]).broadcast_to(
+                (BLOCKSIZE_ROW, n_subblocks_to_load)
+            )
         qs = qs_selected.to(UPCAST_DTYPE)
 
-        return (ds * qs - ms).reshape((-1,))
+        ds = all_ds.gather(dm_offs, axis=-1)
+        ms = all_ms.gather(dm_offs, axis=-1)
+
+        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
     elif conceptual_dtype == tensor.q5_k.name:
         # q5_k
         ...
