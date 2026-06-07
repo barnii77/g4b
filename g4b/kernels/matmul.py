@@ -19,6 +19,9 @@ from g4b.utils import contiguous_strides_for_shape
 #  ... sadly, I think for now I don't have the time to get this right, let's hope mem bandwidth bottlenecks enough for
 #  bf16 mma to do the trick during decode.
 
+# TODO It turns out K-quants are a retarded format for GPUs. There's room for optimization by repacking into a
+#  custom format with better block layout at load time... However I fear such a repack would be lossy.
+
 
 def _pre_hook(args):
     split_k = args["NUM_K_SPLITS"]
@@ -220,13 +223,67 @@ def _matmul_a3d_b2d_kernel(
         BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
         BLOCK_K: tl.constexpr = A_BLOCKSIZE2
         BLOCK_N: tl.constexpr = B_BLOCKSIZE1
-        a = loader_fn("a", a_desc, off_b, off_row, off_k, A_DTYPE).reshape((BLOCK_M, BLOCK_K))
-        b = loader_fn("b", b_desc, 0, off_k, off_col, B_DTYPE).reshape((BLOCK_K, BLOCK_N))
+        a = loader_fn(
+            "a",
+            a_desc,
+            off_b,
+            off_row,
+            off_k,
+            a_ptr,
+            a_shape0,
+            a_shape1,
+            a_shape2,
+            a_stride0,
+            a_stride1,
+            a_stride2,
+            A_BLOCKSIZE0,
+            A_BLOCKSIZE1,
+            A_BLOCKSIZE2,
+            A_DTYPE,
+        ).reshape((BLOCK_M, BLOCK_K))
+        b = loader_fn(
+            "b",
+            b_desc,
+            0,
+            off_k,
+            off_col,
+            b_ptr,
+            1,
+            b_shape0,
+            b_shape1,
+            0,
+            b_stride0,
+            b_stride1,
+            1,
+            A_BLOCKSIZE2,
+            B_BLOCKSIZE1,
+            B_DTYPE,
+        ).reshape((BLOCK_K, BLOCK_N))
+        # TODO logic for upcasting a and b tiles to common dtype... do I want implicit or user-controlled upcasting?
+        #  also ensure I upcast b2 to b_upcast_ty!
         c = tl.dot(a, b, c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
             (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1)
         )
         if has_b2:
-            b2_tile = loader_fn("b2", b2_desc, 0, off_k, off_col, B2_DTYPE).reshape(b.shape)
+            # TODO maybe t.join'ing the b and b2 tiles and doing one tl.dot call then splitting again is faster? try!
+            b2_tile = loader_fn(
+                "b2",
+                b2_desc,
+                0,
+                off_k,
+                off_col,
+                b2_ptr,
+                1,
+                b_shape0,
+                b_shape1,
+                0,
+                b_stride0,
+                b_stride1,
+                1,
+                A_BLOCKSIZE2,
+                B_BLOCKSIZE1,
+                B2_DTYPE,
+            ).reshape(b.shape)
             c2 = tl.dot(a, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
 
     if has_b2:
@@ -251,16 +308,130 @@ def _matmul_a3d_b2d_kernel(
 
 
 @triton.jit
-def matmul_a3d_b2d_loader_jfn(name: tl.constexpr, desc, off0, off1, off2, conceptual_dtype: tl.constexpr):
-    tile = desc.load((off0, off1, off2))
-    # TODO
+def matmul_a3d_b2d_loader_jfn(
+    name: tl.constexpr,
+    desc,
+    off0,
+    off1,
+    off2,
+    ptr,
+    shape0: tl.constexpr,
+    shape1: tl.constexpr,
+    shape2: tl.constexpr,
+    stride0: tl.constexpr,
+    stride1: tl.constexpr,
+    stride2: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr,
+    BLOCKSIZE1: tl.constexpr,
+    BLOCKSIZE2: tl.constexpr,
+    conceptual_dtype: tl.constexpr,
+):
+    is_quantized: tl.constexpr = conceptual_dtype == tensor.q4_k.name or conceptual_dtype == tensor.q5_k.name or conceptual_dtype == tensor.q6_k.name
+    if not is_quantized:
+        return desc.load((off0, off1, off2))
+
+    # desc not used, we manually tl.load
+    ptr_u8 = ptr
+    tl.static_assert(not is_quantized or ptr_u8.dtype.element_ty == tl.uint8)
+
+    # each row must fit in one superblock for now
+    k_quant_superblock_num_elems: tl.constexpr = 256
+    tl.static_assert(not is_quantized or BLOCKSIZE2 <= k_quant_superblock_num_elems)
+
+    # dtype to which it upcasts values
+    UPCAST_DTYPE: tl.constexpr = tl.float16
+
+    # for quantized loads, tensor must be 2d for now
+    tl.static_assert(not is_quantized or shape0 == 1)
+    tl.static_assert(not is_quantized or stride0 == 0)
+    tl.static_assert(not is_quantized or BLOCKSIZE0 == 1)
+    tl.static_assert(not is_quantized or stride2 == 1)  # superblocks are physically laid out as contiguous 256-byte arrays
+    tl.static_assert(not is_quantized or BLOCKSIZE2 >= 16)  # hacky assert but makes my life easier below
+
+    stride_row: tl.constexpr = stride1
+    BLOCKSIZE_ROW: tl.constexpr = BLOCKSIZE1
+    BLOCKSIZE_COL: tl.constexpr = BLOCKSIZE2
+    first_row = off1
+    first_col = off2
+    SUPERBLOCK_SIZE_ELEMS: tl.constexpr = 256
+    offs_row = first_row + tl.arange(0, BLOCKSIZE_ROW)[:, None]
+
+    # TODO a lot of the indexing can probably be optimized and maybe one could also avoid loading all sub-block scales.
+
+    # full ahead-of-mma dequant
     if conceptual_dtype == tensor.q4_k.name:
-        ...
+        # q4_k
+        SUPERBLOCK_SIZE_BYTES: tl.constexpr = 144
+        SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
+        SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
+
+        rows: tl.constexpr = shape1 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        cols: tl.constexpr = shape2 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        tl.static_assert(not is_quantized or cols % SUPERBLOCK_SIZE_ELEMS == 0)
+
+        ptr_u16 = ptr_u8.cast(tl.pointer_type(tl.uint16))
+        sizeof_u16 = 2
+
+        superblock_id_col = first_col // SUPERBLOCK_SIZE_ELEMS
+        sb_first_byte_col_off = superblock_id_col * SUPERBLOCK_SIZE_BYTES
+        dd_ptrs_u16 = ptr_u16 + offs_row * (stride_row // sizeof_u16) + sb_first_byte_col_off // sizeof_u16
+        mask = offs_row < rows
+        dd = tl.load(dd_ptrs_u16, mask=mask).cast(UPCAST_DTYPE, bitcast=True)
+        md = tl.load(dd_ptrs_u16 + 1, mask=mask).cast(UPCAST_DTYPE, bitcast=True)
+
+        dd_ptrs_u8 = ptr_u8 + offs_row * stride_row + sb_first_byte_col_off
+        d_frags = tl.load(dd_ptrs_u8 + 4 + tl.arange(0, 4), mask=mask)
+        m_frags = tl.load(dd_ptrs_u8 + 8 + tl.arange(0, 4), mask=mask)
+        mixed_frags = tl.load(dd_ptrs_u8 + 12 + tl.arange(0, 4), mask=mask)
+
+        sc = tl.cat(d_frags & 0x3F, ((d_frags & 0xC0) >> 2) | (mixed_frags & 0x0F), dim=-1)
+        mins = tl.cat(m_frags & 0x3F, ((m_frags & 0xC0) >> 2) | (mixed_frags >> 4), dim=-1)
+
+        ds = sc.to(UPCAST_DTYPE) * dd
+        ms = mins.to(UPCAST_DTYPE) * md
+
+        Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN: tl.constexpr = BLOCKSIZE_COL <= SUBBLOCK_SIZE_ELEMS
+        n_subblocks_to_load: tl.constexpr = (
+            tl.cdiv(BLOCKSIZE_COL * 2, SUBBLOCK_SIZE_ELEMS)
+            if Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN
+            else tl.cdiv(BLOCKSIZE_COL, SUBBLOCK_SIZE_ELEMS)
+        )
+        first_subblock_id = (
+            # produces 0,1,0,1,2,3,2,3,4,5,4,5,... pattern - handles Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN
+            (first_col % SUPERBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS * 2) * 2
+            + (first_row % SUPERBLOCK_SIZE_ELEMS % SUBBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS // 2)
+        )
+        qs_packed = tl.load(
+            ptr_u8
+            + 16  # skip first "subblock" which contains block scales/mins
+            + offs_row * stride_row
+            + first_subblock_id * SUBBLOCK_SIZE_BYTES
+            + tl.arange(0, n_subblocks_to_load * SUBBLOCK_SIZE_BYTES)[None, :],
+            mask=mask,
+        )
+
+        # pull high 4 bits and low 4 bits apart into 2 values (order: low then high)
+        qs_unpacked = qs_packed.reshape((-1, 1, 2 * SUBBLOCK_SIZE_BYTES)) >> (tl.arange(0, 1).to(tl.uint8) * 4).reshape(
+            (1, 2, 1)
+        )
+        qs_unpacked &= 0x0F
+        qs_reshaped = qs_unpacked.reshape((n_subblocks_to_load, 32))
+        if Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN:
+            # discard either the top or bottom half (had to be loaded though for dequant because K-quants are dumb)
+            required_idx = first_col % 64 // 32
+            assert required_idx <= 1
+            qs_selected = qs_reshaped.gather(required_idx, dim=0, keepdim=True)
+        else:
+            qs_selected = qs_reshaped
+        qs = qs_selected.to(UPCAST_DTYPE)
+
+        return (ds * qs - ms).reshape((-1,))
     elif conceptual_dtype == tensor.q5_k.name:
+        # q5_k
         ...
-    elif conceptual_dtype == tensor.q6_k.name:
+    else:
+        # q6_k
         ...
-    return tile
 
 
 @triton.jit
