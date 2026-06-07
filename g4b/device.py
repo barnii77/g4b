@@ -99,6 +99,8 @@ def _init_triton():
     triton.runtime.driver.active.get_current_device = lambda: int(_triton_current_device.device_id)
     _triton_current_device = device
     _triton_current_stream = stream
+    # TODO triton.set_allocator(alloc_fn) for tensor descriptors to work without torch.
+    #  See https://triton-lang.org/main/python-api/generated/triton.language.make_tensor_descriptor.html example
 
 
 def _real_torch_available() -> bool:
