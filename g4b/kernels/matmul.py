@@ -406,7 +406,7 @@ def matmul_a3d_b2d_loader_jfn(
         first_subblock_id = (
             # produces 0,1,0,1,2,3,2,3,4,5,4,5,... pattern - handles Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN
             (first_col % SUPERBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS * 2) * 2
-            + (first_row % SUPERBLOCK_SIZE_ELEMS % SUBBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS // 2)
+            + (first_col % SUPERBLOCK_SIZE_ELEMS % SUBBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS // 2)
         )
         qs_packed = tl.load(
             ptr_u8
