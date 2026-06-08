@@ -423,13 +423,13 @@ def matmul_a3d_b2d_b_loader_jfn(
         sb_first_byte_col_off = superblock_id_col * SUPERBLOCK_SIZE_BYTES
         dd_ptrs_u16 = ptr_u16 + offs_row * (stride_row // sizeof_u16) + sb_first_byte_col_off // sizeof_u16
         mask = offs_row < rows
-        dd = tl.load(dd_ptrs_u16, mask=mask).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
-        md = tl.load(dd_ptrs_u16 + 1, mask=mask).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
+        dd = tl.load(dd_ptrs_u16, mask=mask, other=0.0).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
+        md = tl.load(dd_ptrs_u16 + 1, mask=mask, other=0.0).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
 
         dd_ptrs_u8 = ptr_u8 + offs_row * stride_row + sb_first_byte_col_off
-        d_frags = tl.load(dd_ptrs_u8 + 4 + tl.arange(0, 4), mask=mask)
-        m_frags = tl.load(dd_ptrs_u8 + 8 + tl.arange(0, 4), mask=mask)
-        mixed_frags = tl.load(dd_ptrs_u8 + 12 + tl.arange(0, 4), mask=mask)
+        d_frags = tl.load(dd_ptrs_u8 + 4 + tl.arange(0, 4), mask=mask, other=0.0)
+        m_frags = tl.load(dd_ptrs_u8 + 8 + tl.arange(0, 4), mask=mask, other=0.0)
+        mixed_frags = tl.load(dd_ptrs_u8 + 12 + tl.arange(0, 4), mask=mask, other=0.0)
 
         sc = tl.cat(d_frags & 0x3F, ((d_frags & 0xC0) >> 2) | (mixed_frags & 0x0F), dim=-1)
         mins = tl.cat(m_frags & 0x3F, ((m_frags & 0xC0) >> 2) | (mixed_frags >> 4), dim=-1)
@@ -456,6 +456,7 @@ def matmul_a3d_b2d_b_loader_jfn(
             + first_subblock_id * SUBBLOCK_SIZE_BYTES
             + tl.arange(0, n_subblocks_to_load * SUBBLOCK_SIZE_BYTES)[None, :],
             mask=mask,
+            other=0.0,
         )
 
         # pull high 4 bits and low 4 bits apart into 2 values (order: low then high)
@@ -505,13 +506,13 @@ def matmul_a3d_b2d_b_loader_jfn(
         sb_first_byte_col_off = superblock_id_col * SUPERBLOCK_SIZE_BYTES
         dd_ptrs_u16 = ptr_u16 + offs_row * (stride_row // sizeof_u16) + sb_first_byte_col_off // sizeof_u16
         mask = offs_row < rows
-        dd = tl.load(dd_ptrs_u16, mask=mask).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
-        md = tl.load(dd_ptrs_u16 + 1, mask=mask).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
+        dd = tl.load(dd_ptrs_u16, mask=mask, other=0.0).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
+        md = tl.load(dd_ptrs_u16 + 1, mask=mask, other=0.0).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
 
         dd_ptrs_u8 = ptr_u8 + offs_row * stride_row + sb_first_byte_col_off
-        d_frags = tl.load(dd_ptrs_u8 + 4 + tl.arange(0, 4), mask=mask)
-        m_frags = tl.load(dd_ptrs_u8 + 8 + tl.arange(0, 4), mask=mask)
-        mixed_frags = tl.load(dd_ptrs_u8 + 12 + tl.arange(0, 4), mask=mask)
+        d_frags = tl.load(dd_ptrs_u8 + 4 + tl.arange(0, 4), mask=mask, other=0.0)
+        m_frags = tl.load(dd_ptrs_u8 + 8 + tl.arange(0, 4), mask=mask, other=0.0)
+        mixed_frags = tl.load(dd_ptrs_u8 + 12 + tl.arange(0, 4), mask=mask, other=0.0)
 
         sc = tl.cat(d_frags & 0x3F, ((d_frags & 0xC0) >> 2) | (mixed_frags & 0x0F), dim=-1)
         mins = tl.cat(m_frags & 0x3F, ((m_frags & 0xC0) >> 2) | (mixed_frags >> 4), dim=-1)
@@ -538,6 +539,7 @@ def matmul_a3d_b2d_b_loader_jfn(
             + first_subblock_id * SUBBLOCK_SIZE_BYTES
             + tl.arange(0, n_subblocks_to_load * SUBBLOCK_SIZE_BYTES)[None, :],
             mask=mask,
+            other=0.0,
         )
         qh_packed = tl.load(
             ptr_u8
@@ -546,6 +548,7 @@ def matmul_a3d_b2d_b_loader_jfn(
             + 16  # skip first "subblock" which contains block scales/mins
             + tl.arange(0, SUBBLOCK_SIZE_ELEMS)[None, :],
             mask=mask,
+            other=0.0,
         )
 
         # pull high 4 bits and low 4 bits apart into 2 values (order: low then high)
@@ -600,9 +603,9 @@ def matmul_a3d_b2d_b_loader_jfn(
         sb_first_byte_col_off = superblock_id_col * SUPERBLOCK_SIZE_BYTES
         dd_ptrs_u16 = ptr_u16 + offs_row * (stride_row // sizeof_u16) + sb_first_byte_col_off // sizeof_u16 + 104
         mask = offs_row < rows
-        dd = tl.load(dd_ptrs_u16, mask=mask).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
+        dd = tl.load(dd_ptrs_u16, mask=mask, other=0.0).cast(tl.float16, bitcast=True).to(UPCAST_DTYPE)
         sc_ptrs_u8 = ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + 192 + tl.arange(0, 16)[None, :]
-        sc = tl.load(sc_ptrs_u8, mask=mask).cast(tl.int8, bitcast=True)
+        sc = tl.load(sc_ptrs_u8, mask=mask, other=0.0).cast(tl.int8, bitcast=True)
 
         all_ds = sc.to(UPCAST_DTYPE) * dd
 
@@ -619,6 +622,7 @@ def matmul_a3d_b2d_b_loader_jfn(
             + sb_first_byte_col_off
             + ql_byte_offs,
             mask=mask,
+            other=0.0,
         )
 
         qh_byte_offs = 128 + (col_offs // 128) * 32 + (col_offs % 32)
@@ -629,6 +633,7 @@ def matmul_a3d_b2d_b_loader_jfn(
             + sb_first_byte_col_off
             + qh_byte_offs,
             mask=mask,
+            other=0.0,
         )
 
         ql_unpacked = (ql_packed >> ql_shift) & 0x0F
