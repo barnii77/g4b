@@ -9,3 +9,5 @@ class Config:
     model_arch: str
     gguf_path: Path
     prefill_chunk_size: int
+    host: str
+    port: int

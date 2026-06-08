@@ -4,6 +4,7 @@ from pathlib import Path
 from g4b.config import Config
 from g4b.scheduler import Scheduler
 from g4b.models import models
+from g4b.serve import Uvicorn
 from g4b import gguf, device
 
 
@@ -13,8 +14,18 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--context-length", type=int, default=-1)
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    return Config(args.batch_size, args.context_length, "unknown", Path(args.gguf), args.prefill_chunk_size)
+    return Config(
+        args.batch_size,
+        args.context_length,
+        "unknown",
+        Path(args.gguf),
+        args.prefill_chunk_size,
+        args.host,
+        args.port,
+    )
 
 
 def main():
@@ -28,12 +39,22 @@ def main():
     if config.context_len == -1:
         config.context_len = supported_ctx_len - config.prefill_chunk_size + 1
     if supported_ctx_len < config.context_len:
-        warnings.warn(f"The gguf says this model only supports {supported_ctx_len}, but you passed {config.context_len}")
+        warnings.warn(
+            f"The gguf says this model only supports {supported_ctx_len}, but you passed {config.context_len}"
+        )
 
     model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
     scheduler = Scheduler(model)
-    # TODO run http server
 
+    uvicorn = Uvicorn.start(config.host, config.port)
+
+    try:
+        while True:
+            scheduler.step()
+    except Exception:
+        pass
+
+    uvicorn.stop()
     device.teardown()
 
 
