@@ -366,11 +366,11 @@ def matmul_a3d_b2d_loader_jfn(
     offs_row = first_row + tl.arange(0, BLOCKSIZE_ROW)[:, None]
 
     # TODO a lot of the indexing can probably be optimized and maybe one could also avoid loading all sub-block scales.
+    # TODO handle BLOCKSIZE_COL == 16 correctly
 
     # full ahead-of-mma dequant
     if conceptual_dtype == tensor.q4_k.name:
         # q4_k
-        # TODO handle BLOCKSIZE_COL == 16 correctly
         SUPERBLOCK_SIZE_BYTES: tl.constexpr = 144
         SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
         SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
@@ -411,7 +411,7 @@ def matmul_a3d_b2d_loader_jfn(
             (first_col % SUPERBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS * 2) * 2
             + (first_col % SUPERBLOCK_SIZE_ELEMS % SUBBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS // 2)
         )
-        qs_packed = tl.load(
+        ql_packed = tl.load(
             ptr_u8
             + 16  # skip first "subblock" which contains block scales/mins
             + offs_row * stride_row
@@ -421,12 +421,12 @@ def matmul_a3d_b2d_loader_jfn(
         )
 
         # pull high 4 bits and low 4 bits apart into 2 values (order: low then high)
-        group_scale: tl.constexpr = 2 if BLOCKSIZE_COL == 16 else 1
-        qs_unpacked = qs_packed.reshape(
-            (BLOCKSIZE_ROW, n_subblocks_to_load * group_scale // 2, 1, 32 // group_scale)
-        ) >> (tl.arange(0, 2).to(tl.uint8) * 4).reshape((1, 1, 2, 1))
+        qs_unpacked = ql_packed.reshape((BLOCKSIZE_ROW, n_subblocks_to_load // 2, 1, 32)) >> (
+            tl.arange(0, 2).to(tl.uint8) * 4
+        ).reshape((1, 1, 2, 1))
         qs_unpacked &= 0x0F
-        qs_reshaped = qs_unpacked.reshape((BLOCKSIZE_ROW, n_subblocks_to_load * group_scale, 32 // group_scale))
+
+        qs_reshaped = qs_unpacked.reshape((BLOCKSIZE_ROW, n_subblocks_to_load, 32))
         if Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN:
             # discard either the top or bottom half (had to be loaded though for dequant because K-quants are dumb)
             required_idx_val = first_col % 64 // 32
@@ -452,7 +452,98 @@ def matmul_a3d_b2d_loader_jfn(
         return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
     elif conceptual_dtype == tensor.q5_k.name:
         # q5_k
-        ...
+        SUPERBLOCK_SIZE_BYTES: tl.constexpr = 176
+        SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
+        SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
+
+        rows: tl.constexpr = shape1
+        cols: tl.constexpr = shape2 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        tl.static_assert(not is_quantized or cols % SUPERBLOCK_SIZE_ELEMS == 0)
+
+        ptr_u16 = ptr_u8.cast(tl.pointer_type(tl.uint16))
+        sizeof_u16 = 2
+
+        superblock_id_col = first_col // SUPERBLOCK_SIZE_ELEMS
+        sb_first_byte_col_off = superblock_id_col * SUPERBLOCK_SIZE_BYTES
+        dd_ptrs_u16 = ptr_u16 + offs_row * (stride_row // sizeof_u16) + sb_first_byte_col_off // sizeof_u16
+        mask = offs_row < rows
+        dd = tl.load(dd_ptrs_u16, mask=mask).cast(UPCAST_DTYPE, bitcast=True)
+        md = tl.load(dd_ptrs_u16 + 1, mask=mask).cast(UPCAST_DTYPE, bitcast=True)
+
+        dd_ptrs_u8 = ptr_u8 + offs_row * stride_row + sb_first_byte_col_off
+        d_frags = tl.load(dd_ptrs_u8 + 4 + tl.arange(0, 4), mask=mask)
+        m_frags = tl.load(dd_ptrs_u8 + 8 + tl.arange(0, 4), mask=mask)
+        mixed_frags = tl.load(dd_ptrs_u8 + 12 + tl.arange(0, 4), mask=mask)
+
+        sc = tl.cat(d_frags & 0x3F, ((d_frags & 0xC0) >> 2) | (mixed_frags & 0x0F), dim=-1)
+        mins = tl.cat(m_frags & 0x3F, ((m_frags & 0xC0) >> 2) | (mixed_frags >> 4), dim=-1)
+
+        all_ds = sc.to(UPCAST_DTYPE) * dd
+        all_ms = mins.to(UPCAST_DTYPE) * md
+
+        Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN: tl.constexpr = BLOCKSIZE_COL <= SUBBLOCK_SIZE_ELEMS
+        n_subblocks_to_load: tl.constexpr = (
+            tl.cdiv(BLOCKSIZE_COL * 2, SUBBLOCK_SIZE_ELEMS)
+            if Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN
+            else tl.cdiv(BLOCKSIZE_COL, SUBBLOCK_SIZE_ELEMS)
+        )
+        first_subblock_id = (
+            # produces 0,1,0,1,2,3,2,3,4,5,4,5,... pattern - handles Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN
+            (first_col % SUPERBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS * 2) * 2
+            + (first_col % SUPERBLOCK_SIZE_ELEMS % SUBBLOCK_SIZE_ELEMS) // (SUBBLOCK_SIZE_ELEMS // 2)
+        )
+        ql_packed = tl.load(
+            ptr_u8
+            + 48  # skip first "subblock" which contains block scales/mins
+            + offs_row * stride_row
+            + first_subblock_id * SUBBLOCK_SIZE_BYTES
+            + tl.arange(0, n_subblocks_to_load * SUBBLOCK_SIZE_BYTES)[None, :],
+            mask=mask,
+        )
+        qh_packed = tl.load(
+            ptr_u8
+            + 16  # skip first "subblock" which contains block scales/mins
+            + offs_row * stride_row
+            + tl.arange(0, SUBBLOCK_SIZE_ELEMS)[None, :],
+            mask=mask,
+        )
+
+        # pull high 4 bits and low 4 bits apart into 2 values (order: low then high)
+        ql_unpacked = ql_packed.reshape((BLOCKSIZE_ROW, n_subblocks_to_load // 2, 1, 32)) >> (
+            tl.arange(0, 2).to(tl.uint8) * 4
+        ).reshape((1, 1, 2, 1))
+        ql_unpacked &= 0x0F
+        qs_reshaped = ql_unpacked.reshape((BLOCKSIZE_ROW, n_subblocks_to_load, 32))
+
+        qh_unpacked = qh_packed.reshape((BLOCKSIZE_ROW, 1, 32)) >> (
+            (first_subblock_id + tl.arange(0, n_subblocks_to_load)).to(tl.uint8)
+        ).reshape((1, n_subblocks_to_load, 1))
+        qh_unpacked &= 0x01
+        qs_reshaped |= qh_unpacked << 4
+
+        if Q4_K_REQUIRES_INEFFICIENT_LOAD_PATTERN:
+            # discard either the top or bottom half (had to be loaded though for dequant because K-quants are dumb)
+            required_idx_val = first_col % 64 // 32
+            required_idx = tl.full((qs_reshaped.shape[0], 1, qs_reshaped.shape[2]), required_idx_val, dtype=tl.int32)
+            required_idx_dm_offs = tl.full((1, 1), required_idx_val, dtype=tl.int32)
+            assert required_idx <= 1
+            qs_selected = qs_reshaped.gather(required_idx, axis=1)
+            dm_offs = (
+                (first_subblock_id + tl.arange(0, n_subblocks_to_load)[None, :])
+                .gather(required_idx_dm_offs, axis=1)
+                .broadcast_to((BLOCKSIZE_ROW, required_idx_dm_offs.shape[1]))
+            )
+        else:
+            qs_selected = qs_reshaped
+            dm_offs = (first_subblock_id + tl.arange(0, n_subblocks_to_load)[None, :]).broadcast_to(
+                (BLOCKSIZE_ROW, n_subblocks_to_load)
+            )
+        qs = qs_selected.to(UPCAST_DTYPE)
+
+        ds = all_ds.gather(dm_offs, axis=-1)
+        ms = all_ms.gather(dm_offs, axis=-1)
+
+        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
     else:
         # q6_k
         ...
