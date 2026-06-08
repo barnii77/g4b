@@ -338,7 +338,7 @@ def matmul_a3d_b2d_loader_jfn(
         return desc.load((off0, off1, off2))
 
     # desc not used, we manually tl.load
-    ptr_u8 = ptr
+    ptr_u8 = ptr.to(tl.pointer_type(tl.uint8))
     tl.static_assert(not is_quantized or ptr_u8.dtype.element_ty == tl.uint8)
 
     # each row must fit in one superblock for now
@@ -450,7 +450,7 @@ def matmul_a3d_b2d_loader_jfn(
         ds = all_ds.gather(dm_offs, axis=-1)
         ms = all_ms.gather(dm_offs, axis=-1)
 
-        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((1, BLOCKSIZE_ROW, BLOCKSIZE_COL))
     elif conceptual_dtype == tensor.q5_k.name:
         # q5_k
         SUPERBLOCK_SIZE_BYTES: tl.constexpr = 176
@@ -546,7 +546,7 @@ def matmul_a3d_b2d_loader_jfn(
         ds = all_ds.gather(dm_offs, axis=-1)
         ms = all_ms.gather(dm_offs, axis=-1)
 
-        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((1, BLOCKSIZE_ROW, BLOCKSIZE_COL))
     else:
         # q6_k
         SUPERBLOCK_SIZE_BYTES: tl.constexpr = 210
@@ -606,7 +606,7 @@ def matmul_a3d_b2d_loader_jfn(
 
         ds = all_ds.gather(dm_offs, axis=-1)
 
-        return (ds.expand_dims(-1) * qs).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        return (ds.expand_dims(-1) * qs).reshape((1, BLOCKSIZE_ROW, BLOCKSIZE_COL))
 
 
 @triton.jit
