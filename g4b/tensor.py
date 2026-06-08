@@ -184,7 +184,7 @@ def _copy_dtoh_sync(src) -> bytes:
 
 
 def _dtype_from(gguf_dtype: GGUFType) -> DType:
-    name = gguf_dtype.name
+    name = str(gguf_dtype)
     for dtype in dtypes:
         if dtype.name == name:
             return dtype
