@@ -119,8 +119,9 @@ def _matmul_3d_autotune_configs():
         # optional second B matrix for SwiGLU / GeGLU-style fusion
         "b2_stride0", "b2_stride1",
         # codegen-affecting constexpr callables
-        # "loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
-        "_loader_fn_key", "_storer_fn_key", "_c_c2_merge_tiles_fn_key",  # hack so autotune results are cacheable to disk
+        # "a_loader_fn", "b_loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
+        # hack so autotune results are cacheable to disk
+        "_a_loader_fn_key", "_b_loader_fn_key", "_storer_fn_key", "_c_c2_merge_tiles_fn_key",
         # dtype / quantization specialization
         "A_DTYPE", "B_DTYPE", "B2_DTYPE", "C_DTYPE", "_ACCUM_DTYPE_CACHE_KEY",
         # fmt: on
@@ -143,12 +144,13 @@ def _matmul_a3d_b2d_kernel(
     B_BLOCKSIZE1: tl.constexpr,  # B_BLOCKSIZE0 = A_BLOCKSIZE2
     # C_BLOCKSIZE0 = A_BLOCKSIZE0, C_BLOCKSIZE1 = A_BLOCKSIZE1, C_BLOCKSIZE2 = B_BLOCKSIZE1
     GROUPSIZE1: tl.constexpr, NUM_K_SPLITS: tl.constexpr,
-    loader_fn: tl.constexpr, storer_fn: tl.constexpr,
+    a_loader_fn: tl.constexpr, b_loader_fn: tl.constexpr, storer_fn: tl.constexpr,
     A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, B2_DTYPE: tl.constexpr | None, C_DTYPE: tl.constexpr,  # e.g. q4_k
     ACCUM_DTYPE: tl.constexpr,
     KEEP_C: tl.constexpr,  # if true, init c = c_desc.load(...)
     # make caching to disk work (hacky)
-    _loader_fn_key: tl.constexpr, _storer_fn_key: tl.constexpr, _c_c2_merge_tiles_fn_key: tl.constexpr,
+    _a_loader_fn_key: tl.constexpr, _b_loader_fn_key: tl.constexpr, _storer_fn_key: tl.constexpr,
+    _c_c2_merge_tiles_fn_key: tl.constexpr,
     _ACCUM_DTYPE_CACHE_KEY: tl.constexpr,
     # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr is used for the PLE layers.
     c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
@@ -226,7 +228,7 @@ def _matmul_a3d_b2d_kernel(
         BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
         BLOCK_K: tl.constexpr = A_BLOCKSIZE2
         BLOCK_N: tl.constexpr = B_BLOCKSIZE1
-        a = loader_fn(
+        a = a_loader_fn(
             "a",
             a_desc,
             off_b,
@@ -244,7 +246,7 @@ def _matmul_a3d_b2d_kernel(
             A_BLOCKSIZE2,
             A_DTYPE,
         ).reshape((BLOCK_M, BLOCK_K))
-        b = loader_fn(
+        b = b_loader_fn(
             "b",
             b_desc,
             0,
@@ -262,14 +264,27 @@ def _matmul_a3d_b2d_kernel(
             B_BLOCKSIZE1,
             B_DTYPE,
         ).reshape((BLOCK_K, BLOCK_N))
-        # TODO logic for upcasting a and b tiles to common dtype... do I want implicit or user-controlled upcasting?
-        #  also ensure I upcast b2 to b_upcast_ty!
-        c = tl.dot(a, b, c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
+
+        # Handle upcasting.
+        tl.static_assert(a.dtype == tl.float32 or a.dtype == tl.float16 or a.dtype == tl.bfloat16)
+        tl.static_assert(b.dtype == tl.float32 or b.dtype == tl.float16 or b.dtype == tl.bfloat16)
+        tl.static_assert(a.dtype == b.dtype or a.dtype == tl.float32 or b.dtype == tl.float32)
+        if a.dtype == tl.float32 or b.dtype == tl.float32:
+            UPCAST_TY = tl.float32
+        elif a.dtype == b.dtype:
+            UPCAST_TY = a.dtype
+        else:
+            UPCAST_TY = tl.float32
+            assert False
+
+        a_upcast = a.to(UPCAST_TY)
+
+        c = tl.dot(a_upcast, b.to(UPCAST_TY), c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
             (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1)
         )
         if has_b2:
             # TODO maybe t.join'ing the b and b2 tiles and doing one tl.dot call then splitting again is faster? try!
-            b2_tile = loader_fn(
+            b2_tile = b_loader_fn(
                 "b2",
                 b2_desc,
                 0,
@@ -286,8 +301,8 @@ def _matmul_a3d_b2d_kernel(
                 A_BLOCKSIZE2,
                 B_BLOCKSIZE1,
                 B2_DTYPE,
-            ).reshape(b.shape)
-            c2 = tl.dot(a, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
+            ).reshape(b.shape).to(UPCAST_TY)
+            c2 = tl.dot(a_upcast, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
 
     if has_b2:
         c = c_c2_merge_tiles_fn(c, c2, off_b, off_row, off_col, NUM_K_SPLITS, C_DTYPE)
@@ -311,7 +326,29 @@ def _matmul_a3d_b2d_kernel(
 
 
 @triton.jit
-def matmul_a3d_b2d_loader_jfn(
+def matmul_a3d_b2d_a_loader_jfn(
+    name: tl.constexpr,
+    desc,
+    off0,
+    off1,
+    off2,
+    ptr,
+    shape0: tl.constexpr,
+    shape1: tl.constexpr,
+    shape2: tl.constexpr,
+    stride0: tl.constexpr,
+    stride1: tl.constexpr,
+    stride2: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr,
+    BLOCKSIZE1: tl.constexpr,
+    BLOCKSIZE2: tl.constexpr,
+    conceptual_dtype: tl.constexpr,
+):
+    return desc.load((off0, off1, off2))
+
+
+@triton.jit
+def matmul_a3d_b2d_b_loader_jfn(
     name: tl.constexpr,
     desc,
     off0,
@@ -649,7 +686,8 @@ def matmul_a3d_b2d(
     b: Tensor,
     b2: Tensor | None = None,
     storer_extra: Tensor | None = None,
-    loader_fn: tl.constexpr = matmul_a3d_b2d_loader_jfn,
+    a_loader_fn: tl.constexpr = matmul_a3d_b2d_a_loader_jfn,
+    b_loader_fn: tl.constexpr = matmul_a3d_b2d_b_loader_jfn,
     storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     accum_dtype: DType | None = None,
@@ -681,7 +719,8 @@ def matmul_a3d_b2d(
         b=b,
         b2=b2,
         storer_extra=storer_extra,
-        loader_fn=loader_fn,
+        a_loader_fn=a_loader_fn,
+        b_loader_fn=b_loader_fn,
         storer_fn=storer_fn,
         c_c2_merge_tiles_fn=c_c2_merge_tiles_fn,
         A_DTYPE=_dtype_name(a.dtype),
@@ -690,7 +729,8 @@ def matmul_a3d_b2d(
         C_DTYPE=_dtype_name(c.dtype),
         ACCUM_DTYPE=accum_dtype,
         KEEP_C=keep_c,
-        _loader_fn_key=jfn_cache_key(loader_fn),
+        _a_loader_fn_key=jfn_cache_key(a_loader_fn),
+        _b_loader_fn_key=jfn_cache_key(b_loader_fn),
         _storer_fn_key=jfn_cache_key(storer_fn),
         _c_c2_merge_tiles_fn_key=jfn_cache_key(c_c2_merge_tiles_fn),
         _ACCUM_DTYPE_CACHE_KEY=accum_dtype.name,
