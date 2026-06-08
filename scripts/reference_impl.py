@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import re
-import time
+import argparse
 from pathlib import Path
 from dataclasses import dataclass
 from g4b import gguf
@@ -686,7 +686,7 @@ class Tokenizer:
 
 @torch.inference_mode()
 def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, SamplingConfig, Tokenizer]:
-    meta, tensors = gguf.load(Path("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf"))
+    meta, tensors = gguf.load(Path(model_path))
     check_meta(meta)
     check_dtypes_supported(tensors)
 
@@ -848,6 +848,10 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")
 
 
 if __name__ == "__main__":
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument("--gguf", type=str, default="/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf")
+    cli_args = arg_parser.parse_args()
+    model_path = cli_args.gguf
     model, gemma_config, tokenizer_config, sampling_config, tokenizer = load_model()
     # TODO figure out how to restrict the api from providing special privileged tokens to the model
     #  (<unused0>, <pad>, <|turn>, ... many more).
