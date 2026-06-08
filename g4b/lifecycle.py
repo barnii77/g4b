@@ -2,7 +2,7 @@ import triton
 import triton.knobs
 import triton.runtime.autotuner
 import functools
-from g4b import scheduler
+from g4b import scheduler, device
 
 _phases = ["init", "warmup", "record", "deployment"]
 _phase = _phases[0]
@@ -34,14 +34,18 @@ def record_static_cuda_graph(step_fn):
     def wrapper(self, sched: "scheduler.Scheduler"):
         nonlocal cuda_graph
         if _phase == "warmup":
-            return step_fn(self, sched)
+            out = step_fn(self, sched)
+            assert out is None  # expect not return value
         elif _phase == "record":
-            # TODO record cuda graph
-            return step_fn(self, sched)
+            graph_builder = device.stream.create_graph_builder()
+            graph_builder.begin_building()
+            out = step_fn(self, sched)
+            assert out is None  # expect not return value
+            cuda_graph = graph_builder.end_building().complete()
         else:
             assert _phase == "deployment"
-            # TODO launch cuda graph
-            ...
+            assert cuda_graph is not None
+            cuda_graph.upload(device.stream)
 
     return wrapper
 
