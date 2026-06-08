@@ -1,5 +1,6 @@
 from . import add_kv_to_cache
 from . import embeddings
+from . import fa2
 from . import geglu
 from . import matmul
 from . import memset
@@ -12,6 +13,7 @@ from . import utils
 __all__ = [
     "add_kv_to_cache",
     "embeddings",
+    "fa2",
     "geglu",
     "matmul",
     "memset",

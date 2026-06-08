@@ -215,8 +215,8 @@ class Gemma4E(Model):
         # define important sizes
         B = config.batch_size
         t = 1  # no MTP support at the moment
-        T = ...  # config.context_len ... + t - 1?
-        W = ...  # meta["gemma4.attention.sliding_window"] ... + t - 1?
+        T = config.context_len + t - 1
+        W = meta["gemma4.attention.sliding_window"] + t - 1
         D = meta["gemma4.embedding_length"]
         k_gqa = meta["gemma4.attention.key_length"]
         v_gqa = meta["gemma4.attention.value_length"]

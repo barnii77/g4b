@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
     batch_size: int
-    context_len: int  # TODO emit warning if gguf context len < this value
-    ...  # TODO
+    context_len: int
+    model_arch: str
+    gguf_path: Path

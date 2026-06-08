@@ -188,9 +188,8 @@ def _copy_dtoh_sync(src) -> bytes:
 
 
 def _dtype_from(gguf_dtype: GGUFType) -> DType:
-    name = str(gguf_dtype)
     for dtype in dtypes:
-        if dtype.name == name:
+        if dtype.gguf_dtype == gguf_dtype:
             return dtype
     raise RuntimeError("dtype not found")
 
