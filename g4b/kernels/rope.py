@@ -28,13 +28,13 @@ def _rope_tile_jfn(
 
 
 def _cfg(
-        b0: int,
-        b1: int,
-        b2: int,
-        b3: int,
-        *,
-        warps: int,
-        stages: int = 3,
+    b0: int,
+    b1: int,
+    b2: int,
+    b3: int,
+    *,
+    warps: int,
+    stages: int = 3,
 ):
     return triton.Config(
         {
