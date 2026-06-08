@@ -68,39 +68,41 @@ def _matmul_3d_autotune_configs():
     # AI slop configs
     return [
         # ---- aggressive ----
+        _cfg(1, 32, 32, 32, 8, warps=4, stages=3),
+        _cfg(1, 64, 32, 32, 8, warps=4, stages=3),
         _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
         _cfg(1, 64, 32, 128, 8, split_k=2, warps=4, stages=3),
         _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
         _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
         # ---- small / skinny-N / decode-ish ----
         # Effective MxN: 16x16, 16x32, 32x16, 32x32
-        _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
-        # _cfg(1, 16, 64, 32, 8, warps=4, stages=3),
-        # _cfg(2, 16, 64, 16, 8, warps=4, stages=3),
-        _cfg(2, 16, 64, 32, 8, warps=4, stages=3),
-        # ---- normal balanced tiles ----
-        # Effective MxN: 32x64, 64x32, 64x64
-        # _cfg(2, 16, 64, 64, 8, warps=4, stages=3),
-        # _cfg(4, 16, 64, 32, 8, warps=4, stages=3),
-        _cfg(4, 16, 64, 64, 8, warps=4, stages=3),
-        # Larger K tile: usually good when K is big and register pressure is fine.
-        # _cfg(2, 16, 128, 64, 8, warps=4, stages=3),
-        # _cfg(4, 16, 128, 32, 8, warps=4, stages=3),
-        _cfg(4, 16, 128, 64, 8, warps=4, stages=3),
-        # ---- bigger output tiles ----
-        # Effective MxN: 64x128, 128x64, 128x128
-        # _cfg(4, 16, 64, 128, 8, warps=4, stages=4),
-        # _cfg(8, 16, 64, 64, 8, warps=4, stages=4),
-        # _cfg(8, 16, 64, 128, 8, warps=8, stages=4),
-        _cfg(4, 16, 128, 128, 8, warps=4, stages=4),
-        # _cfg(8, 16, 128, 64, 8, warps=4, stages=4),
-        _cfg(8, 16, 128, 128, 8, warps=8, stages=4),
-        # ---- split-K variants ----
-        _cfg(2, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
-        # _cfg(4, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
-        # _cfg(4, 16, 128, 64, 8, split_k=2, warps=4, stages=4),
-        # _cfg(2, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
-        _cfg(4, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
+        # _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
+        # # _cfg(1, 16, 64, 32, 8, warps=4, stages=3),
+        # # _cfg(2, 16, 64, 16, 8, warps=4, stages=3),
+        # _cfg(2, 16, 64, 32, 8, warps=4, stages=3),
+        # # ---- normal balanced tiles ----
+        # # Effective MxN: 32x64, 64x32, 64x64
+        # # _cfg(2, 16, 64, 64, 8, warps=4, stages=3),
+        # # _cfg(4, 16, 64, 32, 8, warps=4, stages=3),
+        # _cfg(4, 16, 64, 64, 8, warps=4, stages=3),
+        # # Larger K tile: usually good when K is big and register pressure is fine.
+        # # _cfg(2, 16, 128, 64, 8, warps=4, stages=3),
+        # # _cfg(4, 16, 128, 32, 8, warps=4, stages=3),
+        # _cfg(4, 16, 128, 64, 8, warps=4, stages=3),
+        # # ---- bigger output tiles ----
+        # # Effective MxN: 64x128, 128x64, 128x128
+        # # _cfg(4, 16, 64, 128, 8, warps=4, stages=4),
+        # # _cfg(8, 16, 64, 64, 8, warps=4, stages=4),
+        # # _cfg(8, 16, 64, 128, 8, warps=8, stages=4),
+        # _cfg(4, 16, 128, 128, 8, warps=4, stages=4),
+        # # _cfg(8, 16, 128, 64, 8, warps=4, stages=4),
+        # _cfg(8, 16, 128, 128, 8, warps=8, stages=4),
+        # # ---- split-K variants ----
+        # _cfg(2, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
+        # # _cfg(4, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
+        # # _cfg(4, 16, 128, 64, 8, split_k=2, warps=4, stages=4),
+        # # _cfg(2, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
+        # _cfg(4, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
     ]
 
 
@@ -353,7 +355,7 @@ def matmul_a3d_b2d_loader_jfn(
     tl.static_assert(
         not is_quantized or stride2 == 1
     )  # superblocks are physically laid out as contiguous 256-byte arrays
-    tl.static_assert(not is_quantized or BLOCKSIZE2 >= 16)  # hacky assert but makes my life easier below
+    tl.static_assert(not is_quantized or BLOCKSIZE2 >= 32)  # hacky assert but makes my life easier below
 
     stride_row: tl.constexpr = stride1
     BLOCKSIZE_ROW: tl.constexpr = BLOCKSIZE1
@@ -368,6 +370,7 @@ def matmul_a3d_b2d_loader_jfn(
     # full ahead-of-mma dequant
     if conceptual_dtype == tensor.q4_k.name:
         # q4_k
+        # TODO handle BLOCKSIZE_COL == 16 correctly
         SUPERBLOCK_SIZE_BYTES: tl.constexpr = 144
         SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
         SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
