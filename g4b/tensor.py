@@ -82,6 +82,8 @@ class Tensor:
     def from_bytes_sync(cls, data: bytes, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):
         if strides is None:
             strides = contiguous_strides_for_shape(shape)
+            if _is_quantized_dtype(dtype):
+                strides = _storage_based_strides_from_q_elem_strides(strides, dtype)
         buf = device.alloc(len(data))
         _copy_htod_sync(buf, data)
         return cls(buf, dtype, shape, strides)
@@ -98,6 +100,8 @@ class Tensor:
     def alloc_empty(cls, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):
         if strides is None:
             strides = contiguous_strides_for_shape(shape)
+            if _is_quantized_dtype(dtype):
+                strides = _storage_based_strides_from_q_elem_strides(strides, dtype)
         size_in_bytes = dtype.sizeof_tensor(shape)
         buf = device.alloc(size_in_bytes)
         return cls(buf, dtype, shape, strides)
@@ -189,3 +193,17 @@ def _dtype_from(gguf_dtype: GGUFType) -> DType:
         if dtype.name == name:
             return dtype
     raise RuntimeError("dtype not found")
+
+
+# Tensors with quantized dtypes will get auto-computed strides in terms of their logical type,
+#  but my kernels require strides in terms of the storage type (i.e. uint8 for q4_k etc.).
+def _storage_based_strides_from_q_elem_strides(strides: Sequence[int], logical_dtype: DType) -> list[int]:
+    assert logical_dtype.gguf_dtype is not None
+    gguf_type = logical_dtype.gguf_dtype
+    assert gguf_type.block_bytes() < gguf_type.block_elements(), "not a quantized dtype"
+    scaling_factor = gguf_type.block_bytes() / gguf_type.block_elements()
+    return [round(s * scaling_factor) if i != len(strides) - 1 else s for i, s in enumerate(strides)]
+
+
+def _is_quantized_dtype(dtype: DType):
+    return dtype.name != dtype.storage  # Is this property stable?
