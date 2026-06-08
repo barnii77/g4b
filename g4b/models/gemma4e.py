@@ -9,9 +9,6 @@ from g4b.lifecycle import record_static_cuda_graph
 from g4b.utils import gguf_tensors_by_name
 from g4b import kernels
 
-# TODO I cannot bake in the ple_proj into ple_lookup because they are both quantized, so I'll need a kernel that
-#  computes both at the start of the forward pass.
-
 # TODO I can fuse the sum-of-squares computation of a decoder block's output rmsnorm into the last matmul (with
 #  atomic_add). Then, I make a specialized reduction kernel instead of the next layer's input rmsnorm which
 #  1) reads the sum-of-squares, divides by D and takes the root and computes the inverse -> inv_rms
@@ -29,12 +26,6 @@ from g4b import kernels
 #  I think this optimization needs to be documented somewhere.
 # TODO I can fuse the rmsnorm w mul into the epilogue which computes the sum of squares too or, for input rmsnorms,
 #  fuse it into the resid_stream_combine kernel. (just make sure to compute the sum of squares from the original values).
-
-# TODO think about RoPE fusion and SwiGLU fusion.
-#  SwiGLU fusion works by having a single for loop over K in your kernel that MMAs both the up proj and gate proj, and
-#  then you get up_tile and gate_tile and then you immediately do out = gelu(gate_tile) * up_tile; out_ptr.store(out)
-#  As for RoPE fusion, it may be tricky because of NeoX RoPE.
-#  I think these optimizations need to be documented somewhere as well.
 
 # TODO think about how to handle sliding window attention... do I need a ring buffer KV cache?
 #  Hmm, actually I think I need a ring buffer KV cache for global attention too.
@@ -200,11 +191,7 @@ class Gemma4E(Model):
     @record_static_cuda_graph
     def prefill_chunk(self, sched: "scheduler.Scheduler"): ...  # TODO
 
-    # TODO technically for MTP if the MTP model produced keys and values (e.g. self-speculative decoding),
-    #  I would need the kv cache to have time dim size (T + t - 1), not T. I must think about how to annotate this
-    #  throughout the code and whether any of my code so far assumes size T when it should be (T + t - 1)...
-    #  Should I reassign the name T and W to mean (context_len + t - 1)? Probably...
-    #  This means the attn kernel needs two separate args: clen and T (though one is derived from the other I guess)
+    # TODO the attn kernel needs two separate args: clen and T (though one is derived from the other I guess)
     @classmethod
     def load(cls, meta: GGUFMeta, tensors: list[GGUFTensor], config: Config):
         _check_meta(meta)
@@ -214,7 +201,7 @@ class Gemma4E(Model):
 
         # define important sizes
         B = config.batch_size
-        t = 1  # no MTP support at the moment
+        t = config.prefill_chunk_size
         T = config.context_len + t - 1
         W = meta["gemma4.attention.sliding_window"] + t - 1
         D = meta["gemma4.embedding_length"]

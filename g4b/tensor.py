@@ -149,6 +149,12 @@ class Tensor:
         permute_seq[dim2] = dim1
         return self.permute(permute_seq)
 
+    def slice_start(self, dim: int, end: int):
+        assert len(self.shape) > dim
+        assert self.shape[dim] >= end
+        new_shape = [end if i == dim else s for i, s in enumerate(self.shape)]
+        return Tensor(self.buffer, self.dtype, new_shape, self.stride)
+
 
 def _copy_htod_sync(dst, data: bytes | bytearray | memoryview):
     stream = device.stream

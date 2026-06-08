@@ -8,3 +8,4 @@ class Config:
     context_len: int
     model_arch: str
     gguf_path: Path
+    prefill_chunk_size: int
