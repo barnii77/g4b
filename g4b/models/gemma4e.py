@@ -329,7 +329,9 @@ class Gemma4E(Model):
             input_rmsnorm_w = by_name("attn_norm")
             swa_pattern = meta["gemma4.attention.sliding_window_pattern"]
             is_swa = swa_pattern[i]
-            context_window_size = min(W, config.context_len) if is_swa else config.context_len
+            context_window_size = (
+                min(meta["gemma4.attention.sliding_window"], config.context_len) if is_swa else config.context_len
+            )
             assert isinstance(context_window_size, int)
 
             owns_kv_cache = L - i >= meta["gemma4.attention.shared_kv_layers"]
