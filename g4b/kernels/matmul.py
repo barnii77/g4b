@@ -413,8 +413,9 @@ def matmul_a3d_b2d_loader_jfn(
         )
         ql_packed = tl.load(
             ptr_u8
-            + 16  # skip first "subblock" which contains block scales/mins
             + offs_row * stride_row
+            + sb_first_byte_col_off
+            + 16  # skip first "subblock" which contains block scales/mins
             + first_subblock_id * SUBBLOCK_SIZE_BYTES
             + tl.arange(0, n_subblocks_to_load * SUBBLOCK_SIZE_BYTES)[None, :],
             mask=mask,
@@ -494,16 +495,18 @@ def matmul_a3d_b2d_loader_jfn(
         )
         ql_packed = tl.load(
             ptr_u8
-            + 48  # skip first "subblock" which contains block scales/mins
             + offs_row * stride_row
+            + sb_first_byte_col_off
+            + 48  # skip first "subblock" which contains block scales/mins
             + first_subblock_id * SUBBLOCK_SIZE_BYTES
             + tl.arange(0, n_subblocks_to_load * SUBBLOCK_SIZE_BYTES)[None, :],
             mask=mask,
         )
         qh_packed = tl.load(
             ptr_u8
-            + 16  # skip first "subblock" which contains block scales/mins
             + offs_row * stride_row
+            + sb_first_byte_col_off
+            + 16  # skip first "subblock" which contains block scales/mins
             + tl.arange(0, SUBBLOCK_SIZE_ELEMS)[None, :],
             mask=mask,
         )
@@ -546,7 +549,8 @@ def matmul_a3d_b2d_loader_jfn(
         return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
     else:
         # q6_k
-        ...
+        SUPERBLOCK_SIZE_BYTES: tl.constexpr = 210
+        SUBBLOCK_SIZE_ELEMS: tl.constexpr = 16
 
 
 @triton.jit
