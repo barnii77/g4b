@@ -24,8 +24,9 @@ def main():
     config.model_arch = gguf_meta["general.architecture"]
 
     supported_ctx_len = gguf_meta[f"{config.model_arch}.context_length"]
+    n_mtp = 1
     if config.context_len == -1:
-        config.context_len = supported_ctx_len
+        config.context_len = supported_ctx_len - n_mtp + 1
     if supported_ctx_len < config.context_len:
         warnings.warn(f"The gguf says this model only supports {supported_ctx_len}, but you passed {config.context_len}")
 
