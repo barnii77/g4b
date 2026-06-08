@@ -21,7 +21,7 @@ def complete_phase(expected_phase: str | None = None):
     if expected_phase is not None and _phase != expected_phase:
         raise RuntimeError(f"Expected phase does not match actual phase: expected {expected_phase} vs actual {_phase}")
     _phase = _phases[_phases.index(_phase) + 1]
-    if _phase == _phases[-1]:
+    if _phase == "record":
         triton.knobs.runtime.jit_cache_hook = _forbid_triton_compile
         triton.runtime.autotuner.Autotuner._bench = _forbid_triton_autotune
 
@@ -42,10 +42,11 @@ def record_static_cuda_graph(step_fn):
             out = step_fn(self, sched)
             assert out is None  # expect not return value
             cuda_graph = graph_builder.end_building().complete()
+            cuda_graph.upload(device.stream)
         else:
             assert _phase == "deployment"
             assert cuda_graph is not None
-            cuda_graph.upload(device.stream)
+            cuda_graph.launch(device.stream)
 
     return wrapper
 
