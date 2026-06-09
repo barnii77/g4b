@@ -3,6 +3,7 @@ import warnings
 from pathlib import Path
 from g4b.config import Config
 from g4b.scheduler import Scheduler
+from g4b.tokenizer import Tokenizer, ChatTemplate
 from g4b.models import models
 from g4b import gguf, device, serve
 
@@ -44,8 +45,12 @@ def main():
 
     model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
     scheduler = Scheduler(model)
+    tokenizer = Tokenizer(config)
+    chat_template = ChatTemplate(config)
 
     serve.register_scheduler(scheduler)
+    serve.register_tokenizer(tokenizer)
+    serve.register_chat_template(chat_template)
     uvicorn = serve.Uvicorn.start(config.host, config.port)
 
     try:
