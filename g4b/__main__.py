@@ -4,8 +4,7 @@ from pathlib import Path
 from g4b.config import Config
 from g4b.scheduler import Scheduler
 from g4b.models import models
-from g4b.serve import Uvicorn
-from g4b import gguf, device
+from g4b import gguf, device, serve
 
 
 def parse_args():
@@ -46,7 +45,8 @@ def main():
     model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
     scheduler = Scheduler(model)
 
-    uvicorn = Uvicorn.start(config.host, config.port)
+    serve.register_scheduler(scheduler)
+    uvicorn = serve.Uvicorn.start(config.host, config.port)
 
     try:
         while True:
