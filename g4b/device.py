@@ -1,7 +1,3 @@
-# TODO after _init_cuda and _init_triton but before cuda graph capture, run triton on fake input tensors so it can
-#  autotune first and only then when that is done, record. Also, before recording, make sure to call stream.sync()
-#  on all streams.
-
 import importlib.util
 import sys
 from cuda.core import Device, Stream, Buffer, Event, EventOptions, PinnedMemoryResource
@@ -69,6 +65,11 @@ def teardown():
     stream.close()
     _alloc_stream.close()
     _pinned_mr.close()
+
+
+def sync_all_streams():
+    stream.sync()
+    _alloc_stream.sync()
 
 
 def _init_cuda(device_id: int):

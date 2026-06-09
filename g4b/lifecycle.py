@@ -37,12 +37,14 @@ def record_static_cuda_graph(step_fn):
             out = step_fn(self, sched)
             assert out is None  # expect not return value
         elif _phase == "record":
+            device.sync_all_streams()
             graph_builder = device.stream.create_graph_builder()
             graph_builder.begin_building()
             out = step_fn(self, sched)
             assert out is None  # expect not return value
             cuda_graph = graph_builder.end_building().complete()
             cuda_graph.upload(device.stream)
+            device.sync_all_streams()
         else:
             assert _phase == "deployment"
             assert cuda_graph is not None
