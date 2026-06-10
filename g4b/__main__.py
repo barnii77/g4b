@@ -45,8 +45,8 @@ def main():
 
     model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
     scheduler = Scheduler(model)
-    tokenizer = Tokenizer(config)
-    chat_template = ChatTemplate(config)
+    tokenizer = Tokenizer(config, gguf_meta)
+    chat_template = ChatTemplate(config, gguf_meta)
 
     serve.register_scheduler(scheduler)
     serve.register_tokenizer(tokenizer)
