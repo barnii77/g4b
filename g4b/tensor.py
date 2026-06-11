@@ -74,9 +74,10 @@ class Tensor:
     dtype: DType
     shape: Sequence[int]
     stride: Sequence[int]
+    _base_ptr_byte_offset: int = 0
 
     def data_ptr(self) -> int:
-        return int(self.buffer.handle)
+        return int(self.buffer.handle + self._base_ptr_byte_offset)
 
     @classmethod
     def from_bytes_sync(cls, data: bytes, dtype: DType, shape: Sequence[int], strides: Sequence[int] | None = None):
@@ -107,9 +108,14 @@ class Tensor:
         return cls(buf, dtype, shape, strides)
 
     def to_bytes_sync(self) -> bytes:
-        return _copy_dtoh_sync(self.buffer)
+        if self._base_ptr_byte_offset != 0:
+            raise RuntimeError("unsupported for slice_at tensors")
+        return _copy_dtoh_sync(self.buffer)  # TODO use tensor shape and dtype size to transfer only relevant chunk
 
     def copy_to(self, dst: Buffer, event: Event):
+        # TODO replace with cuda runtime api calls so I can support self._base_ptr_byte_offset != 0
+        if self._base_ptr_byte_offset != 0:
+            raise RuntimeError("unsupported for slice_at tensors")
         self.buffer.copy_to(dst, stream=device.stream)
         return device.stream.record(event)
 
@@ -149,11 +155,24 @@ class Tensor:
         permute_seq[dim2] = dim1
         return self.permute(permute_seq)
 
-    def slice_start(self, dim: int, end: int):
+    def slice_until(self, dim: int, end: int):
         assert len(self.shape) > dim
         assert self.shape[dim] >= end
         new_shape = [end if i == dim else s for i, s in enumerate(self.shape)]
         return Tensor(self.buffer, self.dtype, new_shape, self.stride)
+
+    def slice_at(self, dim: int, idx: int):
+        if dim >= len(self.shape) or idx >= self.shape[dim]:
+            raise RuntimeError("illegal dim or idx")
+        if _is_quantized_dtype(self.dtype):
+            raise RuntimeError("cannot slice_at into quantized tensor")
+        return Tensor(
+            self.buffer,
+            self.dtype,
+            list(self.shape[:dim]) + list(self.shape[dim + 1 :]),
+            list(self.stride[:dim]) + list(self.stride[dim + 1 :]),
+            self._base_ptr_byte_offset + self.stride[dim] * idx * self.dtype.tl_dtype.itemsize,
+        )
 
 
 def _copy_htod_sync(dst, data: bytes | bytearray | memoryview):
