@@ -1,11 +1,5 @@
 import triton
-from triton import language as tl
-
-
-@triton.jit
-def tanh_jfn(x):
-    # Tanh is just a scaled sigmoid
-    return 2 * tl.sigmoid(2 * x) - 1
+from g4b.kernels.utils import tanh_jfn
 
 
 @triton.jit

@@ -2,7 +2,7 @@ import math
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, tanh_jfn
 from g4b.utils import to_int_exact
 
 
@@ -257,6 +257,7 @@ def _sample_logits_finalize_kernel(
     temperature: tl.constexpr, top_k: tl.constexpr, top_p: tl.constexpr,
     NUM_V_SPLITS: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
+    logit_softcap: tl.constexpr = None,
     # fmt: on
 ):
     tl.static_assert(top_k_logits_shape0 == top_k_idx_shape0)
@@ -319,6 +320,10 @@ def _sample_logits_finalize_kernel(
     top_k_idx = top_BS2_idx.gather(gather_top_k_idx, axis=-1)
 
     ### final reduction done - sample now
+
+    # logit softcap
+    if logit_softcap is not None:
+        top_k_logits = logit_softcap * tanh_jfn(top_k_logits / logit_softcap)
 
     probs = tl.softmax(top_k_logits / temperature, dim=-1, keep_dims=True)
 

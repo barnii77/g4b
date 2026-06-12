@@ -6,6 +6,12 @@ from triton.experimental.gluon import language as gl
 from g4b import tensor
 
 
+@triton.jit
+def tanh_jfn(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
 def _is_tensor_like(t):
     return hasattr(t, "shape") and hasattr(t, "stride") and hasattr(t, "dtype") and hasattr(t, "data_ptr")
 
