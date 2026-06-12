@@ -126,12 +126,7 @@ class Tensor:
         # TODO validate if this reshape is actually possible given the strides and update strides properly
         assert self.is_contiguous(), "reshape of non-contiguous tensor unsupported"
         shape = canonicalize_shape_for_size(shape, math.prod(self.shape))
-        return Tensor(
-            self.buffer,
-            self.dtype,
-            shape,
-            contiguous_strides_for_shape(shape),
-        )
+        return Tensor(self.buffer, self.dtype, shape, contiguous_strides_for_shape(shape), self._base_ptr_byte_offset)
 
     def view(self, dtype: DType) -> Tensor:
         # attempts to resize last dim, fails if shape[-1] or stride[-1] not divisible to cleanly fit new dtype
@@ -141,13 +136,20 @@ class Tensor:
             dtype,
             [*self.shape[:-1], to_int_exact(self.shape[-1] * size_ratio)],
             [*self.stride[:-1], to_int_exact(self.stride[-1] * size_ratio)],
+            self._base_ptr_byte_offset,
         )
 
     def permute(self, dims: Sequence[int]) -> Tensor:
         dims = list(dims)
         if sorted(dims) != list(range(len(self.shape))):
             raise RuntimeError(f"incomplete dim list {dims}")
-        return Tensor(self.buffer, self.dtype, [self.shape[i] for i in dims], [self.stride[i] for i in dims])
+        return Tensor(
+            self.buffer,
+            self.dtype,
+            [self.shape[i] for i in dims],
+            [self.stride[i] for i in dims],
+            self._base_ptr_byte_offset,
+        )
 
     def transpose(self, dim1: int, dim2: int) -> Tensor:
         permute_seq = list(range(len(self.shape)))
@@ -159,7 +161,7 @@ class Tensor:
         assert len(self.shape) > dim
         assert self.shape[dim] >= end
         new_shape = [end if i == dim else s for i, s in enumerate(self.shape)]
-        return Tensor(self.buffer, self.dtype, new_shape, self.stride)
+        return Tensor(self.buffer, self.dtype, new_shape, self.stride, self._base_ptr_byte_offset)
 
     def slice_at(self, dim: int, idx: int):
         if dim >= len(self.shape) or idx >= self.shape[dim]:
