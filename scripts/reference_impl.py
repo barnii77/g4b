@@ -685,7 +685,7 @@ class Tokenizer:
 
 
 @torch.inference_mode()
-def load_model() -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, SamplingConfig, Tokenizer]:
+def load_model(model_path: str) -> tuple[Gemma4TextModel, Gemma4Config, TokenizerConfig, SamplingConfig, Tokenizer]:
     meta, tensors = gguf.load(Path(model_path))
     check_meta(meta)
     check_dtypes_supported(tensors)
@@ -851,8 +851,7 @@ if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--gguf", type=str, default="/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf")
     cli_args = arg_parser.parse_args()
-    model_path = cli_args.gguf
-    model, gemma_config, tokenizer_config, sampling_config, tokenizer = load_model()
+    model, gemma_config, tokenizer_config, sampling_config, tokenizer = load_model(cli_args.gguf)
     # TODO figure out how to restrict the api from providing special privileged tokens to the model
     #  (<unused0>, <pad>, <|turn>, ... many more).
     #  I think I actually don't need any sanitization logic... see dump_gguf.py for more
