@@ -1,3 +1,4 @@
+from . import add
 from . import add_kv_to_cache
 from . import embeddings
 from . import fa2
@@ -11,6 +12,7 @@ from . import update_residual_stream
 from . import utils
 
 __all__ = [
+    "add",
     "add_kv_to_cache",
     "embeddings",
     "fa2",
