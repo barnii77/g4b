@@ -38,4 +38,4 @@ def increment(
     modulus: int | float,
 ):
     grid_fn = lambda META: (triton.cdiv(x.shape[0], META["BLOCKSIZE0"]),)
-    launch[_increment_kernel, grid_fn](x=x, increment_by=increment_by, modulus=modulus)
+    return launch[_increment_kernel, grid_fn](x=x, increment_by=increment_by, modulus=modulus)

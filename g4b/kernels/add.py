@@ -104,7 +104,7 @@ def add(
         triton.cdiv(a.shape[1], META["BLOCKSIZE1"]),
         triton.cdiv(a.shape[0], META["BLOCKSIZE0"]),
     )
-    launch[_add_2d_kernel, grid_fn](
+    return launch[_add_2d_kernel, grid_fn](
         a=a,
         b=b,
         b_rsos=b_rsos,

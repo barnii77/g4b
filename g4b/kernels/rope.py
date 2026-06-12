@@ -168,7 +168,7 @@ def apply_rope(q: Tensor, k: Tensor, rope_freqs: Tensor, time_dim_offsets: Tenso
         triton.cdiv(k.shape[2], META["BLOCKSIZE2"]),
         triton.cdiv(k.shape[1], META["BLOCKSIZE1"]) * triton.cdiv(k.shape[0], META["BLOCKSIZE0"]),
     )
-    launch[_apply_rope_kernel, grid_fn](q=q, k=k, rope_freqs=rope_freqs, time_dim_offsets=time_dim_offsets)
+    return launch[_apply_rope_kernel, grid_fn](q=q, k=k, rope_freqs=rope_freqs, time_dim_offsets=time_dim_offsets)
 
 
 # Only used once during model loading
@@ -199,4 +199,4 @@ def _populate_rope_frequencies_kernel(
 def populate_rope_frequencies(out: Tensor, freq_scalars: Tensor | None, freq_base: float):
     assert freq_scalars is None or out.shape[-1] == freq_scalars.shape[-1]
     grid_fn = lambda META: (triton.cdiv(out.shape[0], META["BLOCKSIZE"]),)
-    launch[_populate_rope_frequencies_kernel, grid_fn](out=out, freq_scalars=freq_scalars, freq_base=freq_base)
+    return launch[_populate_rope_frequencies_kernel, grid_fn](out=out, freq_scalars=freq_scalars, freq_base=freq_base)
