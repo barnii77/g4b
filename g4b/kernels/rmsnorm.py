@@ -2,12 +2,100 @@ import triton
 from triton import language as tl
 from typing import Literal
 from g4b.tensor import Tensor, DType
-from g4b.kernels.utils import launch
-
-# TODO take epsilon parameter
+from g4b.kernels.utils import launch, default_bencher
 
 
-# TODO autotune block sizes
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 128}),
+        triton.Config({"BLOCKSIZE0": 16, "BLOCKSIZE1": 128}),
+        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 256}),
+        triton.Config({"BLOCKSIZE0": 8, "BLOCKSIZE1": 256}),
+        triton.Config({"BLOCKSIZE0": 2, "BLOCKSIZE1": 256}),
+        triton.Config({"BLOCKSIZE0": 4, "BLOCKSIZE1": 512}),
+        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 512}),
+        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 1024}),
+        triton.Config({"BLOCKSIZE0": 4, "BLOCKSIZE1": 1024}),
+        triton.Config({"BLOCKSIZE0": 16, "BLOCKSIZE1": 256}),
+        triton.Config({"BLOCKSIZE0": 64, "BLOCKSIZE1": 512}),
+        triton.Config({"BLOCKSIZE0": 32, "BLOCKSIZE1": 1024}),
+    ],
+    key=[
+        "x_shape0",
+        "x_shape1",
+        "x_rsos_shape0",
+        "x_rmsnorm_w_shape0",
+        "x_stride0",
+        "x_stride1",
+        "x_rsos_stride0",
+        "x_rmsnorm_w_stride0",
+    ],
+    do_bench=default_bencher,
+    cache_results=True,
+)
+@triton.jit
+def _finish_rmsnorm_inplace_kernel(
+    x_ptr,
+    x_rsos_ptr,
+    x_rmsnorm_w_ptr,
+    x_shape0: tl.constexpr,
+    x_shape1: tl.constexpr,
+    x_rsos_shape0: tl.constexpr,
+    x_rmsnorm_w_shape0: tl.constexpr,
+    x_stride0: tl.constexpr,
+    x_stride1: tl.constexpr,
+    x_rsos_stride0: tl.constexpr,
+    x_rmsnorm_w_stride0: tl.constexpr,
+    epsilon: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr,
+    BLOCKSIZE1: tl.constexpr,
+):
+    tl.static_assert(x_rsos_shape0 == x_shape0)
+    tl.static_assert(x_rmsnorm_w_shape0 == x_shape1)
+
+    pid_b = tl.program_id(1)
+    pid_d = tl.program_id(0)
+
+    offs_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None]
+    offs_d = pid_d * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :]
+
+    x_ptrs = x_ptr + offs_b * x_stride0 + offs_d * x_stride1
+    x_mask = (offs_b < x_shape0) & (offs_d < x_shape1)
+    x = tl.load(x_ptrs, mask=x_mask)
+    rsos = tl.load(x_rsos_ptr + offs_b * x_rsos_stride0, mask=offs_b < x_rsos_shape0)
+    if x_rmsnorm_w_ptr is not None:
+        w = tl.load(x_rmsnorm_w_ptr + offs_d * x_rmsnorm_w_stride0, mask=offs_d < x_rmsnorm_w_shape0)
+    else:
+        w = tl.full((1, 1), 1, dtype=x.dtype)
+
+    x /= (rsos / x_shape1 + epsilon).sqrt()
+    x *= w
+
+    tl.store(x_ptrs, x, mask=x_mask)
+
+
+def finish_rmsnorm_inplace(x: Tensor, x_rsos: Tensor, x_rmsnorm_w: Tensor, epsilon: float):
+    assert x.shape[:-1] == x_rsos.shape
+    assert x.shape[-1:] == x_rmsnorm_w.shape
+
+    x = x.reshape((-1, x.shape[-1]))
+    x_rsos = x_rsos.reshape((-1,))
+    x_rmsnorm_w = x_rmsnorm_w.reshape((-1,))
+
+    grid_fn = lambda META: (
+        triton.cdiv(x.shape[1], META["BLOCKSIZE1"]),
+        triton.cdiv(x.shape[0], META["BLOCKSIZE0"]),
+    )
+    return launch[_finish_rmsnorm_inplace_kernel, grid_fn](
+        x=x,
+        x_rsos=x_rsos,
+        x_rmsnorm_w=x_rmsnorm_w,
+        epsilon=epsilon,
+    )
+
+
+# to do take epsilon parameter
+# to do autotune block sizes
 @triton.jit
 def _rmsnorm_x_4d_to_y_kernel(
     y_ptr,
@@ -97,5 +185,5 @@ def rmsnorm_x_4d_write_to_y(y: Tensor, x: Tensor, accum_dtype: DType | None = No
     return _rmsnorm_x_4d_to_y(y, x, accum_dtype, output_action="write")
 
 
-# TODO inplace rmsnorm
-# TODO maybe fuse weight elementwise mul into it optionally?
+# to do inplace rmsnorm
+# to do maybe fuse weight elementwise mul into it optionally?
