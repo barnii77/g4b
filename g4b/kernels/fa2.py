@@ -12,3 +12,7 @@
 #  following a long-tailed distribution.
 # TODO I need a temporary KV buffer for when the SWA window size is < chunked prefill size, from which I then memcpy to
 #  the actual KV cache (which is only 512 tokens long for SWA layers)
+# TODO since this kernel is probably the one which deals with the largest indices, I'll have to consider doing some
+#  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
+#  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
+#  cache is pretty common after all.

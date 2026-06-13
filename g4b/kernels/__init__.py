@@ -12,6 +12,9 @@ from . import sample_logits
 from . import update_residual_stream
 from . import utils
 
+# TODO a lot of the kernels in this module do int32-based indexing and may break for large input tensors.
+#  an ideal implementation would therefore check on the host if overflow would happen and pass a constexpr.
+
 __all__ = [
     "add",
     "add_kv_to_cache",
