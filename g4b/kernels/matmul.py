@@ -130,6 +130,7 @@ def _matmul_3d_autotune_configs():
         "storer_extra_shape0", "storer_extra_shape1", "storer_extra_shape2",
         "storer_extra_stride0", "storer_extra_stride1", "storer_extra_stride2",
         "rmsnorm_eps",
+        "TRANSPOSE_B_BEFORE_MMA",
         # codegen-affecting constexpr callables
         # "a_loader_fn", "b_loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
         # hack so autotune results are cacheable to disk
@@ -160,6 +161,7 @@ def _matmul_a3d_b2d_kernel(
     A_DTYPE: tl.constexpr, B_DTYPE: tl.constexpr, B2_DTYPE: tl.constexpr | None, C_DTYPE: tl.constexpr,  # e.g. q4_k
     ACCUM_DTYPE: tl.constexpr,
     KEEP_C: tl.constexpr,  # if true, init c = c_desc.load(...)
+    TRANSPOSE_B_BEFORE_MMA: tl.constexpr,
     # make caching to disk work (hacky)
     _a_loader_fn_key: tl.constexpr, _b_loader_fn_key: tl.constexpr, _storer_fn_key: tl.constexpr,
     _c_c2_merge_tiles_fn_key: tl.constexpr,
@@ -182,7 +184,14 @@ def _matmul_a3d_b2d_kernel(
     input_rmsnorm_sum_of_squares: None = None,
     # fmt: on
 ):
-    tl.static_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
+    if TRANSPOSE_B_BEFORE_MMA:
+        tl.static_assert(
+            a_shape2 == b_shape1 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape0 == c_shape2
+        )
+    else:
+        tl.static_assert(
+            a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2
+        )
     tl.static_assert(a_shape2 % NUM_K_SPLITS == 0)
 
     if b2_ptr is not None:
@@ -191,7 +200,7 @@ def _matmul_a3d_b2d_kernel(
 
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
     num_tile_rows = tl.cdiv(a_shape1, A_BLOCKSIZE1)
-    num_tile_cols = tl.cdiv(b_shape1, B_BLOCKSIZE1)
+    num_tile_cols = tl.cdiv(c_shape2, B_BLOCKSIZE1)
     pid = tl.program_id(0)
     tile_b = tl.program_id(1)
     tile_k_split = tl.program_id(2)
@@ -214,23 +223,38 @@ def _matmul_a3d_b2d_kernel(
         (a_stride0, a_stride1, a_stride2),
         (A_BLOCKSIZE0, A_BLOCKSIZE1, A_BLOCKSIZE2),
     )
-    b_desc = tl.make_tensor_descriptor(
-        b_ptr,
-        (1, b_shape0, b_shape1),
-        (0, b_stride0, b_stride1),
-        (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
-    )
-    has_b2: tl.constexpr = b2_ptr is not None
-    b2_desc = (
-        tl.make_tensor_descriptor(
-            b2_ptr,
+    if TRANSPOSE_B_BEFORE_MMA:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
             (1, b_shape0, b_shape1),
-            (0, b2_stride0, b2_stride1),
+            (0, b_stride0, b_stride1),
+            (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
+        )
+    else:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            (1, b_shape0, b_shape1),
+            (0, b_stride0, b_stride1),
             (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
         )
-        if has_b2
-        else None
-    )
+    has_b2: tl.constexpr = b2_ptr is not None
+    if has_b2:
+        if TRANSPOSE_B_BEFORE_MMA:
+            b2_desc = tl.make_tensor_descriptor(
+                b2_ptr,
+                (1, b_shape0, b_shape1),
+                (0, b2_stride0, b2_stride1),
+                (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
+            )
+        else:
+            b2_desc = tl.make_tensor_descriptor(
+                b2_ptr,
+                (1, b_shape0, b_shape1),
+                (0, b2_stride0, b2_stride1),
+                (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
+            )
+    else:
+        b2_desc = None
     c_desc = tl.make_tensor_descriptor(
         c_ptr,
         (c_shape0, c_shape1, c_shape2),
@@ -257,13 +281,22 @@ def _matmul_a3d_b2d_kernel(
             A_BLOCKSIZE0, A_BLOCKSIZE1, A_BLOCKSIZE2,
             A_DTYPE,
         ).reshape((BLOCK_M, BLOCK_K))
-        b = b_loader_fn(
-            "b", b_desc, 0, off_k, off_col, b_ptr,
-            1, b_shape0, b_shape1,
-            0, b_stride0, b_stride1,
-            1, A_BLOCKSIZE2, B_BLOCKSIZE1,
-            B_DTYPE,
-        ).reshape((BLOCK_K, BLOCK_N))
+        if TRANSPOSE_B_BEFORE_MMA:
+            b = b_loader_fn(
+                "b", b_desc, 0, off_col, off_k, b_ptr,
+                1, b_shape0, b_shape1,
+                0, b_stride0, b_stride1,
+                1, B_BLOCKSIZE1, A_BLOCKSIZE2,
+                B_DTYPE,
+            ).reshape((BLOCK_N, BLOCK_K)).T
+        else:
+            b = b_loader_fn(
+                "b", b_desc, 0, off_k, off_col, b_ptr,
+                1, b_shape0, b_shape1,
+                0, b_stride0, b_stride1,
+                1, A_BLOCKSIZE2, B_BLOCKSIZE1,
+                B_DTYPE,
+            ).reshape((BLOCK_K, BLOCK_N))
         # fmt: on
 
         # Handle upcasting.
@@ -286,13 +319,22 @@ def _matmul_a3d_b2d_kernel(
         if has_b2:
             # TODO maybe t.join'ing the b and b2 tiles and doing one tl.dot call then splitting again is faster? try!
             # fmt: off
-            b2_tile = b_loader_fn(
-                "b2", b2_desc, 0, off_k, off_col, b2_ptr,
-                1, b_shape0, b_shape1,
-                0, b2_stride0, b2_stride1,
-                1, A_BLOCKSIZE2, B_BLOCKSIZE1,
-                B2_DTYPE,
-            ).reshape(b.shape).to(UPCAST_TY)
+            if TRANSPOSE_B_BEFORE_MMA:
+                b2_tile = b_loader_fn(
+                    "b2", b2_desc, 0, off_col, off_k, b2_ptr,
+                    1, b_shape0, b_shape1,
+                    0, b2_stride0, b2_stride1,
+                    1, B_BLOCKSIZE1, A_BLOCKSIZE2,
+                    B2_DTYPE,
+                ).reshape((BLOCK_N, BLOCK_K)).T.to(UPCAST_TY)
+            else:
+                b2_tile = b_loader_fn(
+                    "b2", b2_desc, 0, off_k, off_col, b2_ptr,
+                    1, b_shape0, b_shape1,
+                    0, b2_stride0, b2_stride1,
+                    1, A_BLOCKSIZE2, B_BLOCKSIZE1,
+                    B2_DTYPE,
+                ).reshape((BLOCK_K, BLOCK_N)).to(UPCAST_TY)
             # fmt: on
             c2 = tl.dot(a_upcast, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
 
@@ -677,6 +719,7 @@ def matmul_a3d_b2d(
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     accum_dtype: DType | None = None,
     keep_c: bool = False,
+    transpose_b_before_mma: bool = False,
     *,
     input_rmsnorm_sum_of_squares: Tensor | None = None,
     rmsnorm_eps: float,
@@ -722,6 +765,7 @@ def matmul_a3d_b2d(
         C_DTYPE=_dtype_name(c.dtype),
         ACCUM_DTYPE=accum_dtype,
         KEEP_C=keep_c,
+        TRANSPOSE_B_BEFORE_MMA=transpose_b_before_mma,
         rmsnorm_eps=float(rmsnorm_eps),
         _a_loader_fn_key=jfn_cache_key(a_loader_fn),
         _b_loader_fn_key=jfn_cache_key(b_loader_fn),
