@@ -56,6 +56,7 @@ def _cfg(
         "act_buf_shape0", "act_buf_shape1", "act_buf_shape2",
         "act_rsos_shape0", "act_rsos_shape1",
         "out_rsos_shape0", "out_rsos_shape1",
+        "layer_output_scale_shape0",
         "current_rmsnorm_w_shape0",
         "next_layer_input_rmsnorm_w_shape0",
         "residual_stride0", "residual_stride1", "residual_stride2",
@@ -88,6 +89,9 @@ def _update_residual_stream_kernel(
     next_layer_input_rmsnorm_w_stride0: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     eps: tl.constexpr,
+    layer_output_scale_ptr=None,
+    layer_output_scale_shape0: tl.constexpr = 0,
+    layer_output_scale: None = None,
     # fmt: on
 ):
     tl.static_assert(residual_shape0 == act_buf_shape0)
@@ -97,6 +101,7 @@ def _update_residual_stream_kernel(
     tl.static_assert(residual_shape2 == act_buf_shape2)
     tl.static_assert(residual_shape2 == current_rmsnorm_w_shape0)
     tl.static_assert(current_rmsnorm_w_shape0 == next_layer_input_rmsnorm_w_shape0)
+    tl.static_assert(layer_output_scale_shape0 == 0 or layer_output_scale_shape0 == 1)
     tl.static_assert(out_rsos_shape0 == act_rsos_shape0)
     tl.static_assert(out_rsos_shape1 == act_rsos_shape1)
 
@@ -134,6 +139,9 @@ def _update_residual_stream_kernel(
     inv_rms = tl.rsqrt(act_rsos / residual_shape2 + eps)
 
     residual += act_buf * inv_rms * current_rmsnorm_w
+    if layer_output_scale_ptr is not None:
+        layer_output_scale = tl.load(layer_output_scale_ptr)
+        residual *= layer_output_scale
 
     tl.store(
         residual_ptr + residual_off,
@@ -161,6 +169,7 @@ def update_residual_stream(
     current_rmsnorm_w: Tensor,
     next_layer_input_rmsnorm_w: Tensor,
     eps: float,
+    layer_output_scale: Tensor | None = None,
 ):
     grid_fn = lambda META: (
         triton.cdiv(residual.shape[2], META["BLOCKSIZE2"]),
@@ -173,6 +182,7 @@ def update_residual_stream(
         act_buf=act_buf,
         act_rsos=act_rsos,
         out_rsos=out_rsos,
+        layer_output_scale=layer_output_scale,
         current_rmsnorm_w=current_rmsnorm_w,
         next_layer_input_rmsnorm_w=next_layer_input_rmsnorm_w,
         eps=float(eps),

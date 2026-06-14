@@ -7,7 +7,8 @@ from g4b.tensor import Tensor, float32, bfloat16, int8, int32
 from g4b.config import Config
 from g4b.lifecycle import record_static_cuda_graph
 from g4b.utils import gguf_tensors_by_name
-from g4b import kernels
+from g4b import kernels, device
+from g4b.kernels.memset import memset_contiguous
 
 # TODO I can fuse the sum-of-squares computation of a decoder block's output rmsnorm into the last matmul (with
 #  atomic_add). Then, I make a specialized reduction kernel instead of the next layer's input rmsnorm which
@@ -84,7 +85,7 @@ class Attention:
     input_rmsnorm_w_D_fp32: Tensor
     rope_freqs_k_fp32: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
     context_window_size: int  # small for SWA
-    owns_kv_cache: bool  # model's late layers share KV cache with earlier ones. If true, must not write to KV cache.
+    owns_kv_cache: bool  # model's late layers share KV cache with earlier ones. If false, must not write to KV cache.
     head_count_q: int
     head_count_kv: int
     head_size_qk: int
@@ -135,7 +136,7 @@ class DecoderLayer:
     attn: Attention
     mlp: MLP
     ple: PerLayerEmbeddings
-    layer_output_scale: float
+    layer_output_scale_1_fp32: Tensor
 
 
 @dataclass(frozen=True)
@@ -270,6 +271,7 @@ class Gemma4E(Model):
         # create global state tensors
         residual = Tensor.alloc_empty(DTR, [B, t, D])
         time_dim_offsets = Tensor.alloc_empty(int32, [B])
+        memset_contiguous(time_dim_offsets, 0)
         rmsnorm_epsilon = meta["gemma4.attention.layer_norm_rms_epsilon"]
         assert isinstance(rmsnorm_epsilon, float)
 
@@ -322,7 +324,7 @@ class Gemma4E(Model):
             )
             assert isinstance(context_window_size, int)
 
-            owns_kv_cache = L - i >= meta["gemma4.attention.shared_kv_layers"]
+            owns_kv_cache = L - i > meta["gemma4.attention.shared_kv_layers"]
             if owns_kv_cache:
                 if is_swa:
                     k_cache = Tensor.alloc_empty(DTKV, [B, g, W, k_swa])
@@ -421,10 +423,10 @@ class Gemma4E(Model):
 
             # construct layer
             layer_output_scale = by_name("layer_output_scale")
-            layer = DecoderLayer(attn=attn, mlp=mlp, ple=ple, layer_output_scale=layer_output_scale)
+            layer = DecoderLayer(attn=attn, mlp=mlp, ple=ple, layer_output_scale_1_fp32=layer_output_scale)
             layers.append(layer)
 
-        return Gemma4E(
+        model = Gemma4E(
             embeddings=embeddings,
             layers=layers,
             lm_head=lm_head,
@@ -433,6 +435,8 @@ class Gemma4E(Model):
             residual_BtD_dtr=residual,
             time_dim_offsets_B_int32=time_dim_offsets,
         )
+        device.sync_all_streams()
+        return model
 
 
 def _compute_rope_freqs(rope_freqs: GGUFTensor | None, freq_base: float, rope_dim_count: int) -> Tensor:
