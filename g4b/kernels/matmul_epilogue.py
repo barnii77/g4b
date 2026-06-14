@@ -43,15 +43,15 @@ def apply_input_rsos_in_epilogue_mixin_jfn(
 @triton.jit
 def gelu_tile_times_extra_mixin_jfn(
     # fmt: off
-    tile, c_extra_2_ptr, off0, off1, off2,
-    c_extra_2_shape0: tl.constexpr, c_extra_2_shape1: tl.constexpr, c_extra_2_shape2: tl.constexpr,
-    c_extra_2_stride0: tl.constexpr, c_extra_2_stride1: tl.constexpr, c_extra_2_stride2: tl.constexpr,
+    tile, extra_ptr, off0, off1, off2,
+    extra_shape0: tl.constexpr, extra_shape1: tl.constexpr, extra_shape2: tl.constexpr,
+    extra_stride0: tl.constexpr, extra_stride1: tl.constexpr, extra_stride2: tl.constexpr,
     # fmt: on
 ):
     extra_desc = tl.make_tensor_descriptor(
-        c_extra_2_ptr,
-        (c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2),
-        (c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2),
+        extra_ptr,
+        (extra_shape0, extra_shape1, extra_shape2),
+        (extra_stride0, extra_stride1, extra_stride2),
         tile.shape,
     )
     return gelu_jfn(tile) * extra_desc.load((off0, off1, off2))
@@ -66,9 +66,6 @@ def geglu_fusion_matmul_merge_tiles_mixin_jfn(
     input_rsos_shape0: tl.constexpr, input_rsos_shape1: tl.constexpr,
     input_rsos_stride0: tl.constexpr, input_rsos_stride1: tl.constexpr,
     rmsnorm_dim: tl.constexpr, rmsnorm_eps: tl.constexpr,
-    c_extra_2_ptr,
-    c_extra_2_shape0: tl.constexpr, c_extra_2_shape1: tl.constexpr, c_extra_2_shape2: tl.constexpr,
-    c_extra_2_stride0: tl.constexpr, c_extra_2_stride1: tl.constexpr, c_extra_2_stride2: tl.constexpr,
     # fmt: on
 ):
     # fmt: off
@@ -94,9 +91,8 @@ def ple_gate_storer_jfn(
     input_rsos_shape0: tl.constexpr, input_rsos_shape1: tl.constexpr,
     input_rsos_stride0: tl.constexpr, input_rsos_stride1: tl.constexpr,
     rmsnorm_dim: tl.constexpr, rmsnorm_eps: tl.constexpr,
-    c_extra_2_ptr,
-    c_extra_2_shape0: tl.constexpr, c_extra_2_shape1: tl.constexpr, c_extra_2_shape2: tl.constexpr,
-    c_extra_2_stride0: tl.constexpr, c_extra_2_stride1: tl.constexpr, c_extra_2_stride2: tl.constexpr,
+    extra_shape0: tl.constexpr, extra_shape1: tl.constexpr, extra_shape2: tl.constexpr,
+    extra_stride0: tl.constexpr, extra_stride1: tl.constexpr, extra_stride2: tl.constexpr,
     # fmt: on
 ):
     # fmt: off
@@ -108,9 +104,9 @@ def ple_gate_storer_jfn(
         rmsnorm_dim, rmsnorm_eps,
     )
     tile = gelu_tile_times_extra_mixin_jfn(
-        tile, c_extra_2_ptr, off0, off1, off2,
-        c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2,
-        c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2,
+        tile, extra_ptr, off0, off1, off2,
+        extra_shape0, extra_shape1, extra_shape2,
+        extra_stride0, extra_stride1, extra_stride2,
     )
     matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
         name, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
@@ -121,8 +117,7 @@ def ple_gate_storer_jfn(
         input_rsos_shape0, input_rsos_shape1,
         input_rsos_stride0, input_rsos_stride1,
         rmsnorm_dim, rmsnorm_eps,
-        c_extra_2_ptr,
-        c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2,
-        c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2,
+        extra_shape0, extra_shape1, extra_shape2,
+        extra_stride0, extra_stride1, extra_stride2,
     )
     # fmt: on

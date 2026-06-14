@@ -122,8 +122,8 @@ def _matmul_3d_autotune_configs():
         # optional epilogue inputs
         "input_rmsnorm_sum_of_squares_shape0", "input_rmsnorm_sum_of_squares_shape1",
         "input_rmsnorm_sum_of_squares_stride0", "input_rmsnorm_sum_of_squares_stride1",
-        "c_extra_2_shape0", "c_extra_2_shape1", "c_extra_2_shape2",
-        "c_extra_2_stride0", "c_extra_2_stride1", "c_extra_2_stride2",
+        "storer_extra_shape0", "storer_extra_shape1", "storer_extra_shape2",
+        "storer_extra_stride0", "storer_extra_stride1", "storer_extra_stride2",
         "rmsnorm_eps",
         # codegen-affecting constexpr callables
         # "a_loader_fn", "b_loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
@@ -159,19 +159,21 @@ def _matmul_a3d_b2d_kernel(
     _a_loader_fn_key: tl.constexpr, _b_loader_fn_key: tl.constexpr, _storer_fn_key: tl.constexpr,
     _c_c2_merge_tiles_fn_key: tl.constexpr,
     _ACCUM_DTYPE_CACHE_KEY: tl.constexpr,
-    # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr and c_extra_2_ptr are used by epilogues.
-    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None, c_extra_2_ptr = None,
+    # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr is used by custom storers.
+    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
     input_rmsnorm_sum_of_squares_ptr = None,
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
     b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
     input_rmsnorm_sum_of_squares_shape0: tl.constexpr = 0, input_rmsnorm_sum_of_squares_shape1: tl.constexpr = 0,
     input_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, input_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
-    c_extra_2_shape0: tl.constexpr = 0, c_extra_2_shape1: tl.constexpr = 0, c_extra_2_shape2: tl.constexpr = 0,
-    c_extra_2_stride0: tl.constexpr = 0, c_extra_2_stride1: tl.constexpr = 0, c_extra_2_stride2: tl.constexpr = 0,
+    storer_extra_shape0: tl.constexpr = 0, storer_extra_shape1: tl.constexpr = 0,
+    storer_extra_shape2: tl.constexpr = 0,
+    storer_extra_stride0: tl.constexpr = 0, storer_extra_stride1: tl.constexpr = 0,
+    storer_extra_stride2: tl.constexpr = 0,
     rmsnorm_eps: tl.constexpr = 0.0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
-    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None, c_extra_2: None = None,
+    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None,
     input_rmsnorm_sum_of_squares: None = None,
     # fmt: on
 ):
@@ -298,9 +300,6 @@ def _matmul_a3d_b2d_kernel(
             input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
             input_rmsnorm_sum_of_squares_stride0, input_rmsnorm_sum_of_squares_stride1,
             a_shape2, rmsnorm_eps,
-            c_extra_2_ptr,
-            c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2,
-            c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2,
         )
         # fmt: on
 
@@ -315,9 +314,8 @@ def _matmul_a3d_b2d_kernel(
         input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
         input_rmsnorm_sum_of_squares_stride0, input_rmsnorm_sum_of_squares_stride1,
         a_shape2, rmsnorm_eps,
-        c_extra_2_ptr,
-        c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2,
-        c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2,
+        storer_extra_shape0, storer_extra_shape1, storer_extra_shape2,
+        storer_extra_stride0, storer_extra_stride1, storer_extra_stride2,
     )
     # fmt: on
 
@@ -641,9 +639,8 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     input_rsos_shape0: tl.constexpr = 0, input_rsos_shape1: tl.constexpr = 0,
     input_rsos_stride0: tl.constexpr = 0, input_rsos_stride1: tl.constexpr = 0,
     rmsnorm_dim: tl.constexpr = 0, rmsnorm_eps: tl.constexpr = 0.0,
-    c_extra_2_ptr=None,
-    c_extra_2_shape0: tl.constexpr = 0, c_extra_2_shape1: tl.constexpr = 0, c_extra_2_shape2: tl.constexpr = 0,
-    c_extra_2_stride0: tl.constexpr = 0, c_extra_2_stride1: tl.constexpr = 0, c_extra_2_stride2: tl.constexpr = 0,
+    extra_shape0: tl.constexpr = 0, extra_shape1: tl.constexpr = 0, extra_shape2: tl.constexpr = 0,
+    extra_stride0: tl.constexpr = 0, extra_stride1: tl.constexpr = 0, extra_stride2: tl.constexpr = 0,
     # fmt: on
 ):
     if rsos_ptr is not None and NUM_K_SPLITS == 1:
@@ -669,7 +666,6 @@ def matmul_a3d_b2d(
     b: Tensor,
     b2: Tensor | None = None,
     storer_extra: Tensor | None = None,
-    c_extra_2: Tensor | None = None,
     a_loader_fn: tl.constexpr = matmul_a3d_b2d_a_loader_jfn,
     b_loader_fn: tl.constexpr = matmul_a3d_b2d_b_loader_jfn,
     storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
@@ -710,7 +706,6 @@ def matmul_a3d_b2d(
         b=b,
         b2=b2,
         storer_extra=storer_extra,
-        c_extra_2=c_extra_2,
         input_rmsnorm_sum_of_squares=input_rmsnorm_sum_of_squares,
         a_loader_fn=a_loader_fn,
         b_loader_fn=b_loader_fn,
