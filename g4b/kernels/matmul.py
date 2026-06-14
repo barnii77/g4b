@@ -119,6 +119,12 @@ def _matmul_3d_autotune_configs():
         "c_rmsnorm_sum_of_squares_stride0", "c_rmsnorm_sum_of_squares_stride1",
         # optional second B matrix for SwiGLU / GeGLU-style fusion
         "b2_stride0", "b2_stride1",
+        # optional epilogue inputs
+        "input_rmsnorm_sum_of_squares_shape0", "input_rmsnorm_sum_of_squares_shape1",
+        "input_rmsnorm_sum_of_squares_stride0", "input_rmsnorm_sum_of_squares_stride1",
+        "c_extra_2_shape0", "c_extra_2_shape1", "c_extra_2_shape2",
+        "c_extra_2_stride0", "c_extra_2_stride1", "c_extra_2_stride2",
+        "rmsnorm_eps",
         # codegen-affecting constexpr callables
         # "a_loader_fn", "b_loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
         # hack so autotune results are cacheable to disk
@@ -153,13 +159,20 @@ def _matmul_a3d_b2d_kernel(
     _a_loader_fn_key: tl.constexpr, _b_loader_fn_key: tl.constexpr, _storer_fn_key: tl.constexpr,
     _c_c2_merge_tiles_fn_key: tl.constexpr,
     _ACCUM_DTYPE_CACHE_KEY: tl.constexpr,
-    # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr is used for the PLE layers.
-    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
+    # the b2_ptr mechanism can be used for GeGLU fusion. storer_extra_ptr and c_extra_2_ptr are used by epilogues.
+    c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None, c_extra_2_ptr = None,
+    input_rmsnorm_sum_of_squares_ptr = None,
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
     b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
+    input_rmsnorm_sum_of_squares_shape0: tl.constexpr = 0, input_rmsnorm_sum_of_squares_shape1: tl.constexpr = 0,
+    input_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, input_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
+    c_extra_2_shape0: tl.constexpr = 0, c_extra_2_shape1: tl.constexpr = 0, c_extra_2_shape2: tl.constexpr = 0,
+    c_extra_2_stride0: tl.constexpr = 0, c_extra_2_stride1: tl.constexpr = 0, c_extra_2_stride2: tl.constexpr = 0,
+    rmsnorm_eps: tl.constexpr = 0.0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
-    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None,
+    b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None, c_extra_2: None = None,
+    input_rmsnorm_sum_of_squares: None = None,
     # fmt: on
 ):
     tl.static_assert(a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2)
@@ -229,42 +242,22 @@ def _matmul_a3d_b2d_kernel(
         BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
         BLOCK_K: tl.constexpr = A_BLOCKSIZE2
         BLOCK_N: tl.constexpr = B_BLOCKSIZE1
+        # fmt: off
         a = a_loader_fn(
-            "a",
-            a_desc,
-            off_b,
-            off_row,
-            off_k,
-            a_ptr,
-            a_shape0,
-            a_shape1,
-            a_shape2,
-            a_stride0,
-            a_stride1,
-            a_stride2,
-            A_BLOCKSIZE0,
-            A_BLOCKSIZE1,
-            A_BLOCKSIZE2,
+            "a", a_desc, off_b, off_row, off_k, a_ptr,
+            a_shape0, a_shape1, a_shape2,
+            a_stride0, a_stride1, a_stride2,
+            A_BLOCKSIZE0, A_BLOCKSIZE1, A_BLOCKSIZE2,
             A_DTYPE,
         ).reshape((BLOCK_M, BLOCK_K))
         b = b_loader_fn(
-            "b",
-            b_desc,
-            0,
-            off_k,
-            off_col,
-            b_ptr,
-            1,
-            b_shape0,
-            b_shape1,
-            0,
-            b_stride0,
-            b_stride1,
-            1,
-            A_BLOCKSIZE2,
-            B_BLOCKSIZE1,
+            "b", b_desc, 0, off_k, off_col, b_ptr,
+            1, b_shape0, b_shape1,
+            0, b_stride0, b_stride1,
+            1, A_BLOCKSIZE2, B_BLOCKSIZE1,
             B_DTYPE,
         ).reshape((BLOCK_K, BLOCK_N))
+        # fmt: on
 
         # Handle upcasting.
         tl.static_assert(a.dtype == tl.float32 or a.dtype == tl.float16 or a.dtype == tl.bfloat16)
@@ -285,87 +278,72 @@ def _matmul_a3d_b2d_kernel(
         )
         if has_b2:
             # TODO maybe t.join'ing the b and b2 tiles and doing one tl.dot call then splitting again is faster? try!
+            # fmt: off
             b2_tile = b_loader_fn(
-                "b2",
-                b2_desc,
-                0,
-                off_k,
-                off_col,
-                b2_ptr,
-                1,
-                b_shape0,
-                b_shape1,
-                0,
-                b_stride0,
-                b_stride1,
-                1,
-                A_BLOCKSIZE2,
-                B_BLOCKSIZE1,
+                "b2", b2_desc, 0, off_k, off_col, b2_ptr,
+                1, b_shape0, b_shape1,
+                0, b2_stride0, b2_stride1,
+                1, A_BLOCKSIZE2, B_BLOCKSIZE1,
                 B2_DTYPE,
             ).reshape(b.shape).to(UPCAST_TY)
+            # fmt: on
             c2 = tl.dot(a_upcast, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
 
     if has_b2:
-        c = c_c2_merge_tiles_fn(c, c2, off_b, off_row, off_col, NUM_K_SPLITS, C_DTYPE)
+        # fmt: off
+        c = c_c2_merge_tiles_fn(
+            c, c2, off_b, off_row, off_col,
+            NUM_K_SPLITS, C_DTYPE,
+            input_rmsnorm_sum_of_squares_ptr,
+            input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
+            input_rmsnorm_sum_of_squares_stride0, input_rmsnorm_sum_of_squares_stride1,
+            a_shape2, rmsnorm_eps,
+            c_extra_2_ptr,
+            c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2,
+            c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2,
+        )
+        # fmt: on
 
+    # fmt: off
     storer_fn(
-        "c",
-        c_desc,
-        c,
-        off_b,
-        off_row,
-        off_col,
-        c_rmsnorm_sum_of_squares_ptr,
-        storer_extra_ptr,
-        c_shape0,
-        c_shape1,
-        c_rmsnorm_sum_of_squares_stride0,
-        c_rmsnorm_sum_of_squares_stride1,
-        NUM_K_SPLITS,
-        C_DTYPE,
+        "c", c_desc, c, off_b, off_row, off_col,
+        c_rmsnorm_sum_of_squares_ptr, storer_extra_ptr,
+        c_shape0, c_shape1,
+        c_rmsnorm_sum_of_squares_stride0, c_rmsnorm_sum_of_squares_stride1,
+        NUM_K_SPLITS, C_DTYPE,
+        input_rmsnorm_sum_of_squares_ptr,
+        input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
+        input_rmsnorm_sum_of_squares_stride0, input_rmsnorm_sum_of_squares_stride1,
+        a_shape2, rmsnorm_eps,
+        c_extra_2_ptr,
+        c_extra_2_shape0, c_extra_2_shape1, c_extra_2_shape2,
+        c_extra_2_stride0, c_extra_2_stride1, c_extra_2_stride2,
     )
+    # fmt: on
 
 
 @triton.jit
 def matmul_a3d_b2d_a_loader_jfn(
-    name: tl.constexpr,
-    desc,
-    off0,
-    off1,
-    off2,
-    ptr,
-    shape0: tl.constexpr,
-    shape1: tl.constexpr,
-    shape2: tl.constexpr,
-    stride0: tl.constexpr,
-    stride1: tl.constexpr,
-    stride2: tl.constexpr,
-    BLOCKSIZE0: tl.constexpr,
-    BLOCKSIZE1: tl.constexpr,
-    BLOCKSIZE2: tl.constexpr,
+    # fmt: off
+    name: tl.constexpr, desc, off0, off1, off2, ptr,
+    shape0: tl.constexpr, shape1: tl.constexpr, shape2: tl.constexpr,
+    stride0: tl.constexpr, stride1: tl.constexpr, stride2: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     conceptual_dtype: tl.constexpr,
+    # fmt: on
 ):
     return desc.load((off0, off1, off2))
 
 
 @triton.jit
 def matmul_a3d_b2d_b_loader_jfn(
-    name: tl.constexpr,
-    desc,
-    off0,
-    off1,
-    off2,
-    ptr,
-    shape0: tl.constexpr,
-    shape1: tl.constexpr,
-    shape2: tl.constexpr,
-    stride0: tl.constexpr,
-    stride1: tl.constexpr,
-    stride2: tl.constexpr,
-    BLOCKSIZE0: tl.constexpr,
-    BLOCKSIZE1: tl.constexpr,
-    BLOCKSIZE2: tl.constexpr,
+    # fmt: off
+    name: tl.constexpr, desc, off0, off1, off2, ptr,
+    shape0: tl.constexpr, shape1: tl.constexpr, shape2: tl.constexpr,
+    stride0: tl.constexpr, stride1: tl.constexpr, stride2: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     conceptual_dtype: tl.constexpr,
+    # fmt: on
 ):
     is_quantized: tl.constexpr = (
         conceptual_dtype == tensor.q4_k.name
@@ -654,20 +632,19 @@ def matmul_a3d_b2d_b_loader_jfn(
 
 @triton.jit
 def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
-    name: tl.constexpr,
-    desc,
-    tile,
-    off0,
-    off1,
-    off2,
-    rsos_ptr,
-    extra_ptr,
-    rsos_shape0: tl.constexpr,
-    rsos_shape1: tl.constexpr,
-    rsos_stride0: tl.constexpr,
-    rsos_stride1: tl.constexpr,
-    NUM_K_SPLITS: tl.constexpr,
-    C_DTYPE: tl.constexpr,  # e.g. "q4_k", ignored here for convenience (no case where it differs from desc.dtype)
+    # fmt: off
+    name: tl.constexpr, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
+    rsos_shape0: tl.constexpr, rsos_shape1: tl.constexpr,
+    rsos_stride0: tl.constexpr, rsos_stride1: tl.constexpr,
+    NUM_K_SPLITS: tl.constexpr, C_DTYPE: tl.constexpr,  # e.g. "q4_k", ignored here for convenience
+    input_rsos_ptr=None,
+    input_rsos_shape0: tl.constexpr = 0, input_rsos_shape1: tl.constexpr = 0,
+    input_rsos_stride0: tl.constexpr = 0, input_rsos_stride1: tl.constexpr = 0,
+    rmsnorm_dim: tl.constexpr = 0, rmsnorm_eps: tl.constexpr = 0.0,
+    c_extra_2_ptr=None,
+    c_extra_2_shape0: tl.constexpr = 0, c_extra_2_shape1: tl.constexpr = 0, c_extra_2_shape2: tl.constexpr = 0,
+    c_extra_2_stride0: tl.constexpr = 0, c_extra_2_stride1: tl.constexpr = 0, c_extra_2_stride2: tl.constexpr = 0,
+    # fmt: on
 ):
     if rsos_ptr is not None and NUM_K_SPLITS == 1:
         rsos = (tile * tile).sum(-1)
@@ -692,12 +669,16 @@ def matmul_a3d_b2d(
     b: Tensor,
     b2: Tensor | None = None,
     storer_extra: Tensor | None = None,
+    c_extra_2: Tensor | None = None,
     a_loader_fn: tl.constexpr = matmul_a3d_b2d_a_loader_jfn,
     b_loader_fn: tl.constexpr = matmul_a3d_b2d_b_loader_jfn,
     storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     accum_dtype: DType | None = None,
     keep_c: bool = False,
+    *,
+    input_rmsnorm_sum_of_squares: Tensor | None = None,
+    rmsnorm_eps: float,
 ):
     assert (b2 is None) == (c_c2_merge_tiles_fn is None)
 
@@ -729,6 +710,8 @@ def matmul_a3d_b2d(
         b=b,
         b2=b2,
         storer_extra=storer_extra,
+        c_extra_2=c_extra_2,
+        input_rmsnorm_sum_of_squares=input_rmsnorm_sum_of_squares,
         a_loader_fn=a_loader_fn,
         b_loader_fn=b_loader_fn,
         storer_fn=storer_fn,
@@ -739,6 +722,7 @@ def matmul_a3d_b2d(
         C_DTYPE=_dtype_name(c.dtype),
         ACCUM_DTYPE=accum_dtype,
         KEEP_C=keep_c,
+        rmsnorm_eps=float(rmsnorm_eps),
         _a_loader_fn_key=jfn_cache_key(a_loader_fn),
         _b_loader_fn_key=jfn_cache_key(b_loader_fn),
         _storer_fn_key=jfn_cache_key(storer_fn),

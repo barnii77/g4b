@@ -2,9 +2,9 @@ from . import add_kv_to_cache
 from . import elementwise_ops
 from . import embeddings
 from . import fa2
-from . import geglu
 from . import increment
 from . import matmul
+from . import matmul_epilogue
 from . import memset
 from . import rmsnorm
 from . import rsos
@@ -21,9 +21,9 @@ __all__ = [
     "elementwise_ops",
     "embeddings",
     "fa2",
-    "geglu",
     "increment",
     "matmul",
+    "matmul_epilogue",
     "memset",
     "rmsnorm",
     "rsos",

@@ -1,15 +1,8 @@
 import triton
 from triton import language as tl
-from functools import cache
 from g4b.tensor import Tensor
 from g4b.kernels.utils import launch, default_bencher
-from g4b.kernels.matmul import matmul_a3d_b2d_partial_rmsnorm_storer_jfn
-from g4b.kernels.geglu import gelu_jfn
 from g4b.kernels.memset import memset_contiguous
-
-# TODO fix this kernel
-# TODO how do I use this to load ple_lookup?
-# TODO gemma4e embeddings require scaling... fuse that into the kernel directly
 
 
 def _cfg(
@@ -163,74 +156,3 @@ def gather_token_embeddings(
         scaling_factor=scaling_factor,
     )
     return k1, k2
-
-
-@cache
-def make_cached_ple_layer_matmul_epilogue_mixin(
-    layer: int,
-    shape0: int,
-    shape1: int,
-    shape2: int,
-    shape3: int,
-    stride0: int,
-    stride1: int,
-    stride2: int,
-    stride3: int,
-):
-    layer = tl.constexpr(layer)
-    shape0 = tl.constexpr(shape0)
-    shape1 = tl.constexpr(shape1)
-    shape2 = tl.constexpr(shape2)
-    shape3 = tl.constexpr(shape3)
-    stride0 = tl.constexpr(stride0)
-    stride1 = tl.constexpr(stride1)
-    stride2 = tl.constexpr(stride2)
-    stride3 = tl.constexpr(stride3)
-
-    @triton.jit
-    def ple_layer_matmul_epilogue_mixin_jfn(
-        name: tl.constexpr,
-        desc,
-        tile,
-        off0,
-        off1,
-        off2,
-        rsos_ptr,
-        extra_ptr,
-        rsos_shape0: tl.constexpr,
-        rsos_shape1: tl.constexpr,
-        rsos_stride0: tl.constexpr,
-        rsos_stride1: tl.constexpr,
-        NUM_K_SPLITS: tl.constexpr,
-        C_DTYPE: tl.constexpr,
-    ):
-        # Load from PLE
-
-        up_tile_desc = tl.make_tensor_descriptor(
-            extra_ptr,
-            (shape0, shape1, shape2, shape3),
-            (stride0, stride1, stride2, stride3),
-            (1, tile.shape[0], tile.shape[1], tile.shape[2]),
-        )
-        up_tile = up_tile_desc.load((layer, off0, off1, off2)).reshape(tile.shape)
-
-        tile = gelu_jfn(tile) * up_tile
-
-        matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
-            name,
-            desc,
-            tile,
-            off0,
-            off1,
-            off2,
-            rsos_ptr,
-            extra_ptr,
-            rsos_shape0,
-            rsos_shape1,
-            rsos_stride0,
-            rsos_stride1,
-            NUM_K_SPLITS,
-            C_DTYPE,
-        )
-
-    return ple_layer_matmul_epilogue_mixin_jfn
