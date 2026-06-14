@@ -17,3 +17,6 @@
 #  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
 #  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
 #  cache is pretty common after all.
+# TODO one could potentially try introducing an extra reduction loop across the head dim (innermost dim), though that
+#  would increase flash attn memory traffic by ~50% so probably bad unless it massively boosts MMA throughput because
+#  of better tile shapes.
