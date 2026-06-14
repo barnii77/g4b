@@ -66,7 +66,6 @@ def _cfg(
 
 
 def _matmul_3d_autotune_configs():
-    # AI slop configs
     return [
         # ---- aggressive ----
         _cfg(1, 32, 32, 32, 8, warps=4, stages=3),
@@ -75,6 +74,12 @@ def _matmul_3d_autotune_configs():
         _cfg(1, 64, 32, 128, 8, split_k=2, warps=4, stages=3),
         _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
         _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
+        _cfg(1, 64, 64, 64, 8, warps=4, stages=3),
+        _cfg(1, 64, 64, 256, 8, warps=4, stages=3),
+        _cfg(1, 64, 128, 64, 8, warps=4, stages=3),
+        _cfg(1, 64, 128, 256, 8, warps=4, stages=3),
+        _cfg(2, 64, 64, 128, 8, warps=4, stages=3),
+        _cfg(2, 64, 128, 128, 8, warps=4, stages=3),
         # ---- small / skinny-N / decode-ish ----
         # Effective MxN: 16x16, 16x32, 32x16, 32x32
         # _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
