@@ -5,6 +5,7 @@ from g4b import tensor
 from g4b.tensor import Tensor, DType
 from g4b.kernels.utils import launch, default_bencher, jfn_cache_key
 from g4b.kernels.memset import memset_contiguous_by_ptr
+from g4b.kernels.rsos import compute_rsos
 from g4b.utils import contiguous_strides_for_shape
 
 # TODO it appears that torch's matmul (without sum of squares fusion) using fp16 + fp32 accum is ~10% faster than mine.
@@ -684,57 +685,6 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
         desc.atomic_add((off0, off1, off2), tile.to(desc.dtype))
 
 
-@triton.jit
-def _compute_rsos_3d_kernel(
-    # fmt: off
-    c_ptr, rsos_ptr,
-    c_shape0: tl.constexpr, c_shape1: tl.constexpr, c_shape2: tl.constexpr,
-    rsos_shape0: tl.constexpr, rsos_shape1: tl.constexpr,
-    c_stride0: tl.constexpr, c_stride1: tl.constexpr, c_stride2: tl.constexpr,
-    rsos_stride0: tl.constexpr, rsos_stride1: tl.constexpr,
-    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
-    # fmt: on
-):
-    tl.static_assert(c_shape0 == rsos_shape0)
-    tl.static_assert(c_shape1 == rsos_shape1)
-
-    off0 = tl.program_id(2) * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
-    off1 = tl.program_id(1) * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
-    off2 = tl.program_id(0) * BLOCKSIZE2 + tl.arange(0, BLOCKSIZE2)[None, None, :]
-
-    c_offsets = off0 * c_stride0 + off1 * c_stride1 + off2 * c_stride2
-    c = tl.load(
-        c_ptr + c_offsets,
-        mask=(off0 < c_shape0) & (off1 < c_shape1) & (off2 < c_shape2),
-        other=0.0,
-    ).to(tl.float32)
-
-    rsos_offsets = off0 * rsos_stride0 + off1 * rsos_stride1
-    tl.atomic_add(
-        rsos_ptr + rsos_offsets.reshape((BLOCKSIZE0, BLOCKSIZE1)),
-        (c * c).sum(-1),
-        mask=((off0 < rsos_shape0) & (off1 < rsos_shape1)).reshape((BLOCKSIZE0, BLOCKSIZE1)),
-    )
-
-
-def _compute_rsos_3d(c: Tensor, rsos: Tensor):
-    assert rsos.is_contiguous(), "sum of squares buffer must be contiguous"
-    grid_fn = lambda META: (
-        triton.cdiv(c.shape[2], META["BLOCKSIZE2"]),
-        triton.cdiv(c.shape[1], META["BLOCKSIZE1"]),
-        triton.cdiv(c.shape[0], META["BLOCKSIZE0"]),
-    )
-    memset_contiguous_by_ptr(rsos.data_ptr(), math.prod(rsos.shape), 0)
-    return launch[_compute_rsos_3d_kernel, grid_fn](
-        c=c,
-        rsos=rsos,
-        BLOCKSIZE0=1,
-        BLOCKSIZE1=1,
-        BLOCKSIZE2=1024,
-        num_warps=4,
-    )
-
-
 def matmul_a3d_b2d(
     c: Tensor,
     c_rmsnorm_sum_of_squares: Tensor | None,
@@ -796,7 +746,7 @@ def matmul_a3d_b2d(
         _ACCUM_DTYPE_CACHE_KEY=accum_dtype.name,
     )
     if c_rmsnorm_sum_of_squares is not None and selected_num_k_splits > 1:
-        _compute_rsos_3d(c, c_rmsnorm_sum_of_squares)
+        compute_rsos(c, c_rmsnorm_sum_of_squares)
 
 
 def _dtype_name(dtype):

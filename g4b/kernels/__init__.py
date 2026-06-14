@@ -7,6 +7,7 @@ from . import increment
 from . import matmul
 from . import memset
 from . import rmsnorm
+from . import rsos
 from . import rope
 from . import sample_logits
 from . import update_residual_stream
@@ -25,6 +26,7 @@ __all__ = [
     "matmul",
     "memset",
     "rmsnorm",
+    "rsos",
     "rope",
     "sample_logits",
     "update_residual_stream",
