@@ -62,10 +62,13 @@ def _cfg(
         # fmt: off
         "x_shape0", "x_shape1", "x_shape2", "x_shape3",
         "cache_shape0", "cache_shape1", "cache_shape2", "cache_shape3",
+        "x_rsos_shape0", "x_rsos_shape1", "x_rsos_shape2",
         "cache_offsets_shape0",
         "x_stride0", "x_stride1", "x_stride2", "x_stride3",
+        "x_rsos_stride0", "x_rsos_stride1", "x_rsos_stride2",
         "cache_stride0", "cache_stride1", "cache_stride2", "cache_stride3",
         "cache_offsets_stride0",
+        "rmsnorm_eps",
         # fmt: on
     ],
     do_bench=default_bencher,
@@ -73,36 +76,30 @@ def _cfg(
 )
 @triton.jit
 def _add_kv_to_cache_kernel(
-    x_ptr,
-    cache_ptr,
-    cache_offsets_ptr,
-    x_shape0: tl.constexpr,
-    x_shape1: tl.constexpr,
-    x_shape2: tl.constexpr,
-    x_shape3: tl.constexpr,
-    cache_shape0: tl.constexpr,
-    cache_shape1: tl.constexpr,
-    cache_shape2: tl.constexpr,
-    cache_shape3: tl.constexpr,
+    # fmt: off
+    x_ptr, cache_ptr, cache_offsets_ptr,
+    x_shape0: tl.constexpr, x_shape1: tl.constexpr, x_shape2: tl.constexpr, x_shape3: tl.constexpr,
+    cache_shape0: tl.constexpr, cache_shape1: tl.constexpr, cache_shape2: tl.constexpr, cache_shape3: tl.constexpr,
     cache_offsets_shape0: tl.constexpr,
-    x_stride0: tl.constexpr,
-    x_stride1: tl.constexpr,
-    x_stride2: tl.constexpr,
-    x_stride3: tl.constexpr,
-    cache_stride0: tl.constexpr,
-    cache_stride1: tl.constexpr,
-    cache_stride2: tl.constexpr,
-    cache_stride3: tl.constexpr,
+    x_stride0: tl.constexpr, x_stride1: tl.constexpr, x_stride2: tl.constexpr, x_stride3: tl.constexpr,
+    cache_stride0: tl.constexpr, cache_stride1: tl.constexpr, cache_stride2: tl.constexpr, cache_stride3: tl.constexpr,
     cache_offsets_stride0: tl.constexpr,
-    BLOCKSIZE0: tl.constexpr,
-    BLOCKSIZE1: tl.constexpr,
-    BLOCKSIZE2: tl.constexpr,
-    BLOCKSIZE3: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCKSIZE3: tl.constexpr,
+    rmsnorm_eps: tl.constexpr,
+    x_rsos_ptr=None,
+    x_rsos_shape0: tl.constexpr = 0, x_rsos_shape1: tl.constexpr = 0, x_rsos_shape2: tl.constexpr = 0,
+    x_rsos_stride0: tl.constexpr = 0, x_rsos_stride1: tl.constexpr = 0, x_rsos_stride2: tl.constexpr = 0,
+    x_rsos: None = None,
+    # fmt: on
 ):
     tl.static_assert(x_shape0 == cache_shape0)
     tl.static_assert(x_shape1 == cache_shape1)
     tl.static_assert(x_shape3 == cache_shape3)
     tl.static_assert(x_shape0 == cache_offsets_shape0)
+    if x_rsos_ptr is not None:
+        tl.static_assert(x_rsos_shape0 == x_shape0)
+        tl.static_assert(x_rsos_shape1 == x_shape1)
+        tl.static_assert(x_rsos_shape2 == x_shape2)
 
     B: tl.constexpr = x_shape0
     t: tl.constexpr = x_shape2
@@ -133,6 +130,10 @@ def _add_kv_to_cache_kernel(
 
     x_offs = off_b * x_stride0 + off_g * x_stride1 + off_t * x_stride2 + off_d * x_stride3
     x = tl.load(x_ptr + x_offs, mask=(off_b < B) & (off_g < G) & (off_t < t) & (off_d < d))
+    if x_rsos_ptr is not None:
+        x_rsos_offs = off_b * x_rsos_stride0 + off_g * x_rsos_stride1 + off_t * x_rsos_stride2
+        x_rsos = tl.load(x_rsos_ptr + x_rsos_offs, mask=(off_b < B) & (off_g < G) & (off_t < t))
+        x *= tl.rsqrt(x_rsos / d + rmsnorm_eps)
 
     cache_offs = (
         off_b * cache_stride0
@@ -143,11 +144,17 @@ def _add_kv_to_cache_kernel(
     tl.store(cache_ptr + cache_offs, x, mask=(off_b < B) & (off_g < G) & (off_t < t) & (off_d < d))
 
 
-def add_kv_to_cache(x: Tensor, cache: Tensor, cache_offsets: Tensor):
+def add_kv_to_cache(x: Tensor, cache: Tensor, cache_offsets: Tensor, rmsnorm_eps: float, x_rsos: Tensor | None = None):
     grid_fn = lambda META: (
         triton.cdiv(x.shape[1], META["BLOCKSIZE1"])
         * triton.cdiv(x.shape[2], META["BLOCKSIZE2"])
         * triton.cdiv(x.shape[3], META["BLOCKSIZE3"]),
         triton.cdiv(x.shape[0], META["BLOCKSIZE0"]),
     )
-    return launch[_add_kv_to_cache_kernel, grid_fn](x=x, cache=cache, cache_offsets=cache_offsets)
+    return launch[_add_kv_to_cache_kernel, grid_fn](
+        x=x,
+        cache=cache,
+        cache_offsets=cache_offsets,
+        x_rsos=x_rsos,
+        rmsnorm_eps=rmsnorm_eps,
+    )
