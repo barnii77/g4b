@@ -668,7 +668,7 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     NUM_K_SPLITS: tl.constexpr,
     C_DTYPE: tl.constexpr,  # e.g. "q4_k", ignored here for convenience (no case where it differs from desc.dtype)
 ):
-    if rsos_ptr is not None:
+    if rsos_ptr is not None and NUM_K_SPLITS == 1:
         rsos = (tile * tile).sum(-1)
         rsos_offsets0 = (off0 + tl.arange(0, tile.shape[0]))[:, None]
         rsos_offsets1 = (off1 + tl.arange(0, tile.shape[1]))[None, :]
@@ -682,6 +682,57 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
         desc.store((off0, off1, off2), tile.to(desc.dtype))
     else:
         desc.atomic_add((off0, off1, off2), tile.to(desc.dtype))
+
+
+@triton.jit
+def _compute_rsos_3d_kernel(
+    # fmt: off
+    c_ptr, rsos_ptr,
+    c_shape0: tl.constexpr, c_shape1: tl.constexpr, c_shape2: tl.constexpr,
+    rsos_shape0: tl.constexpr, rsos_shape1: tl.constexpr,
+    c_stride0: tl.constexpr, c_stride1: tl.constexpr, c_stride2: tl.constexpr,
+    rsos_stride0: tl.constexpr, rsos_stride1: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
+    # fmt: on
+):
+    tl.static_assert(c_shape0 == rsos_shape0)
+    tl.static_assert(c_shape1 == rsos_shape1)
+
+    off0 = tl.program_id(2) * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
+    off1 = tl.program_id(1) * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
+    off2 = tl.program_id(0) * BLOCKSIZE2 + tl.arange(0, BLOCKSIZE2)[None, None, :]
+
+    c_offsets = off0 * c_stride0 + off1 * c_stride1 + off2 * c_stride2
+    c = tl.load(
+        c_ptr + c_offsets,
+        mask=(off0 < c_shape0) & (off1 < c_shape1) & (off2 < c_shape2),
+        other=0.0,
+    ).to(tl.float32)
+
+    rsos_offsets = off0 * rsos_stride0 + off1 * rsos_stride1
+    tl.atomic_add(
+        rsos_ptr + rsos_offsets.reshape((BLOCKSIZE0, BLOCKSIZE1)),
+        (c * c).sum(-1),
+        mask=((off0 < rsos_shape0) & (off1 < rsos_shape1)).reshape((BLOCKSIZE0, BLOCKSIZE1)),
+    )
+
+
+def _compute_rsos_3d(c: Tensor, rsos: Tensor):
+    assert rsos.is_contiguous(), "sum of squares buffer must be contiguous"
+    grid_fn = lambda META: (
+        triton.cdiv(c.shape[2], META["BLOCKSIZE2"]),
+        triton.cdiv(c.shape[1], META["BLOCKSIZE1"]),
+        triton.cdiv(c.shape[0], META["BLOCKSIZE0"]),
+    )
+    memset_contiguous_by_ptr(rsos.data_ptr(), math.prod(rsos.shape), 0)
+    return launch[_compute_rsos_3d_kernel, grid_fn](
+        c=c,
+        rsos=rsos,
+        BLOCKSIZE0=1,
+        BLOCKSIZE1=1,
+        BLOCKSIZE2=1024,
+        num_warps=4,
+    )
 
 
 def matmul_a3d_b2d(
@@ -701,15 +752,19 @@ def matmul_a3d_b2d(
     assert (b2 is None) == (c_c2_merge_tiles_fn is None)
 
     k_split_allowed = b2 is None
+    selected_num_k_splits = 1
 
     # TODO this grid_fn is hacky and I'm not sure launching the pre-hook in the grid_fn is ideal because it is part of
     #  the measurement of the autotuner, but I guess zeroing is a real downside and so it being measured by the
     #  autotuner isn't actually that undesirable?
-    grid_fn = lambda META: _pre_hook(META) or (
-        triton.cdiv(META["a_shape1"], META["A_BLOCKSIZE1"]) * triton.cdiv(META["b_shape1"], META["B_BLOCKSIZE1"]),
-        triton.cdiv(META["a_shape0"], META["A_BLOCKSIZE0"]),
-        META["NUM_K_SPLITS"] if k_split_allowed else 1,
-    )
+    def grid_fn(META):
+        nonlocal selected_num_k_splits
+        selected_num_k_splits = META["NUM_K_SPLITS"] if k_split_allowed else 1
+        return _pre_hook(META) or (
+            triton.cdiv(META["a_shape1"], META["A_BLOCKSIZE1"]) * triton.cdiv(META["b_shape1"], META["B_BLOCKSIZE1"]),
+            triton.cdiv(META["a_shape0"], META["A_BLOCKSIZE0"]),
+            selected_num_k_splits,
+        )
 
     if accum_dtype is None:
         # TODO add parameters and/or heuristics for when to use what. This should depend on hardware architecture,
@@ -740,6 +795,8 @@ def matmul_a3d_b2d(
         _c_c2_merge_tiles_fn_key=jfn_cache_key(c_c2_merge_tiles_fn),
         _ACCUM_DTYPE_CACHE_KEY=accum_dtype.name,
     )
+    if c_rmsnorm_sum_of_squares is not None and selected_num_k_splits > 1:
+        _compute_rsos_3d(c, c_rmsnorm_sum_of_squares)
 
 
 def _dtype_name(dtype):
