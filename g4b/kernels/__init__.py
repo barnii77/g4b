@@ -1,5 +1,5 @@
-from . import add
 from . import add_kv_to_cache
+from . import elementwise_ops
 from . import embeddings
 from . import fa2
 from . import geglu
@@ -16,8 +16,8 @@ from . import utils
 #  an ideal implementation would therefore check on the host if overflow would happen and pass a constexpr.
 
 __all__ = [
-    "add",
     "add_kv_to_cache",
+    "elementwise_ops",
     "embeddings",
     "fa2",
     "geglu",
