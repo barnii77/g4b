@@ -13,7 +13,7 @@ API SPEC:
     - {"type": "assistant.response.chunk", content: "...", "obfuscation": <obfuscation>}
     - {"type": "assistant.response.done", "obfuscation": <obfuscation>}
     - {"type": "pong"}
-    - {"type": "error", "detail": "..."}
+    - {"type": "error", "code": <uint32>, "detail": "..."}
 - <obfuscation>: An optional but recommended crypto-random base64-encoded sequence of X bytes where X is the absolute value of a sample from a uniform distribution U[L/2, 3L/2] and L is the length of the payload without obfuscation. The purpose of this is to prevent certain side channel attacks. Google "openai api obfuscation strings" for more information.
 - <event>: any context-management-related json event documented above except user.init and user.abort
 """
@@ -36,6 +36,9 @@ _tokenizer: "tokenizer_mod.Tokenizer"
 _chat_template: "tokenizer_mod.ChatTemplate"
 RESPONSE_CHUNK_TIMEOUT = 5
 RESPONSE_CHUNK_BUFFER_SIZE = 48  # tokens
+
+GENERIC_ERROR = 1
+MAX_CONTEXT_WINDOW_EXCEEDED_ERROR = 2  # TODO emit this when it happens so the client can truncate conversation
 
 
 def register_scheduler(sched: "scheduler_mod.Scheduler"):
@@ -254,7 +257,7 @@ class Uvicorn:
         self.thread.join()
 
 
-async def _chat_err(ws: WebSocket, error: str):
+async def _chat_err(ws: WebSocket, error: str, code: int = GENERIC_ERROR):
     await ws.send_json({"type": "error", "detail": error})
     await ws.close(code=4000, reason=error)
     raise RuntimeError(error)
