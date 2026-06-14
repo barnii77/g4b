@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from g4b.gguf import GGUFMeta, GGUFTensor, GGUFType
 from g4b.models.model import Model
 from g4b.scheduler import Scheduler
-from g4b.tensor import Tensor, float32, bfloat16, int8, int32
+from g4b.tensor import Tensor, float32, bfloat16, int8, int32, uint8
 from g4b.config import Config
 from g4b.lifecycle import record_static_cuda_graph
 from g4b.utils import gguf_tensors_by_name
@@ -186,6 +186,8 @@ class Gemma4E(Model):
     residual_BtD_dtr: Tensor
     # TODO update this in separate kernel after sampling!
     time_dim_offsets_B_int32: Tensor  # time dim is dynamically sized
+    # TODO update this in separate kernel after sampling, update triggered by scheduler.py through some new Model method
+    user_in_prefill_or_decode_B_uint8: Tensor  # 0 -> prefill, 1 -> decode
 
     @record_static_cuda_graph
     def decode(self, sched: Scheduler): ...  # TODO
@@ -272,6 +274,8 @@ class Gemma4E(Model):
         residual = Tensor.alloc_empty(DTR, [B, t, D])
         time_dim_offsets = Tensor.alloc_empty(int32, [B])
         memset_contiguous(time_dim_offsets, 0)
+        user_in_prefill_or_decode = Tensor.alloc_empty(uint8, [B])
+        memset_contiguous(user_in_prefill_or_decode, 0)
         rmsnorm_epsilon = meta["gemma4.attention.layer_norm_rms_epsilon"]
         assert isinstance(rmsnorm_epsilon, float)
 
@@ -434,6 +438,7 @@ class Gemma4E(Model):
             rmsnorm_epsilon=rmsnorm_epsilon,
             residual_BtD_dtr=residual,
             time_dim_offsets_B_int32=time_dim_offsets,
+            user_in_prefill_or_decode_B_uint8=user_in_prefill_or_decode,
         )
         device.sync_all_streams()
         return model
