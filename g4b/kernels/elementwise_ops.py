@@ -141,11 +141,11 @@ def _elementwise_2d(
 def add(
         a: Tensor,
         b: Tensor,
-        b_rsos: Tensor,
-        b_rmsnorm_w: Tensor,
         out: Tensor,
         output_scale_factor: float,
         rmsnorm_eps: float,
+        b_rsos: Tensor | None = None,
+        b_rmsnorm_w: Tensor | None = None,
 ):
     return _elementwise_2d(
         "add",
@@ -163,10 +163,10 @@ def mul(
         a: Tensor,
         b: Tensor,
         out: Tensor,
-        output_scale_factor: float = 1.0,
+        output_scale_factor: float,
+        rmsnorm_eps: float,
         b_rsos: Tensor | None = None,
         b_rmsnorm_w: Tensor | None = None,
-        rmsnorm_eps: float = 0.0,
 ):
     return _elementwise_2d(
         "mul",
