@@ -24,7 +24,6 @@ def _cfg(
     )
 
 
-# TODO fuse rmsnorm w into this as well?
 @triton.autotune(
     # fmt: off
     configs=[
@@ -57,12 +56,14 @@ def _cfg(
         "act_buf_shape0", "act_buf_shape1", "act_buf_shape2",
         "act_rsos_shape0", "act_rsos_shape1",
         "out_rsos_shape0", "out_rsos_shape1",
-        "rmsnorm_w_shape0",
+        "current_rmsnorm_w_shape0",
+        "next_layer_input_rmsnorm_w_shape0",
         "residual_stride0", "residual_stride1", "residual_stride2",
         "act_buf_stride0", "act_buf_stride1", "act_buf_stride2",
         "act_rsos_stride0", "act_rsos_stride1",
         "out_rsos_stride0", "out_rsos_stride1",
-        "rmsnorm_w_stride0",
+        "current_rmsnorm_w_stride0",
+        "next_layer_input_rmsnorm_w_stride0",
         # fmt: on
     ],
     do_bench=default_bencher,
@@ -71,17 +72,20 @@ def _cfg(
 @triton.jit
 def _update_residual_stream_kernel(
     # fmt: off
-    residual_ptr, act_buf_ptr, act_rsos_ptr, out_rsos_ptr, rmsnorm_w_ptr,
+    residual_ptr, act_buf_ptr, act_rsos_ptr, out_rsos_ptr,
+    current_rmsnorm_w_ptr, next_layer_input_rmsnorm_w_ptr,
     residual_shape0: tl.constexpr, residual_shape1: tl.constexpr, residual_shape2: tl.constexpr,
     act_buf_shape0: tl.constexpr, act_buf_shape1: tl.constexpr, act_buf_shape2: tl.constexpr,
     act_rsos_shape0: tl.constexpr, act_rsos_shape1: tl.constexpr,
     out_rsos_shape0: tl.constexpr, out_rsos_shape1: tl.constexpr,
-    rmsnorm_w_shape0: tl.constexpr,
+    current_rmsnorm_w_shape0: tl.constexpr,
+    next_layer_input_rmsnorm_w_shape0: tl.constexpr,
     residual_stride0: tl.constexpr, residual_stride1: tl.constexpr, residual_stride2: tl.constexpr,
     act_buf_stride0: tl.constexpr, act_buf_stride1: tl.constexpr, act_buf_stride2: tl.constexpr,
     act_rsos_stride0: tl.constexpr, act_rsos_stride1: tl.constexpr,
     out_rsos_stride0: tl.constexpr, out_rsos_stride1: tl.constexpr,
-    rmsnorm_w_stride0: tl.constexpr,
+    current_rmsnorm_w_stride0: tl.constexpr,
+    next_layer_input_rmsnorm_w_stride0: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
     eps: tl.constexpr,
     # fmt: on
@@ -91,7 +95,8 @@ def _update_residual_stream_kernel(
     tl.static_assert(residual_shape1 == act_buf_shape1)
     tl.static_assert(residual_shape1 == act_rsos_shape1)
     tl.static_assert(residual_shape2 == act_buf_shape2)
-    tl.static_assert(residual_shape2 == rmsnorm_w_shape0)
+    tl.static_assert(residual_shape2 == current_rmsnorm_w_shape0)
+    tl.static_assert(current_rmsnorm_w_shape0 == next_layer_input_rmsnorm_w_shape0)
     tl.static_assert(out_rsos_shape0 == act_rsos_shape0)
     tl.static_assert(out_rsos_shape1 == act_rsos_shape1)
 
@@ -117,12 +122,18 @@ def _update_residual_stream_kernel(
     rsos_off = off_b * act_rsos_stride0 + off_t * act_rsos_stride1
     act_rsos = tl.load(act_rsos_ptr + rsos_off, mask=(off_b < act_rsos_shape0) & (off_t < act_rsos_shape1))
 
-    rmsnorm_w_off = off_d * rmsnorm_w_stride0
-    rmsnorm_w = tl.load(rmsnorm_w_ptr + rmsnorm_w_off, mask=off_d < rmsnorm_w_shape0)
+    current_rmsnorm_w = tl.load(
+        current_rmsnorm_w_ptr + off_d * current_rmsnorm_w_stride0,
+        mask=off_d < current_rmsnorm_w_shape0,
+    )
+    next_layer_input_rmsnorm_w = tl.load(
+        next_layer_input_rmsnorm_w_ptr + off_d * next_layer_input_rmsnorm_w_stride0,
+        mask=off_d < next_layer_input_rmsnorm_w_shape0,
+    )
 
     inv_rms = tl.rsqrt(act_rsos / residual_shape2 + eps)
 
-    residual += act_buf * inv_rms
+    residual += act_buf * inv_rms * current_rmsnorm_w
 
     tl.store(
         residual_ptr + residual_off,
@@ -131,7 +142,7 @@ def _update_residual_stream_kernel(
     )
     tl.store(
         act_buf_ptr + act_buf_off,
-        residual * rmsnorm_w,
+        residual * next_layer_input_rmsnorm_w,
         mask=(off_b < act_buf_shape0) & (off_t < act_buf_shape1) & (off_d < act_buf_shape2),
     )
     out_rsos_off = off_b * out_rsos_stride0 + off_t * out_rsos_stride1
@@ -147,7 +158,8 @@ def update_residual_stream(
     act_buf: Tensor,
     act_rsos: Tensor,
     out_rsos: Tensor,
-    rmsnorm_w: Tensor,
+    current_rmsnorm_w: Tensor,
+    next_layer_input_rmsnorm_w: Tensor,
     eps: float,
 ):
     grid_fn = lambda META: (
@@ -161,7 +173,8 @@ def update_residual_stream(
         act_buf=act_buf,
         act_rsos=act_rsos,
         out_rsos=out_rsos,
-        rmsnorm_w=rmsnorm_w,
+        current_rmsnorm_w=current_rmsnorm_w,
+        next_layer_input_rmsnorm_w=next_layer_input_rmsnorm_w,
         eps=float(eps),
     )
     return k1, k2
