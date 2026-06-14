@@ -736,7 +736,7 @@ def matmul_a3d_b2d(
         nonlocal selected_num_k_splits
         selected_num_k_splits = META["NUM_K_SPLITS"] if k_split_allowed else 1
         return _pre_hook(META) or (
-            triton.cdiv(META["a_shape1"], META["A_BLOCKSIZE1"]) * triton.cdiv(META["b_shape1"], META["B_BLOCKSIZE1"]),
+            triton.cdiv(META["a_shape1"], META["A_BLOCKSIZE1"]) * triton.cdiv(META["c_shape2"], META["B_BLOCKSIZE1"]),
             triton.cdiv(META["a_shape0"], META["A_BLOCKSIZE0"]),
             selected_num_k_splits,
         )
