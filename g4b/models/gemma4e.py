@@ -24,8 +24,9 @@ from g4b import kernels
 #  Also, in all this, I must not forget about DecoderLayer.layer_output_scale, so I guess I need a special case after
 #  the PLE layer. Remember, the layer output scale scales the entire residual stream, not just the decoder layer delta.
 #  I think this optimization needs to be documented somewhere.
-# TODO I can fuse the rmsnorm w mul into the epilogue which computes the sum of squares too or, for input rmsnorms,
-#  fuse it into the resid_stream_combine kernel. (just make sure to compute the sum of squares from the original values).
+# TODO I could also do the above except I fuse the input RMSNorm w mult into the update_residual_stream kernel and
+#  then the rsos scaling of the input to the next layer's matmul actually happens in the matmul epilogue, since matmul
+#  is linear.
 
 # TODO think about how to handle sliding window attention... do I need a ring buffer KV cache?
 #  Hmm, actually I think I need a ring buffer KV cache for global attention too.
