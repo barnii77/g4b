@@ -427,6 +427,7 @@ def _attn_kernel(
         )
 
 
+# TODO autotune block sizes (and maybe somehow include the perf penalty of this kernel in the autotuner measurement of the main kernel for NUM_KV_SPLITS > 1)
 @triton.jit
 def _reduce_split_kv_kernel(
     # fmt: off
@@ -439,6 +440,7 @@ def _reduce_split_kv_kernel(
     partial_l_stride0: tl.constexpr, partial_l_stride1: tl.constexpr, partial_l_stride2: tl.constexpr, partial_l_stride3: tl.constexpr,
     partial_m_stride0: tl.constexpr, partial_m_stride1: tl.constexpr, partial_m_stride2: tl.constexpr, partial_m_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr, BLOCKSIZE_B: tl.constexpr, BLOCKSIZE_H: tl.constexpr, BLOCKSIZE_T: tl.constexpr,
     # fmt: on
 ):
     tl.static_assert(partial_o_shape1 == o_shape0)
@@ -455,46 +457,47 @@ def _reduce_split_kv_kernel(
     tl.static_assert(partial_m_shape3 == o_shape2)
 
     HEAD_DIM: tl.constexpr = o_shape3
-    H: tl.constexpr = o_shape1
 
     pid_q_t = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_h = pid_b % H
-    pid_b //= H
+    pid_h = tl.program_id(1)
+    pid_b = tl.program_id(2)
 
-    off_b = pid_b * BLOCKSIZE_B
-    off_h = pid_h * BLOCKSIZE_H
-    offs_t = pid_q_t * BLOCKSIZE_T + tl.arange(0, BLOCKSIZE_T)[:, None]
-    offs_d = tl.arange(0, HEAD_DIM)[None, :]
+    offs_b = pid_b * BLOCKSIZE_B + tl.arange(0, BLOCKSIZE_B)[:, None, None, None]
+    offs_h = pid_h * BLOCKSIZE_H + tl.arange(0, BLOCKSIZE_H)[None, :, None, None]
+    offs_t = pid_q_t * BLOCKSIZE_T + tl.arange(0, BLOCKSIZE_T)[None, None, :, None]
+    offs_d = tl.arange(0, HEAD_DIM)[None, None, None, :]
 
-    m = tl.full((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T), float("-inf"), dtype=partial_m_ptr.dtype.element_ty)
-    l = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T), dtype=partial_l_ptr.dtype.element_ty)
+    m = tl.full((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, 1), float("-inf"), dtype=partial_m_ptr.dtype.element_ty)
+    l = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, 1), dtype=partial_l_ptr.dtype.element_ty)
     accum = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, HEAD_DIM), dtype=partial_o_ptr.dtype.element_ty)
-    for split_i in tl.range(0, partial_o_shape0):
+    for split_i in tl.range(0, NUM_KV_SPLITS):
         accum_i = tl.load(
             partial_o_ptr
             + split_i * partial_o_stride0
-            + off_b * partial_o_stride1
-            + off_h * partial_o_stride2
+            + offs_b * partial_o_stride1
+            + offs_h * partial_o_stride2
             + offs_t * partial_o_stride3
             + offs_d * partial_o_stride4,
-            mask=(offs_t < partial_o_shape3) & (offs_d < partial_o_shape4),
+            mask=(offs_b < partial_o_shape1)
+            & (offs_h < partial_o_shape2)
+            & (offs_t < partial_o_shape3)
+            & (offs_d < partial_o_shape4),
         )
         m_i = tl.load(
             partial_m_ptr
             + split_i * partial_m_stride0
-            + off_b * partial_m_stride1
-            + off_h * partial_m_stride2
+            + offs_b * partial_m_stride1
+            + offs_h * partial_m_stride2
             + offs_t * partial_m_stride3,
-            mask=offs_t < partial_m_shape3,
+            mask=(offs_b < partial_m_shape1) & (offs_h < partial_m_shape2) & (offs_t < partial_m_shape3),
         )
         l_i = tl.load(
             partial_l_ptr
             + split_i * partial_l_stride0
-            + off_b * partial_l_stride1
-            + off_h * partial_l_stride2
+            + offs_b * partial_l_stride1
+            + offs_h * partial_l_stride2
             + offs_t * partial_l_stride3,
-            mask=offs_t < partial_m_shape3,
+            mask=(offs_b < partial_l_shape1) & (offs_h < partial_l_shape2) & (offs_t < partial_l_shape3),
         )
 
         m_new = tl.maximum(m_i, m)
@@ -507,9 +510,9 @@ def _reduce_split_kv_kernel(
 
     accum /= l
     tl.store(
-        o_ptr + off_b * o_stride0 + off_h * o_stride1 + offs_t * o_stride2 + offs_d * o_stride3,
+        o_ptr + offs_b * o_stride0 + offs_h * o_stride1 + offs_t * o_stride2 + offs_d * o_stride3,
         accum.to(o_ptr.dtype.element_ty),
-        mask=(offs_t < o_shape2) & (offs_d < o_shape3),
+        mask=(offs_b < o_shape0) & (offs_h < o_shape1) & (offs_t < o_shape2) & (offs_d < o_shape3),
     )
 
 
@@ -574,8 +577,9 @@ def flash_attention(
     k2 = None
     if selected_num_kv_splits > 1:
         reduce_grid_fn = lambda META: (
-            triton.cdiv(o.shape[2], META["Q_BLOCKSIZE_T"]),
-            o.shape[0] * o.shape[1],
+            triton.cdiv(o.shape[2], META["BLOCKSIZE_T"]),
+            triton.cdiv(o.shape[1], META["BLOCKSIZE_H"]),
+            triton.cdiv(o.shape[0], META["BLOCKSIZE_B"]),
         )
         k2 = launch[_reduce_split_kv_kernel, reduce_grid_fn](
             partial_o=partial_o,
