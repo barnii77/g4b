@@ -615,8 +615,8 @@ def flash_attention(
         selected_num_kv_splits = META["NUM_KV_SPLITS"]
         return (
             triton.cdiv(q.shape[2], META["Q_BLOCKSIZE_T"]),
-            q.shape[0] * k_cache.shape[1] * triton.cdiv(q_heads_per_kv, q_blocksize_h),
             selected_num_kv_splits,
+            q.shape[0] * k_cache.shape[1] * triton.cdiv(q_heads_per_kv, q_blocksize_h),
         )
 
     k1 = launch[_attn_kernel, grid_fn](
