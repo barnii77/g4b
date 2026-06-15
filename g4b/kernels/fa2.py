@@ -42,37 +42,55 @@ INNER_STAGE_FULL_CONSTEXPR = tl.constexpr(3)
 @triton.jit
 def _attn_inner(
     # fmt: off
-    acc, l_i, m_i, q, desc_k, desc_v,
-    offset_y, start_m,
+    acc, l_i, m_i, q, k_cache_ptr, v_cache_ptr, cache_offsets_ptr,
+    off_b, off_kv_h, start_m,
+    k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
+    v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
+    cache_offsets_stride0: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, HEAD_DIM: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-    N_CTX: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
+    Q_CTX: tl.constexpr, KV_CTX: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     # fmt: on
 ):
+    q_t_base: tl.constexpr = KV_CTX - Q_CTX
+    q_tile_start = q_t_base + start_m * Q_BLOCKSIZE_T
     # range of values handled by this stage
     if STAGE == INNER_STAGE_OFF_BAND_CONSTEXPR:
-        lo, hi = 0, start_m * Q_BLOCKSIZE_T
+        lo, hi = 0, q_tile_start
     elif STAGE == INNER_STAGE_ON_BAND_CONSTEXPR:
-        lo, hi = start_m * Q_BLOCKSIZE_T, (start_m + 1) * Q_BLOCKSIZE_T
-        lo = tl.multiple_of(lo, Q_BLOCKSIZE_T)
+        lo, hi = q_tile_start, q_tile_start + Q_BLOCKSIZE_T
     else:
         # causal = False
-        lo, hi = 0, N_CTX
+        lo, hi = 0, KV_CTX
 
-    offsetk_y = offset_y + lo
-    offsetv_y = offset_y + lo
+    cache_offset = tl.load(cache_offsets_ptr + off_b * cache_offsets_stride0)
+    offs_d = tl.arange(0, HEAD_DIM)
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, KV_BLOCKSIZE_T, warp_specialize=WARP_SPECIALIZE):
         start_n = tl.multiple_of(start_n, KV_BLOCKSIZE_T)
 
         # compute qk
-        k = desc_k.load([offsetk_y, 0]).T
+        kv_logical_t = start_n + offs_n
+        kv_mask = kv_logical_t < hi
+        offs_kv_t = (cache_offset + start_n + offs_n) % KV_CTX  # index into KV ring buffers
+        k = tl.load(
+            k_cache_ptr
+            + off_b * k_cache_stride0
+            + off_kv_h * k_cache_stride1
+            + offs_kv_t[:, None] * k_cache_stride2
+            + offs_d[None, :] * k_cache_stride3,
+            mask=kv_mask[:, None],
+            other=0.0,
+        ).T
         qk = tl.dot(q, k)
         qk *= 1.44269504  # 1 / log(2), because this kernel uses exp2.
+        qk = qk + tl.where(kv_mask[None, :], 0, -1.0e6)
 
         # causal mask if required
         if STAGE == INNER_STAGE_ON_BAND_CONSTEXPR:
-            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            q_logical_t = q_t_base + offs_m
+            mask = q_logical_t[:, None] >= kv_logical_t[None, :]
             qk = qk + tl.where(mask, 0, -1.0e6)
 
         # softmax
@@ -94,7 +112,15 @@ def _attn_inner(
             acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape((BM, BN))
         else:
             acc = acc * alpha[:, None]
-        v = desc_v.load([offsetv_y, 0])
+        v = tl.load(
+            v_cache_ptr
+            + off_b * v_cache_stride0
+            + off_kv_h * v_cache_stride1
+            + offs_kv_t[:, None] * v_cache_stride2
+            + offs_d[None, :] * v_cache_stride3,
+            mask=kv_mask[:, None],
+            other=0.0,
+        )
         p = p.to(tl.float16)
         acc = tl.dot(p, v, acc)
 
@@ -102,8 +128,6 @@ def _attn_inner(
         # place this at the end of the loop to reduce register pressure
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        offsetk_y += KV_BLOCKSIZE_T
-        offsetv_y += KV_BLOCKSIZE_T
 
     return acc, l_i, m_i
 
@@ -126,15 +150,15 @@ def _configs():
 
 
 def _prune_invalid_configs(configs, named_args, **kwargs):
-    N_CTX = kwargs["q_shape2"]
+    Q_CTX = kwargs["q_shape2"]
     STAGE = kwargs["STAGE"]
 
-    # Filter out configs where Q_BLOCKSIZE_T > N_CTX
+    # Filter out configs where Q_BLOCKSIZE_T > Q_CTX
     # Filter out configs where Q_BLOCKSIZE_T < KV_BLOCKSIZE_T when causal is True
     return [
         conf
         for conf in configs
-        if conf.kwargs.get("Q_BLOCKSIZE_T", 0) <= N_CTX
+        if conf.kwargs.get("Q_BLOCKSIZE_T", 0) <= Q_CTX
         and (conf.kwargs.get("Q_BLOCKSIZE_T", 0) >= conf.kwargs.get("KV_BLOCKSIZE_T", 0) or STAGE == STAGE_FULL)
     ]
 
@@ -144,13 +168,15 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
     key=[
         # fmt: off
         "q_shape0", "q_shape1", "q_shape2", "q_shape3",
-        "k_shape0", "k_shape1", "k_shape2", "k_shape3",
-        "v_shape0", "v_shape1", "v_shape2", "v_shape3",
+        "k_cache_shape0", "k_cache_shape1", "k_cache_shape2", "k_cache_shape3",
+        "v_cache_shape0", "v_cache_shape1", "v_cache_shape2", "v_cache_shape3",
         "o_shape0", "o_shape1", "o_shape2", "o_shape3",
+        "cache_offsets_shape0",
         "q_stride0", "q_stride1", "q_stride2", "q_stride3",
-        "k_stride0", "k_stride1", "k_stride2", "k_stride3",
-        "v_stride0", "v_stride1", "v_stride2", "v_stride3",
+        "k_cache_stride0", "k_cache_stride1", "k_cache_stride2", "k_cache_stride3",
+        "v_cache_stride0", "v_cache_stride1", "v_cache_stride2", "v_cache_stride3",
         "o_stride0", "o_stride1", "o_stride2", "o_stride3",
+        "cache_offsets_stride0",
         "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
         # fmt: on
     ],
@@ -161,54 +187,55 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
 @triton.jit
 def _attn_kernel(
     # fmt: off
-    q_ptr, k_ptr, v_ptr, o_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, cache_offsets_ptr,
     q_shape0: tl.constexpr, q_shape1: tl.constexpr, q_shape2: tl.constexpr, q_shape3: tl.constexpr,
-    k_shape0: tl.constexpr, k_shape1: tl.constexpr, k_shape2: tl.constexpr, k_shape3: tl.constexpr,
-    v_shape0: tl.constexpr, v_shape1: tl.constexpr, v_shape2: tl.constexpr, v_shape3: tl.constexpr,
+    k_cache_shape0: tl.constexpr, k_cache_shape1: tl.constexpr, k_cache_shape2: tl.constexpr, k_cache_shape3: tl.constexpr,
+    v_cache_shape0: tl.constexpr, v_cache_shape1: tl.constexpr, v_cache_shape2: tl.constexpr, v_cache_shape3: tl.constexpr,
     o_shape0: tl.constexpr, o_shape1: tl.constexpr, o_shape2: tl.constexpr, o_shape3: tl.constexpr,
+    cache_offsets_shape0: tl.constexpr,
     q_stride0: tl.constexpr, q_stride1: tl.constexpr, q_stride2: tl.constexpr, q_stride3: tl.constexpr,
-    k_stride0: tl.constexpr, k_stride1: tl.constexpr, k_stride2: tl.constexpr, k_stride3: tl.constexpr,
-    v_stride0: tl.constexpr, v_stride1: tl.constexpr, v_stride2: tl.constexpr, v_stride3: tl.constexpr,
+    k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
+    v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
+    cache_offsets_stride0: tl.constexpr,
     STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
     # fmt: on
 ):
     HEAD_DIM: tl.constexpr = q_shape3
-    N_CTX: tl.constexpr = q_shape2
+    Q_CTX: tl.constexpr = q_shape2
+    KV_CTX: tl.constexpr = k_cache_shape2
     H: tl.constexpr = q_shape1
+    G: tl.constexpr = k_cache_shape1
     tl.static_assert(KV_BLOCKSIZE_T <= HEAD_DIM)
-    tl.static_assert(q_shape0 == k_shape0 and q_shape0 == v_shape0 and q_shape0 == o_shape0)
-    tl.static_assert(q_shape1 == k_shape1 and q_shape1 == v_shape1 and q_shape1 == o_shape1)
-    tl.static_assert(q_shape2 == k_shape2 and q_shape2 == v_shape2 and q_shape2 == o_shape2)
-    tl.static_assert(q_shape3 == k_shape3 and q_shape3 == v_shape3 and q_shape3 == o_shape3)
+    tl.static_assert(q_shape0 == k_cache_shape0 and q_shape0 == v_cache_shape0 and q_shape0 == o_shape0)
+    tl.static_assert(q_shape0 == cache_offsets_shape0)
+    tl.static_assert(q_shape1 == o_shape1 and q_shape2 == o_shape2 and q_shape3 == o_shape3)
+    tl.static_assert(k_cache_shape1 == v_cache_shape1 and k_cache_shape2 == v_cache_shape2)
+    tl.static_assert(q_shape3 == k_cache_shape3 and q_shape3 == v_cache_shape3)
+    tl.static_assert(q_shape1 % k_cache_shape1 == 0)
     tl.static_assert(q_stride1 == q_shape2 * q_stride2 and q_stride0 == q_shape1 * q_stride1)
-    tl.static_assert(k_stride1 == k_shape2 * k_stride2 and k_stride0 == k_shape1 * k_stride1)
-    tl.static_assert(v_stride1 == v_shape2 * v_stride2 and v_stride0 == v_shape1 * v_stride1)
+    tl.static_assert(k_cache_stride1 == k_cache_shape2 * k_cache_stride2 and k_cache_stride0 == k_cache_shape1 * k_cache_stride1)
+    tl.static_assert(v_cache_stride1 == v_cache_shape2 * v_cache_stride2 and v_cache_stride0 == v_cache_shape1 * v_cache_stride1)
     tl.static_assert(o_stride1 == o_shape2 * o_stride2 and o_stride0 == o_shape1 * o_stride1)
 
     start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    off_bh = tl.program_id(1)
+    off_b = off_bh // H
+    off_h = off_bh % H
+    off_kv_h = off_h // (H // G)
 
     y_dim: tl.constexpr = q_shape0 * q_shape1 * q_shape2
     # fmt: off
     desc_q = tl.make_tensor_descriptor(
         q_ptr, shape=(y_dim, HEAD_DIM), strides=(q_stride2, q_stride3), block_shape=(Q_BLOCKSIZE_T, HEAD_DIM)
     )
-    desc_k = tl.make_tensor_descriptor(
-        k_ptr, shape=(y_dim, HEAD_DIM), strides=(k_stride2, k_stride3), block_shape=(KV_BLOCKSIZE_T, HEAD_DIM)
-    )
-    desc_v = tl.make_tensor_descriptor(
-        v_ptr, shape=(y_dim, HEAD_DIM), strides=(v_stride2, v_stride3), block_shape=(KV_BLOCKSIZE_T, HEAD_DIM)
-    )
     desc_o = tl.make_tensor_descriptor(
         o_ptr, shape=(y_dim, HEAD_DIM), strides=(o_stride2, o_stride3), block_shape=(Q_BLOCKSIZE_T, HEAD_DIM)
     )
     # fmt: on
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
+    offset_y = off_b * (Q_CTX * H) + off_h * Q_CTX
     qo_offset_y = offset_y + start_m * Q_BLOCKSIZE_T
     # initialize offsets
     offs_m = start_m * Q_BLOCKSIZE_T + tl.arange(0, Q_BLOCKSIZE_T)
@@ -231,17 +258,23 @@ def _attn_kernel(
             l_i,
             m_i,
             q,
-            desc_k,
-            desc_v,
-            offset_y,
+            k_cache_ptr,
+            v_cache_ptr,
+            cache_offsets_ptr,
+            off_b,
+            off_kv_h,
             start_m,
+            k_cache_stride0, k_cache_stride1, k_cache_stride2, k_cache_stride3,
+            v_cache_stride0, v_cache_stride1, v_cache_stride2, v_cache_stride3,
+            cache_offsets_stride0,
             Q_BLOCKSIZE_T,
             HEAD_DIM,
             KV_BLOCKSIZE_T,
             INNER_STAGE,
             offs_m,
             offs_n,
-            N_CTX,
+            Q_CTX,
+            KV_CTX,
             WARP_SPECIALIZE,
             IS_HOPPER,
         )
@@ -253,17 +286,23 @@ def _attn_kernel(
             l_i,
             m_i,
             q,
-            desc_k,
-            desc_v,
-            offset_y,
+            k_cache_ptr,
+            v_cache_ptr,
+            cache_offsets_ptr,
+            off_b,
+            off_kv_h,
             start_m,
+            k_cache_stride0, k_cache_stride1, k_cache_stride2, k_cache_stride3,
+            v_cache_stride0, v_cache_stride1, v_cache_stride2, v_cache_stride3,
+            cache_offsets_stride0,
             Q_BLOCKSIZE_T,
             HEAD_DIM,
             KV_BLOCKSIZE_T,
             INNER_STAGE_ON_BAND_CONSTEXPR,
             offs_m,
             offs_n,
-            N_CTX,
+            Q_CTX,
+            KV_CTX,
             WARP_SPECIALIZE,
             IS_HOPPER,
         )
@@ -275,9 +314,10 @@ def _attn_kernel(
 
 def flash_attention(
     q: Tensor,
-    k: Tensor,
-    v: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
     o: Tensor,
+    time_dim_offsets: Tensor,
     *,
     warp_specialize: bool = False,
     is_hopper: bool = False,
@@ -289,9 +329,10 @@ def flash_attention(
     )
     return launch[_attn_kernel, grid_fn](
         q=q,
-        k=k,
-        v=v,
+        k_cache=k_cache,
+        v_cache=v_cache,
         o=o,
+        cache_offsets=time_dim_offsets,
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
         STAGE=stage,
