@@ -49,7 +49,7 @@ def _attn_inner(
     STAGE: tl.constexpr, offs_q_t: tl.constexpr, offs_n: tl.constexpr,
     Q_CTX: tl.constexpr, KV_CTX: tl.constexpr, ctx_window_size: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
-    WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr, USE_FP32_DOT: tl.constexpr,
     # fmt: on
 ):
     time_dim_size = tl.load(time_dim_sizes_ptr + off_b * time_dim_sizes_stride0)
@@ -84,8 +84,11 @@ def _attn_inner(
             + offs_d[None, :] * k_cache_stride3,
             mask=kv_mask[:, None],
             other=0.0,
-        ).to(tl.float16).T
-        qk = tl.dot(q.to(tl.float16), k)
+        )
+        if USE_FP32_DOT:
+            qk = tl.dot(q.to(tl.float32), k.to(tl.float32).T, input_precision="tf32x3")
+        else:
+            qk = tl.dot(q.to(tl.float16), k.to(tl.float16).T)
         qk *= 1.44269504  # 1 / log(2), because this kernel uses exp2.
         qk = qk + tl.where(kv_mask[None, :], 0, -1.0e6)
 
@@ -122,9 +125,11 @@ def _attn_inner(
             + offs_d[None, :] * v_cache_stride3,
             mask=kv_mask[:, None],
             other=0.0,
-        ).to(tl.float16)
-        p = p.to(tl.float16)
-        acc = tl.dot(p, v, acc)
+        )
+        if USE_FP32_DOT:
+            acc = tl.dot(p.to(tl.float32), v.to(tl.float32), acc, input_precision="tf32x3")
+        else:
+            acc = tl.dot(p.to(tl.float16), v.to(tl.float16), acc)
 
         # update m_i and l_i
         # place this at the end of the loop to reduce register pressure
@@ -205,7 +210,7 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "partial_l_stride0", "partial_l_stride1", "partial_l_stride2", "partial_l_stride3",
         "partial_m_stride0", "partial_m_stride1", "partial_m_stride2", "partial_m_stride3",
         "ctx_window_size", "Q_BLOCKSIZE_H", "MAX_KV_SPLITS",
-        "PHASE", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
+        "PHASE", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER", "USE_FP32_DOT",
         # fmt: on
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_configs},
@@ -228,6 +233,7 @@ def _attn_kernel(
     time_dim_sizes_stride0: tl.constexpr, user_in_prefill_or_decode_stride0: tl.constexpr,
     ctx_window_size: tl.constexpr, Q_BLOCKSIZE_H: tl.constexpr, MAX_KV_SPLITS: tl.constexpr,
     PHASE: tl.constexpr, STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
+    USE_FP32_DOT: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr, NUM_KV_SPLITS: tl.constexpr,
     partial_o_ptr=None, partial_l_ptr=None, partial_m_ptr=None,
     partial_o_shape0: tl.constexpr = 0, partial_o_shape1: tl.constexpr = 0, partial_o_shape2: tl.constexpr = 0, partial_o_shape3: tl.constexpr = 0, partial_o_shape4: tl.constexpr = 0,
@@ -350,6 +356,7 @@ def _attn_kernel(
             NUM_KV_SPLITS,
             WARP_SPECIALIZE,
             IS_HOPPER,
+            USE_FP32_DOT,
         )
 
     # stage 2: on-band
@@ -388,6 +395,7 @@ def _attn_kernel(
             NUM_KV_SPLITS,
             WARP_SPECIALIZE,
             IS_HOPPER,
+            USE_FP32_DOT,
         )
 
     # epilogue
@@ -603,6 +611,7 @@ def flash_attention(
     use_grouped_query_tile: bool = True,
     warp_specialize: bool = False,
     is_hopper: bool = False,
+    use_fp32_dot: bool = False,
     stage: int = STAGE_CAUSAL,
 ):
     q_heads_per_kv = q.shape[1] // k_cache.shape[1]
@@ -643,6 +652,7 @@ def flash_attention(
         PHASE=phase_id,
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
+        USE_FP32_DOT=use_fp32_dot,
         STAGE=stage,
     )
     k2 = None

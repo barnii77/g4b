@@ -8,7 +8,7 @@ from cuda.core import Buffer, Event
 from g4b.gguf import GGUFMeta, GGUFTensor, GGUFType
 from g4b.models.model import Model
 from g4b.scheduler import Scheduler
-from g4b.tensor import Tensor, float32, bfloat16, int8, int32, uint8
+from g4b.tensor import Tensor, float32, float16, int8, int32, uint8
 from g4b.config import Config
 from g4b.lifecycle import record_static_cuda_graph
 from g4b.utils import gguf_tensors_by_name
@@ -28,8 +28,8 @@ from g4b.kernels.matmul_epilogue import geglu_fusion_matmul_merge_tiles_mixin_jf
 # The dtypes refer to the following:
 DTR = float32  # DType for Residual stream
 DTA = float32  # DType for Attention
-DTH = bfloat16  # DType for (pre-)activations inside mlp
-DTKV = bfloat16  # DType for KV cache
+DTH = float32 if os.environ.get("G4B_DTH_FP32") else float16  # DType for (pre-)activations inside mlp
+DTKV = float32 if os.environ.get("G4B_DTKV_FP32") else float16  # DType for KV cache
 DTMM = int8  # DType for MatMul tensor core ops
 DTSS = float32  # DType for Sum-of-Squares accumulation for rmsnorm
 DTPLE = float32  # DType for computations in the per-layer-embeddings low-rank space
@@ -451,6 +451,7 @@ class Gemma4E(Model):
             attn.context_window_size,
             phase,
             use_grouped_query_tile=True,
+            use_fp32_dot=bool(os.environ.get("G4B_FA_FP32_DOT")),
         )
         matmul_a3d_b2d(out, out_rsos, o_flat, attn.o_proj_hvD_q4, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
 
