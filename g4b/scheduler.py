@@ -88,12 +88,14 @@ class Scheduler:
         token_cols: list[list[int]] = []
         cache_offsets: list[int] = []
         time_sizes_after: list[int] = []
+        sample_positions: list[int] = []
         phase_active: list[bool] = []
         for rq in self._active:
             if rq is None or rq._done or not self._needs_prefill(rq):
                 token_cols.append([0] * t)
                 cache_offsets.append(0)
                 time_sizes_after.append(0)
+                sample_positions.append(0)
                 phase_active.append(False)
                 continue
 
@@ -111,6 +113,7 @@ class Scheduler:
             rq._prefill_pos = end
             rq._context_len += real_n
             rq._last_sample_t_idx = real_n - 1
+            sample_positions.append(rq._last_sample_t_idx)
             rq._decode_state_prepared = False
             # The model always processes a full t-wide chunk of query positions and writes t KV slots
             # starting at start_offset, so the attention window must span all t of them (start_offset + t),
@@ -120,13 +123,14 @@ class Scheduler:
             time_sizes_after.append(start_offset + t)
 
         self._phase_active = phase_active
-        self._model.prepare_prefill_inputs(token_cols, cache_offsets, time_sizes_after)
+        self._model.prepare_prefill_inputs(token_cols, cache_offsets, time_sizes_after, sample_positions)
 
     def _prepare_decode_inputs(self):
         t = self._model.max_prefill_chunk_size()
         token_cols: list[list[int]] = []
         cache_offsets: list[int] = []
         time_sizes_after: list[int] = []
+        sample_positions: list[int] = []
         phase_active: list[bool] = []
         needs_upload = False
         for rq in self._active:
@@ -134,6 +138,7 @@ class Scheduler:
                 token_cols.append([0] * t)
                 cache_offsets.append(0)
                 time_sizes_after.append(0)
+                sample_positions.append(0)
                 phase_active.append(False)
                 continue
             phase_active.append(True)
@@ -144,10 +149,11 @@ class Scheduler:
             rq._context_len += 1
             rq._last_sample_t_idx = 0
             time_sizes_after.append(rq._context_len)
+            sample_positions.append(0)
 
         self._phase_active = phase_active
         if needs_upload:
-            self._model.prepare_decode_inputs(token_cols, cache_offsets, time_sizes_after)
+            self._model.prepare_decode_inputs(token_cols, cache_offsets, time_sizes_after, sample_positions)
             for rq in self._active:
                 if rq is not None and not rq._done and not self._needs_prefill(rq):
                     rq._decode_state_prepared = True
@@ -160,8 +166,7 @@ class Scheduler:
                 continue
             if phase == "prefill" and self._needs_prefill(rq):
                 continue
-            t_idx = rq._last_sample_t_idx
-            tok = vals[b * t + t_idx]
+            tok = vals[b]
             rq._output_tokens.append(tok)
             if tok == self._model.stop_token_id():
                 rq._done = True

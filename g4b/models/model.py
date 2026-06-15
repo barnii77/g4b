@@ -20,6 +20,7 @@ class Model(ABC):
         token_cols: list[list[int]],
         cache_offsets: list[int],
         time_sizes_after: list[int],
+        sample_positions: list[int],
     ): ...
 
     @abstractmethod
@@ -28,6 +29,7 @@ class Model(ABC):
         token_cols: list[list[int]],
         cache_offsets: list[int],
         time_sizes_after: list[int],
+        sample_positions: list[int],
     ): ...
 
     @abstractmethod

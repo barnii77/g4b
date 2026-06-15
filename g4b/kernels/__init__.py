@@ -11,6 +11,7 @@ from . import rmsnorm
 from . import rsos
 from . import rope
 from . import sample_logits
+from . import select_t
 from . import update_residual_stream
 from . import utils
 
@@ -31,6 +32,7 @@ __all__ = [
     "rsos",
     "rope",
     "sample_logits",
+    "select_t",
     "update_residual_stream",
     "utils",
 ]

@@ -146,16 +146,18 @@ class LmHead:
     embeddings_DV_q5: Tensor
 
     # runtime state
-    logits_BtV_dtsamp: Tensor
+    input_B1D_dtr: Tensor
+    input_rsos_B1_dtss: Tensor
+    logits_B1V_dtsamp: Tensor
     logit_softcap: float  # TODO don't forget to epilogue fuse this into the residual->logits matmul
 
 
 @dataclass(frozen=True)
 class SamplingState:
     # runtime state
-    out_token_ids_Bt_int32: Tensor
-    top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp: Tensor
-    top_k_idx_scratchpad_Bt__num_splits__top_k__int32: Tensor
+    out_token_ids_B1_int32: Tensor
+    top_k_logits_scratchpad_B1__num_splits__top_k__dtsamp: Tensor
+    top_k_idx_scratchpad_B1__num_splits__top_k__int32: Tensor
     seed_2_int32: Tensor
     top_k: int
     top_p: float
@@ -186,6 +188,7 @@ class Gemma4E(Model):
     # would zero the sublayer sos before it's read -> inv_rms=rsqrt(eps)~1000 -> residual explosion.
     residual_rsos_Bt_dtss: Tensor
     input_token_ids_tB_int32: Tensor
+    sample_positions_B_int32: Tensor
     cache_offsets_B_int32: Tensor
     time_dim_sizes_B_int32: Tensor  # time dim is dynamically sized
     # TODO update this in separate kernel after sampling, update triggered by scheduler.py through some new Model method
@@ -210,8 +213,10 @@ class Gemma4E(Model):
         token_cols: list[list[int]],
         cache_offsets: list[int],
         time_sizes_after: list[int],
+        sample_positions: list[int],
     ):
         self._copy_tokens_t_by_b(token_cols)
+        self._copy_i32(self.sample_positions_B_int32, sample_positions)
         self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
         self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
         self._copy_u8(self.user_in_prefill_or_decode_B_uint8, [0] * self.batch_size)
@@ -221,19 +226,21 @@ class Gemma4E(Model):
         token_cols: list[list[int]],
         cache_offsets: list[int],
         time_sizes_after: list[int],
+        sample_positions: list[int],
     ):
         self._copy_tokens_t_by_b(token_cols)
+        self._copy_i32(self.sample_positions_B_int32, sample_positions)
         self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
         self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
         self._copy_u8(self.user_in_prefill_or_decode_B_uint8, [1] * self.batch_size)
 
     def collect_output_token_ids(self) -> list[int]:
-        n = self.batch_size * self.prefill_chunk_size
+        n = self.batch_size
         nbytes = 4 * n
         slot_idx = self.output_copy_ring_idx[0]
         self.output_copy_ring_idx[0] = (slot_idx + 1) % len(self.output_copy_ring)
         slot = self.output_copy_ring[slot_idx]
-        self.sampling_state.out_token_ids_Bt_int32.copy_to(slot.host_buf, slot.event)
+        self.sampling_state.out_token_ids_B1_int32.copy_to(slot.host_buf, slot.event)
         slot.event.sync()
         raw = ctypes.string_at(int(slot.host_buf.handle), nbytes)
         return list(struct.unpack(f"<{n}i", raw[: 4 * n]))
@@ -348,33 +355,38 @@ class Gemma4E(Model):
             self._dbg(f"L{i} act_rsos", act_rsos)
 
         self._dbg("final act_rsos (for logits)", act_rsos)
-        logits = _slice_t(self.lm_head.logits_BtV_dtsamp, t_now)
+        kernels.select_t.select_t(act, self.sample_positions_B_int32, self.lm_head.input_B1D_dtr)
+        kernels.select_t.select_t(
+            act_rsos.reshape((act_rsos.shape[0], act_rsos.shape[1], 1)),
+            self.sample_positions_B_int32,
+            self.lm_head.input_rsos_B1_dtss.reshape((self.lm_head.input_rsos_B1_dtss.shape[0], 1, 1)),
+        )
         matmul_a3d_b2d(
-            logits,
+            self.lm_head.logits_B1V_dtsamp,
             None,
-            act,
+            self.lm_head.input_B1D_dtr,
             self.embeddings.embeddings_VD_q5,
             transpose_b_before_mma=True,
-            input_rmsnorm_sum_of_squares=act_rsos,
+            input_rmsnorm_sum_of_squares=self.lm_head.input_rsos_B1_dtss,
             rmsnorm_eps=eps,
         )
-        self._dbg("logits", logits)
+        self._dbg("logits", self.lm_head.logits_B1V_dtsamp)
         kernels.sample_logits.sample_logits(
-            logits,
-            _slice_t(self.sampling_state.out_token_ids_Bt_int32, t_now),
+            self.lm_head.logits_B1V_dtsamp,
+            self.sampling_state.out_token_ids_B1_int32,
             self.sampling_state.seed_2_int32,
-            _slice_t(self.sampling_state.top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp, t_now),
-            _slice_t(self.sampling_state.top_k_idx_scratchpad_Bt__num_splits__top_k__int32, t_now),
+            self.sampling_state.top_k_logits_scratchpad_B1__num_splits__top_k__dtsamp,
+            self.sampling_state.top_k_idx_scratchpad_B1__num_splits__top_k__int32,
             self.sampling_state.temperature,
             self.sampling_state.top_k,
             self.sampling_state.top_p,
-            self.sampling_state.top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp.shape[2],
+            self.sampling_state.top_k_logits_scratchpad_B1__num_splits__top_k__dtsamp.shape[2],
             logit_softcap=self.lm_head.logit_softcap,
         )
         if phase == "decode":
             kernels.advance_decode_state.advance_decode_state(
                 self.input_token_ids_tB_int32,
-                self.sampling_state.out_token_ids_Bt_int32,
+                self.sampling_state.out_token_ids_B1_int32,
                 self.cache_offsets_B_int32,
                 self.time_dim_sizes_B_int32,
                 self.user_in_prefill_or_decode_B_uint8,
@@ -507,16 +519,16 @@ class Gemma4E(Model):
         assert isinstance(top_p, float)
         temperature = meta["general.sampling.temp"]
         assert isinstance(temperature, float)
-        out_token_ids = Tensor.alloc_empty(int32, [B, t])
+        out_token_ids = Tensor.alloc_empty(int32, [B, 1])
         num_sampling_splits = kernels.sample_logits.get_recommended_num_v_splits(V)
-        top_k_logits_scratchpad = Tensor.alloc_empty(DTSAMP, [B, t, num_sampling_splits, top_k])
-        top_k_idx_scratchpad = Tensor.alloc_empty(int32, [B, t, num_sampling_splits, top_k])
+        top_k_logits_scratchpad = Tensor.alloc_empty(DTSAMP, [B, 1, num_sampling_splits, top_k])
+        top_k_idx_scratchpad = Tensor.alloc_empty(int32, [B, 1, num_sampling_splits, top_k])
         seed = Tensor.alloc_empty(int32, [2])
         seed.copy_from_bytes_sync(struct.pack("<2i", 12345, 0))
         sampling_state = SamplingState(
-            out_token_ids_Bt_int32=out_token_ids,
-            top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp=top_k_logits_scratchpad,
-            top_k_idx_scratchpad_Bt__num_splits__top_k__int32=top_k_idx_scratchpad,
+            out_token_ids_B1_int32=out_token_ids,
+            top_k_logits_scratchpad_B1__num_splits__top_k__dtsamp=top_k_logits_scratchpad,
+            top_k_idx_scratchpad_B1__num_splits__top_k__int32=top_k_idx_scratchpad,
             seed_2_int32=seed,
             top_k=top_k,
             top_p=top_p,
@@ -550,13 +562,17 @@ class Gemma4E(Model):
         # lm head
         head_rmsnorm_w = Tensor.from_gguf_tensor(ts["output_norm.weight"])
         embeddings_DV = token_embeddings.transpose(0, 1)
-        logits_buf = Tensor.alloc_empty(DTSAMP, [B, t, V])
+        lm_head_input = Tensor.alloc_empty(DTR, [B, 1, D])
+        lm_head_input_rsos = Tensor.alloc_empty(DTSS, [B, 1])
+        logits_buf = Tensor.alloc_empty(DTSAMP, [B, 1, V])
         logit_softcap = meta["gemma4.final_logit_softcapping"]
         assert isinstance(logit_softcap, float)
         lm_head = LmHead(
             rmsnorm_w_D_fp32=head_rmsnorm_w,
             embeddings_DV_q5=embeddings_DV,
-            logits_BtV_dtsamp=logits_buf,
+            input_B1D_dtr=lm_head_input,
+            input_rsos_B1_dtss=lm_head_input_rsos,
+            logits_B1V_dtsamp=logits_buf,
             logit_softcap=logit_softcap,
         )
 
@@ -564,9 +580,11 @@ class Gemma4E(Model):
         residual = Tensor.alloc_empty(DTR, [B, t, D])
         residual_rsos = Tensor.alloc_empty(DTSS, [B, t])
         input_token_ids = Tensor.alloc_empty(int32, [t, B])
+        sample_positions = Tensor.alloc_empty(int32, [B])
         cache_offsets = Tensor.alloc_empty(int32, [B])
         time_dim_sizes = Tensor.alloc_empty(int32, [B])
         memset_contiguous(input_token_ids, 0)
+        memset_contiguous(sample_positions, 0)
         memset_contiguous(cache_offsets, 0)
         memset_contiguous(time_dim_sizes, 0)
         user_in_prefill_or_decode = Tensor.alloc_empty(uint8, [B])
@@ -748,6 +766,7 @@ class Gemma4E(Model):
             residual_BtD_dtr=residual,
             residual_rsos_Bt_dtss=residual_rsos,
             input_token_ids_tB_int32=input_token_ids,
+            sample_positions_B_int32=sample_positions,
             cache_offsets_B_int32=cache_offsets,
             time_dim_sizes_B_int32=time_dim_sizes,
             user_in_prefill_or_decode_B_uint8=user_in_prefill_or_decode,
