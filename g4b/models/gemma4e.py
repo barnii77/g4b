@@ -184,8 +184,8 @@ class Gemma4E(Model):
 
     # runtime state
     residual_BtD_dtr: Tensor
-    # TODO update this in separate kernel after sampling!
-    time_dim_offsets_B_int32: Tensor  # time dim is dynamically sized
+    # TODO update this in separate kernel BEFORE EMBEDDING!
+    time_dim_sizes_B_int32: Tensor  # time dim is dynamically sized
     # TODO update this in separate kernel after sampling, update triggered by scheduler.py through some new Model method
     user_in_prefill_or_decode_B_uint8: Tensor  # 0 -> prefill, 1 -> decode
 
@@ -272,8 +272,8 @@ class Gemma4E(Model):
 
         # create global state tensors
         residual = Tensor.alloc_empty(DTR, [B, t, D])
-        time_dim_offsets = Tensor.alloc_empty(int32, [B])
-        memset_contiguous(time_dim_offsets, 0)
+        time_dim_sizes = Tensor.alloc_empty(int32, [B])
+        memset_contiguous(time_dim_sizes, 0)
         user_in_prefill_or_decode = Tensor.alloc_empty(uint8, [B])
         memset_contiguous(user_in_prefill_or_decode, 0)
         rmsnorm_epsilon = meta["gemma4.attention.layer_norm_rms_epsilon"]
@@ -437,7 +437,7 @@ class Gemma4E(Model):
             sampling_state=sampling_state,
             rmsnorm_epsilon=rmsnorm_epsilon,
             residual_BtD_dtr=residual,
-            time_dim_offsets_B_int32=time_dim_offsets,
+            time_dim_sizes_B_int32=time_dim_sizes,
             user_in_prefill_or_decode_B_uint8=user_in_prefill_or_decode,
         )
         device.sync_all_streams()
