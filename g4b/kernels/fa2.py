@@ -18,6 +18,7 @@
 #  implies small M_tile and N_tile due to SMEM constraints.
 
 import triton
+from typing import Literal
 from triton import language as tl
 from g4b.tensor import Tensor
 from g4b.kernels.utils import launch, default_bencher
@@ -34,6 +35,10 @@ STAGE_CAUSAL_CONSTEXPR = tl.constexpr(STAGE_FULL | STAGE_ON_BAND)
 INNER_STAGE_OFF_BAND_CONSTEXPR = tl.constexpr(1)
 INNER_STAGE_ON_BAND_CONSTEXPR = tl.constexpr(2)
 INNER_STAGE_FULL_CONSTEXPR = tl.constexpr(3)
+PHASE_PREFILL = 0
+PHASE_DECODE = 1
+PHASE_PREFILL_CONSTEXPR = tl.constexpr(0)
+PHASE_DECODE_CONSTEXPR = tl.constexpr(1)
 
 
 @triton.jit
@@ -176,13 +181,13 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "k_cache_shape0", "k_cache_shape1", "k_cache_shape2", "k_cache_shape3",
         "v_cache_shape0", "v_cache_shape1", "v_cache_shape2", "v_cache_shape3",
         "o_shape0", "o_shape1", "o_shape2", "o_shape3",
-        "time_dim_sizes_shape0",
+        "time_dim_sizes_shape0", "user_in_prefill_or_decode_shape0",
         "q_stride0", "q_stride1", "q_stride2", "q_stride3",
         "k_cache_stride0", "k_cache_stride1", "k_cache_stride2", "k_cache_stride3",
         "v_cache_stride0", "v_cache_stride1", "v_cache_stride2", "v_cache_stride3",
         "o_stride0", "o_stride1", "o_stride2", "o_stride3",
-        "time_dim_sizes_stride0",
-        "ctx_window_size", "Q_BLOCKSIZE_H", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
+        "time_dim_sizes_stride0", "user_in_prefill_or_decode_stride0",
+        "ctx_window_size", "Q_BLOCKSIZE_H", "PHASE", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
         # fmt: on
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_configs},
@@ -192,19 +197,19 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
 @triton.jit
 def _attn_kernel(
     # fmt: off
-    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, time_dim_sizes_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, time_dim_sizes_ptr, user_in_prefill_or_decode_ptr,
     q_shape0: tl.constexpr, q_shape1: tl.constexpr, q_shape2: tl.constexpr, q_shape3: tl.constexpr,
     k_cache_shape0: tl.constexpr, k_cache_shape1: tl.constexpr, k_cache_shape2: tl.constexpr, k_cache_shape3: tl.constexpr,
     v_cache_shape0: tl.constexpr, v_cache_shape1: tl.constexpr, v_cache_shape2: tl.constexpr, v_cache_shape3: tl.constexpr,
     o_shape0: tl.constexpr, o_shape1: tl.constexpr, o_shape2: tl.constexpr, o_shape3: tl.constexpr,
-    time_dim_sizes_shape0: tl.constexpr,
+    time_dim_sizes_shape0: tl.constexpr, user_in_prefill_or_decode_shape0: tl.constexpr,
     q_stride0: tl.constexpr, q_stride1: tl.constexpr, q_stride2: tl.constexpr, q_stride3: tl.constexpr,
     k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
-    time_dim_sizes_stride0: tl.constexpr,
+    time_dim_sizes_stride0: tl.constexpr, user_in_prefill_or_decode_stride0: tl.constexpr,
     ctx_window_size: tl.constexpr, Q_BLOCKSIZE_H: tl.constexpr,
-    STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
+    PHASE: tl.constexpr, STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
     # fmt: on
 ):
@@ -216,6 +221,7 @@ def _attn_kernel(
     tl.static_assert(KV_BLOCKSIZE_T <= HEAD_DIM)
     tl.static_assert(q_shape0 == k_cache_shape0 and q_shape0 == v_cache_shape0 and q_shape0 == o_shape0)
     tl.static_assert(q_shape0 == time_dim_sizes_shape0)
+    tl.static_assert(q_shape0 == user_in_prefill_or_decode_shape0)
     tl.static_assert(q_shape1 == o_shape1 and q_shape2 == o_shape2 and q_shape3 == o_shape3)
     tl.static_assert(k_cache_shape1 == v_cache_shape1 and k_cache_shape2 == v_cache_shape2)
     tl.static_assert(q_shape3 == k_cache_shape3 and q_shape3 == v_cache_shape3)
@@ -235,6 +241,11 @@ def _attn_kernel(
     off_gqh = off_bgh % (G * Q_HEAD_TILES_PER_KV)
     off_kv_h = off_gqh // Q_HEAD_TILES_PER_KV
     off_q_h_tile = off_gqh % Q_HEAD_TILES_PER_KV
+
+    # if this kernel is doing decode, skip users in prefill, and vice versa
+    user_phase = tl.load(user_in_prefill_or_decode_ptr + off_b * user_in_prefill_or_decode_stride0)
+    if user_phase != PHASE:
+        return
 
     offs_q_h = off_kv_h * Q_HEADS_PER_KV + off_q_h_tile * Q_BLOCKSIZE_H + tl.arange(0, Q_BLOCKSIZE_H)[:, None, None]
     offs_q_t = start_m * Q_BLOCKSIZE_T + tl.arange(0, Q_BLOCKSIZE_T)[None, :, None]
@@ -342,7 +353,9 @@ def flash_attention(
     v_cache: Tensor,
     o: Tensor,
     time_dim_sizes: Tensor,
+    user_in_prefill_or_decode: Tensor,
     ctx_window_size: int,
+    phase: Literal["prefill", "decode"],
     *,
     use_grouped_query_tile: bool = True,
     warp_specialize: bool = False,
@@ -351,6 +364,12 @@ def flash_attention(
 ):
     q_heads_per_kv = q.shape[1] // k_cache.shape[1]
     q_blocksize_h = q_heads_per_kv if use_grouped_query_tile else 1
+    if phase == "prefill":
+        phase_id = PHASE_PREFILL
+    elif phase == "decode":
+        phase_id = PHASE_DECODE
+    else:
+        raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}")
     grid_fn = lambda META: (
         triton.cdiv(q.shape[2], META["Q_BLOCKSIZE_T"]),
         q.shape[0] * k_cache.shape[1] * triton.cdiv(q_heads_per_kv, q_blocksize_h),
@@ -361,8 +380,10 @@ def flash_attention(
         v_cache=v_cache,
         o=o,
         time_dim_sizes=time_dim_sizes,
+        user_in_prefill_or_decode=user_in_prefill_or_decode,
         ctx_window_size=int(ctx_window_size),
         Q_BLOCKSIZE_H=q_blocksize_h,
+        PHASE=phase_id,
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
         STAGE=stage,
