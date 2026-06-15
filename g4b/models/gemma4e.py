@@ -10,31 +10,6 @@ from g4b.utils import gguf_tensors_by_name
 from g4b import kernels, device
 from g4b.kernels.memset import memset_contiguous
 
-# TODO I can fuse the sum-of-squares computation of a decoder block's output rmsnorm into the last matmul (with
-#  atomic_add). Then, I make a specialized reduction kernel instead of the next layer's input rmsnorm which
-#  1) reads the sum-of-squares, divides by D and takes the root and computes the inverse -> inv_rms
-#  2) loads residual stream and output of last layer's last matmul which did the sum-of-squares accum
-#  3) new_resid = residual.load() + last_matmul_out.load() * inv_rms * last_rmsnorm_w.load(); residual.store(new_resid)
-#  4) immediately also computes a reduce-sum over new_resid and computes the new_resid_inv_rms from that
-#  5) prologue-fuses new_resid_inv_rms scaling before the next matmul after dequant, using block-scaled mma if avail.
-#  The end result of this is that you do 2 RMSNorms with 1 resid_stream_combine kernel and get the rest for ~free.
-#  This method can (and also kinda has to) be applied as well to the lm_head, since the lm head will receive not a clean
-#  residual stream but rather the second-to-last layer's residual stream plus the last layer's matmul output and sum of
-#  squares. Then you can again run this resid_stream_combine kernel instead of the lm head norm, and prologue fuse the scaling
-#  into the logits matmul. Then you just write out the logits to a bit tensor and run your sampling kernel.
-#  Also, in all this, I must not forget about DecoderLayer.layer_output_scale, so I guess I need a special case after
-#  the PLE layer. Remember, the layer output scale scales the entire residual stream, not just the decoder layer delta.
-#  I think this optimization needs to be documented somewhere.
-# TODO I could also do the above except I fuse the input RMSNorm w mult into the update_residual_stream kernel and
-#  then the rsos scaling of the input to the next layer's matmul actually happens in the matmul epilogue, since matmul
-#  is linear.
-
-# TODO think about how to handle sliding window attention... do I need a ring buffer KV cache?
-#  Hmm, actually I think I need a ring buffer KV cache for global attention too.
-#  Also how do I keep track of time (index in T dim) for RoPE?
-# TODO I need a temporary KV buffer for when the SWA window size is < chunked prefill size, from which I then memcpy to
-#  the actual KV cache (which is only 512 tokens long for SWA layers)
-
 # TODO if I wanted to support MoE models:
 #  I could allocate a tensor for every expert host-side, then build a cuda graph where the router kernel produces
 #  expert IDs and then there's cuda graph switch nodes over the produced token IDs which issue a memcpy of the relevant
