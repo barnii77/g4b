@@ -1,3 +1,6 @@
+# TODO separate Q (current from residual) from KV (cache) time dim size
+# TODO use context_window_offsets
+# TODO skip decode-batch-dim-indices for prefill and vice versa + more advanced job assignment based on per-B seq lens
 # TODO GQA support
 # TODO foreach KV group (GQA) I should load all corresponding queries in a single thread-block so I can get a
 #  ((g*tile_T1) x d_k) @ (d_k x tile_T2) tl.dot operation -> better arithmetic intensity than loading KV tiles for each
