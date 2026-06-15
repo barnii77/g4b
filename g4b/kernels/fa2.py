@@ -72,8 +72,6 @@ def _attn_inner(
     offs_d = tl.arange(0, HEAD_DIM)
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, KV_BLOCKSIZE_T, warp_specialize=WARP_SPECIALIZE):
-        start_n = tl.multiple_of(start_n, KV_BLOCKSIZE_T)
-
         # compute qk
         kv_logical_t = start_n + offs_n
         kv_mask = kv_logical_t < hi
@@ -303,7 +301,7 @@ def _attn_kernel(
     ).reshape((Q_BLOCKSIZE_H * Q_BLOCKSIZE_T, HEAD_DIM))
     offs_q_t_flat = offs_q_t.broadcast_to((Q_BLOCKSIZE_H, Q_BLOCKSIZE_T, 1)).reshape((Q_BLOCKSIZE_H * Q_BLOCKSIZE_T,))
     m_i = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T], dtype=tl.float32) + 1.0
+    l_i = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T], dtype=tl.float32)
     acc = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T, HEAD_DIM], dtype=tl.float32)
 
     # stage 1: off-band
@@ -430,7 +428,69 @@ def _attn_kernel(
         )
 
 
-# TODO autotune block sizes (and maybe somehow include the perf penalty of this kernel in the autotuner measurement of the main kernel for NUM_KV_SPLITS > 1)
+def _reduce_cfg(b: int, h: int, t: int, *, warps: int, stages: int = 3):
+    return triton.Config(
+        {
+            "BLOCKSIZE_B": b,
+            "BLOCKSIZE_H": h,
+            "BLOCKSIZE_T": t,
+        },
+        num_warps=warps,
+        num_stages=stages,
+    )
+
+
+def _reduce_configs():
+    return [
+        # fmt: off
+        _reduce_cfg(1, 1, 1, warps=1, stages=2),
+        _reduce_cfg(1, 2, 1, warps=1, stages=2),
+        _reduce_cfg(1, 4, 1, warps=2, stages=2),
+        _reduce_cfg(2, 1, 1, warps=1, stages=2),
+        _reduce_cfg(4, 1, 1, warps=2, stages=2),
+        _reduce_cfg(1, 1, 16, warps=2, stages=2),
+        _reduce_cfg(1, 2, 16, warps=4, stages=2),
+        _reduce_cfg(1, 4, 16, warps=4, stages=2),
+        _reduce_cfg(1, 1, 32, warps=4, stages=2),
+        _reduce_cfg(1, 2, 32, warps=4, stages=2),
+        _reduce_cfg(1, 1, 64, warps=4, stages=3),
+        _reduce_cfg(1, 2, 64, warps=4, stages=3),
+        # fmt: on
+    ]
+
+
+def _prune_invalid_reduce_configs(configs, named_args, **kwargs):
+    B = kwargs["o_shape0"]
+    H = kwargs["o_shape1"]
+    T = kwargs["o_shape2"]
+    return [
+        conf
+        for conf in configs
+        if conf.kwargs.get("BLOCKSIZE_B", 0) <= B
+        and conf.kwargs.get("BLOCKSIZE_H", 0) <= H
+        and conf.kwargs.get("BLOCKSIZE_T", 0) <= T
+    ]
+
+
+@triton.autotune(
+    configs=_reduce_configs(),
+    key=[
+        # fmt: off
+        "partial_o_shape0", "partial_o_shape1", "partial_o_shape2", "partial_o_shape3", "partial_o_shape4",
+        "partial_l_shape0", "partial_l_shape1", "partial_l_shape2", "partial_l_shape3",
+        "partial_m_shape0", "partial_m_shape1", "partial_m_shape2", "partial_m_shape3",
+        "o_shape0", "o_shape1", "o_shape2", "o_shape3",
+        "partial_o_stride0", "partial_o_stride1", "partial_o_stride2", "partial_o_stride3", "partial_o_stride4",
+        "partial_l_stride0", "partial_l_stride1", "partial_l_stride2", "partial_l_stride3",
+        "partial_m_stride0", "partial_m_stride1", "partial_m_stride2", "partial_m_stride3",
+        "o_stride0", "o_stride1", "o_stride2", "o_stride3",
+        "NUM_KV_SPLITS",
+        # fmt: on
+    ],
+    prune_configs_by={"early_config_prune": _prune_invalid_reduce_configs},
+    do_bench=default_bencher,
+    cache_results=True,
+)
 @triton.jit
 def _reduce_split_kv_kernel(
     # fmt: off
@@ -589,5 +649,6 @@ def flash_attention(
             partial_l=partial_l,
             partial_m=partial_m,
             o=o,
+            NUM_KV_SPLITS=selected_num_kv_splits,
         )
     return k1, k2
