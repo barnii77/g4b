@@ -371,6 +371,14 @@ class Gemma4E(Model):
             self.sampling_state.top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp.shape[2],
             logit_softcap=self.lm_head.logit_softcap,
         )
+        if phase == "decode":
+            kernels.advance_decode_state.advance_decode_state(
+                self.input_token_ids_tB_int32,
+                self.sampling_state.out_token_ids_Bt_int32,
+                self.cache_offsets_B_int32,
+                self.time_dim_sizes_B_int32,
+                self.user_in_prefill_or_decode_B_uint8,
+            )
 
     def _prepare_ple(self, token_ids: Tensor, residual: Tensor, t_now: int):
         B, _, D = residual.shape

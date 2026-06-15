@@ -1,4 +1,5 @@
 from . import add_kv_to_cache
+from . import advance_decode_state
 from . import elementwise_ops
 from . import embeddings
 from . import fa2
@@ -18,6 +19,7 @@ from . import utils
 
 __all__ = [
     "add_kv_to_cache",
+    "advance_decode_state",
     "elementwise_ops",
     "embeddings",
     "fa2",

@@ -20,6 +20,7 @@ class Request:
         self._prefill_pos = 0
         self._context_len = initial_context_len
         self._last_sample_t_idx = 0
+        self._decode_state_prepared = False
         self._done = False
 
     def get_new_tokens(self) -> list[int]:
@@ -67,6 +68,8 @@ class Scheduler:
                 self._active[i] = None
 
     def _fill_free_slots(self):
+        if any(rq is not None and self._needs_decode(rq) for rq in self._active):
+            return
         for i, rq in enumerate(self._active):
             if rq is not None and not rq._done:
                 continue
@@ -108,6 +111,7 @@ class Scheduler:
             rq._prefill_pos = end
             rq._context_len += real_n
             rq._last_sample_t_idx = real_n - 1
+            rq._decode_state_prepared = False
             # The model always processes a full t-wide chunk of query positions and writes t KV slots
             # starting at start_offset, so the attention window must span all t of them (start_offset + t),
             # NOT just the real_n valid tokens. FA derives q_t_base = window_size - t; using real_n here
@@ -124,6 +128,7 @@ class Scheduler:
         cache_offsets: list[int] = []
         time_sizes_after: list[int] = []
         phase_active: list[bool] = []
+        needs_upload = False
         for rq in self._active:
             if rq is None or rq._done or self._needs_prefill(rq):
                 token_cols.append([0] * t)
@@ -135,12 +140,17 @@ class Scheduler:
             tok = rq.input_tokens[-1] if not rq._output_tokens else rq._output_tokens[-1]
             token_cols.append([tok] * t)
             cache_offsets.append(rq._context_len)
+            needs_upload = needs_upload or not rq._decode_state_prepared
             rq._context_len += 1
             rq._last_sample_t_idx = 0
             time_sizes_after.append(rq._context_len)
 
         self._phase_active = phase_active
-        self._model.prepare_decode_inputs(token_cols, cache_offsets, time_sizes_after)
+        if needs_upload:
+            self._model.prepare_decode_inputs(token_cols, cache_offsets, time_sizes_after)
+            for rq in self._active:
+                if rq is not None and not rq._done and not self._needs_prefill(rq):
+                    rq._decode_state_prepared = True
 
     def _collect_outputs(self, phase: str):
         t = self._model.max_prefill_chunk_size()
