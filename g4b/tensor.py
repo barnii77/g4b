@@ -134,7 +134,10 @@ class Tensor:
         # TODO validate if this reshape is actually possible given the strides and update strides properly
         assert self.is_contiguous(), "reshape of non-contiguous tensor unsupported"
         shape = canonicalize_shape_for_size(shape, math.prod(self.shape))
-        return Tensor(self.buffer, self.dtype, shape, contiguous_strides_for_shape(shape), self._base_ptr_byte_offset)
+        strides = contiguous_strides_for_shape(shape)
+        if _is_quantized_dtype(self.dtype):
+            strides = _storage_based_strides_from_q_elem_strides(strides, self.dtype)
+        return Tensor(self.buffer, self.dtype, shape, strides, self._base_ptr_byte_offset)
 
     def view(self, dtype: DType) -> Tensor:
         # attempts to resize last dim, fails if shape[-1] or stride[-1] not divisible to cleanly fit new dtype
