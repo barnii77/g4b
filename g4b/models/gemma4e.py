@@ -172,6 +172,11 @@ class Gemma4E(Model):
 
     # runtime state
     residual_BtD_dtr: Tensor
+    # rolling sum-of-squares of the residual stream. MUST be a buffer distinct from the per-sublayer
+    # output-sos scratchpads: update_residual_stream reads the sublayer's output sos (act_rsos arg) and
+    # writes the new residual's sos here (out_rsos arg); if they aliased, the wrapper's memset(out_rsos,0)
+    # would zero the sublayer sos before it's read -> inv_rms=rsqrt(eps)~1000 -> residual explosion.
+    residual_rsos_Bt_dtss: Tensor
     input_token_ids_tB_int32: Tensor
     cache_offsets_B_int32: Tensor
     # TODO update this in separate kernel BEFORE EMBEDDING!
@@ -207,7 +212,7 @@ class Gemma4E(Model):
         eps = self.rmsnorm_epsilon
         residual = _slice_t(self.residual_BtD_dtr, t_now)
         act = _slice_t(self.layers[0].attn.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
-        act_rsos = _slice_t(self.layers[0].attn.shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss, t_now)
+        act_rsos = _slice_t(self.residual_rsos_Bt_dtss, t_now)
         residual_rsos = act_rsos
         token_ids = self.input_token_ids_tB_int32.slice_until(0, t_now)
 
@@ -375,8 +380,6 @@ class Gemma4E(Model):
             use_grouped_query_tile=True,
         )
         matmul_a3d_b2d(out, out_rsos, o_flat, attn.o_proj_hvD_q4, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
-        self._dbg("  o_proj out", out)
-        self._dbg("  o_proj out_rsos", out_rsos)
 
     def _mlp(self, mlp: MLP, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int):
         h = _slice_t(mlp.shared_down_proj_input_scratchpad_BtU_dth, t_now)
@@ -481,6 +484,7 @@ class Gemma4E(Model):
 
         # create global state tensors
         residual = Tensor.alloc_empty(DTR, [B, t, D])
+        residual_rsos = Tensor.alloc_empty(DTSS, [B, t])
         input_token_ids = Tensor.alloc_empty(int32, [t, B])
         cache_offsets = Tensor.alloc_empty(int32, [B])
         time_dim_sizes = Tensor.alloc_empty(int32, [B])
@@ -664,6 +668,7 @@ class Gemma4E(Model):
             rmsnorm_epsilon=rmsnorm_epsilon,
             identity_rmsnorm_w_D_fp32=identity_rmsnorm_w,
             residual_BtD_dtr=residual,
+            residual_rsos_Bt_dtss=residual_rsos,
             input_token_ids_tB_int32=input_token_ids,
             cache_offsets_B_int32=cache_offsets,
             time_dim_sizes_B_int32=time_dim_sizes,
