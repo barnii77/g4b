@@ -35,6 +35,10 @@ def canonicalize_shape_for_size(shape: Sequence[int], size: int) -> list[int]:
         raise RuntimeError(f"invalid shape {shape}: no dims less than -1 allowed")
     if shape.count(-1) > 1:
         raise RuntimeError(f"invalid shape {shape}: too many -1")
+    if -1 not in shape:
+        if math.prod(shape) != size:
+            raise RuntimeError(f"invalid shape {shape}: size mismatch with {size}")
+        return list(shape)
     dim_idx = shape.index(-1)
     dim_size = to_int_exact(size / -math.prod(shape))
     return [*shape[:dim_idx], dim_size, *shape[dim_idx + 1:]]

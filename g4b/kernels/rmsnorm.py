@@ -94,6 +94,70 @@ def finish_rmsnorm_inplace(x: Tensor, x_rsos: Tensor, x_rmsnorm_w: Tensor, epsil
     )
 
 
+@triton.jit
+def _finish_rmsnorm_out_kernel(
+    x_ptr,
+    y_ptr,
+    x_rsos_ptr,
+    x_rmsnorm_w_ptr,
+    x_shape0: tl.constexpr,
+    x_shape1: tl.constexpr,
+    y_shape0: tl.constexpr,
+    y_shape1: tl.constexpr,
+    x_rsos_shape0: tl.constexpr,
+    x_rmsnorm_w_shape0: tl.constexpr,
+    x_stride0: tl.constexpr,
+    x_stride1: tl.constexpr,
+    y_stride0: tl.constexpr,
+    y_stride1: tl.constexpr,
+    x_rsos_stride0: tl.constexpr,
+    x_rmsnorm_w_stride0: tl.constexpr,
+    epsilon: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr,
+    BLOCKSIZE1: tl.constexpr,
+):
+    tl.static_assert(x_shape0 == y_shape0)
+    tl.static_assert(x_shape1 == y_shape1)
+    tl.static_assert(x_rsos_shape0 == x_shape0)
+    tl.static_assert(x_rmsnorm_w_shape0 == x_shape1)
+
+    pid_b = tl.program_id(1)
+    pid_d = tl.program_id(0)
+    offs_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None]
+    offs_d = pid_d * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :]
+    mask = (offs_b < x_shape0) & (offs_d < x_shape1)
+
+    x = tl.load(x_ptr + offs_b * x_stride0 + offs_d * x_stride1, mask=mask)
+    rsos = tl.load(x_rsos_ptr + offs_b * x_rsos_stride0, mask=offs_b < x_rsos_shape0)
+    w = tl.load(x_rmsnorm_w_ptr + offs_d * x_rmsnorm_w_stride0, mask=offs_d < x_rmsnorm_w_shape0)
+    y = x * tl.rsqrt(rsos / x_shape1 + epsilon) * w
+    tl.store(y_ptr + offs_b * y_stride0 + offs_d * y_stride1, y, mask=mask)
+
+
+def finish_rmsnorm_out(x: Tensor, y: Tensor, x_rsos: Tensor, x_rmsnorm_w: Tensor, epsilon: float):
+    assert x.shape == y.shape
+    assert x.shape[:-1] == x_rsos.shape
+    assert x.shape[-1:] == x_rmsnorm_w.shape
+    x = x.reshape((-1, x.shape[-1]))
+    y = y.reshape((-1, y.shape[-1]))
+    x_rsos = x_rsos.reshape((-1,))
+    x_rmsnorm_w = x_rmsnorm_w.reshape((-1,))
+    grid_fn = lambda META: (
+        triton.cdiv(x.shape[1], META["BLOCKSIZE1"]),
+        triton.cdiv(x.shape[0], META["BLOCKSIZE0"]),
+    )
+    return launch[_finish_rmsnorm_out_kernel, grid_fn](
+        x=x,
+        y=y,
+        x_rsos=x_rsos,
+        x_rmsnorm_w=x_rmsnorm_w,
+        epsilon=epsilon,
+        BLOCKSIZE0=1,
+        BLOCKSIZE1=1024,
+        num_warps=4,
+    )
+
+
 # to do take epsilon parameter
 # to do autotune block sizes
 @triton.jit

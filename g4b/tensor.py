@@ -112,6 +112,11 @@ class Tensor:
             raise RuntimeError("unsupported for slice_at tensors")
         return _copy_dtoh_sync(self.buffer)  # TODO use tensor shape and dtype size to transfer only relevant chunk
 
+    def copy_from_bytes_sync(self, data: bytes | bytearray | memoryview):
+        if self._base_ptr_byte_offset != 0:
+            raise RuntimeError("unsupported for slice_at tensors")
+        _copy_htod_sync(self.buffer, data)
+
     def copy_to(self, dst: Buffer, event: Event):
         # TODO replace with cuda runtime api calls so I can support self._base_ptr_byte_offset != 0
         if self._base_ptr_byte_offset != 0:
@@ -120,7 +125,10 @@ class Tensor:
         return device.stream.record(event)
 
     def is_contiguous(self) -> bool:
-        return self.stride == contiguous_strides_for_shape(self.shape)
+        expected = contiguous_strides_for_shape(self.shape)
+        if _is_quantized_dtype(self.dtype):
+            expected = _storage_based_strides_from_q_elem_strides(expected, self.dtype)
+        return list(self.stride) == expected
 
     def reshape(self, shape: Sequence[int]) -> Tensor:
         # TODO validate if this reshape is actually possible given the strides and update strides properly

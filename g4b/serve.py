@@ -74,7 +74,14 @@ class _UserChatManager:
         self.token_buf: list[int] = []
 
     def _drain_token_buffer_as_far_as_possible(self) -> list[_ModelOutput]:
-        return []  # TODO if syntactically incomplete tool call, do not drain that partial call yet
+        if not self.token_buf:
+            return []
+        toks = self.token_buf
+        self.token_buf = []
+        if _tokenizer.eos in toks:
+            toks = toks[: toks.index(_tokenizer.eos)]
+        text = _tokenizer.detokenize(toks)
+        return [tokenizer_mod.ResponseFragment(text)] if text else []
 
     async def continue_processing(self):
         while True:

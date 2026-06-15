@@ -1,11 +1,13 @@
 import argparse
+import traceback
 import warnings
 from pathlib import Path
 from g4b.config import Config
 from g4b.scheduler import Scheduler
 from g4b.tokenizer import Tokenizer, ChatTemplate
 from g4b.models import models
-from g4b import gguf, device, serve
+from g4b import gguf, device, serve, lifecycle
+from g4b.interaction_generator import submit_generated_interactions
 
 
 def parse_args():
@@ -48,6 +50,33 @@ def main():
     tokenizer = Tokenizer(config, gguf_meta)
     chat_template = ChatTemplate(config, gguf_meta)
 
+    lifecycle.complete_phase("init")
+    submit_generated_interactions(
+        scheduler,
+        tokenizer,
+        chat_template,
+        config.batch_size,
+        max_prompt_tokens=config.prefill_chunk_size,
+        max_context_len=config.context_len,
+    )
+    scheduler.step()  # warmup prefill graph path / autotune
+    scheduler.step()  # warmup decode graph path / autotune
+
+    lifecycle.complete_phase("warmup")
+    scheduler.reset()
+    submit_generated_interactions(
+        scheduler,
+        tokenizer,
+        chat_template,
+        config.batch_size,
+        max_prompt_tokens=config.prefill_chunk_size,
+        max_context_len=config.context_len,
+    )
+    scheduler.step()  # record prefill graph
+    scheduler.step()  # record decode graph
+    lifecycle.complete_phase("record")
+    scheduler.reset()
+
     serve.register_scheduler(scheduler)
     serve.register_tokenizer(tokenizer)
     serve.register_chat_template(chat_template)
@@ -57,7 +86,7 @@ def main():
         while True:
             scheduler.step()
     except Exception:
-        pass
+        traceback.print_exc()
 
     uvicorn.stop()
     device.teardown()
