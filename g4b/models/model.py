@@ -6,10 +6,38 @@ from g4b import scheduler
 
 class Model(ABC):
     @abstractmethod
-    def decode(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
+    def max_batch_size(self) -> int: ...
 
     @abstractmethod
-    def prefill_chunk(self, sched: "scheduler.Scheduler"): ...  # TODO other params?
+    def max_prefill_chunk_size(self) -> int: ...
+
+    @abstractmethod
+    def stop_token_id(self) -> int: ...
+
+    @abstractmethod
+    def prepare_prefill_inputs(
+        self,
+        token_cols: list[list[int]],
+        cache_offsets: list[int],
+        time_sizes_after: list[int],
+    ): ...
+
+    @abstractmethod
+    def prepare_decode_inputs(
+        self,
+        token_cols: list[list[int]],
+        cache_offsets: list[int],
+        time_sizes_after: list[int],
+    ): ...
+
+    @abstractmethod
+    def collect_output_token_ids(self) -> list[int]: ...
+
+    @abstractmethod
+    def decode(self, sched: "scheduler.Scheduler"): ...
+
+    @abstractmethod
+    def prefill_chunk(self, sched: "scheduler.Scheduler"): ...
 
     @classmethod
     @abstractmethod

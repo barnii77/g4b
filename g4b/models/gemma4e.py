@@ -1,8 +1,10 @@
+import ctypes
 import math
 import os
 import struct
 import warnings
 from dataclasses import dataclass
+from cuda.core import Buffer, Event
 from g4b.gguf import GGUFMeta, GGUFTensor, GGUFType
 from g4b.models.model import Model
 from g4b.scheduler import Scheduler
@@ -161,6 +163,12 @@ class SamplingState:
 
 
 @dataclass(frozen=True)
+class OutputCopySlot:
+    host_buf: Buffer
+    event: Event
+
+
+@dataclass(frozen=True)
 class Gemma4E(Model):
     # parameters
     embeddings: Embeddings
@@ -179,13 +187,71 @@ class Gemma4E(Model):
     residual_rsos_Bt_dtss: Tensor
     input_token_ids_tB_int32: Tensor
     cache_offsets_B_int32: Tensor
-    # TODO update this in separate kernel BEFORE EMBEDDING!
     time_dim_sizes_B_int32: Tensor  # time dim is dynamically sized
     # TODO update this in separate kernel after sampling, update triggered by scheduler.py through some new Model method
     user_in_prefill_or_decode_B_uint8: Tensor  # 0 -> prefill, 1 -> decode
+    output_copy_ring: tuple[OutputCopySlot, ...]
+    output_copy_ring_idx: list[int]
     batch_size: int
     prefill_chunk_size: int
     eos_token_id: int
+
+    def max_batch_size(self) -> int:
+        return self.batch_size
+
+    def max_prefill_chunk_size(self) -> int:
+        return self.prefill_chunk_size
+
+    def stop_token_id(self) -> int:
+        return self.eos_token_id
+
+    def prepare_prefill_inputs(
+        self,
+        token_cols: list[list[int]],
+        cache_offsets: list[int],
+        time_sizes_after: list[int],
+    ):
+        self._copy_tokens_t_by_b(token_cols)
+        self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
+        self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
+        self._copy_u8(self.user_in_prefill_or_decode_B_uint8, [0] * self.batch_size)
+
+    def prepare_decode_inputs(
+        self,
+        token_cols: list[list[int]],
+        cache_offsets: list[int],
+        time_sizes_after: list[int],
+    ):
+        self._copy_tokens_t_by_b(token_cols)
+        self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
+        self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
+        self._copy_u8(self.user_in_prefill_or_decode_B_uint8, [1] * self.batch_size)
+
+    def collect_output_token_ids(self) -> list[int]:
+        n = self.batch_size * self.prefill_chunk_size
+        nbytes = 4 * n
+        slot_idx = self.output_copy_ring_idx[0]
+        self.output_copy_ring_idx[0] = (slot_idx + 1) % len(self.output_copy_ring)
+        slot = self.output_copy_ring[slot_idx]
+        self.sampling_state.out_token_ids_Bt_int32.copy_to(slot.host_buf, slot.event)
+        slot.event.sync()
+        raw = ctypes.string_at(int(slot.host_buf.handle), nbytes)
+        return list(struct.unpack(f"<{n}i", raw[: 4 * n]))
+
+    def _copy_tokens_t_by_b(self, token_cols: list[list[int]]):
+        vals = []
+        for tt in range(self.prefill_chunk_size):
+            for b in range(self.batch_size):
+                vals.append(token_cols[b][tt])
+        self._copy_i32(self.input_token_ids_tB_int32, vals)
+
+    @staticmethod
+    def _copy_i32(tensor: Tensor, vals: list[int]):
+        tensor.copy_from_bytes_sync(struct.pack(f"<{len(vals)}i", *vals))
+
+    @staticmethod
+    def _copy_u8(tensor: Tensor, vals: list[int]):
+        tensor.copy_from_bytes_sync(bytes(vals))
 
     @record_static_cuda_graph
     def decode(self, sched: Scheduler):
@@ -447,6 +513,10 @@ class Gemma4E(Model):
             top_p=top_p,
             temperature=temperature,
         )
+        output_copy_nbytes = int32.sizeof_tensor(out_token_ids.shape)
+        output_copy_ring = tuple(
+            OutputCopySlot(device.alloc_pinned_host(output_copy_nbytes), device.event()) for _ in range(4)
+        )
 
         # embeddings
         token_embeddings = Tensor.from_gguf_tensor(ts["token_embd.weight"])
@@ -672,6 +742,8 @@ class Gemma4E(Model):
             cache_offsets_B_int32=cache_offsets,
             time_dim_sizes_B_int32=time_dim_sizes,
             user_in_prefill_or_decode_B_uint8=user_in_prefill_or_decode,
+            output_copy_ring=output_copy_ring,
+            output_copy_ring_idx=[0],
             batch_size=B,
             prefill_chunk_size=t,
             eos_token_id=meta["tokenizer.ggml.eos_token_id"],
