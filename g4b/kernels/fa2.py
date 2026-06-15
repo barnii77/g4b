@@ -155,15 +155,19 @@ def _configs():
         _cfg(16, 32, 1, warps=4, stages=2),
         _cfg(16, 64, 1, warps=4, stages=3),
         _cfg(16, 128, 1, warps=4, stages=3),
+        _cfg(16, 256, 1, warps=4, stages=3),
         _cfg(32, 32, 1, warps=4, stages=2),
         _cfg(32, 64, 1, warps=4, stages=3),
         _cfg(32, 128, 1, warps=4, stages=3),
+        _cfg(32, 256, 1, warps=4, stages=3),
         _cfg(64, 32, 1, warps=4, stages=2),
         _cfg(64, 64, 1, warps=4, stages=3),
         _cfg(64, 128, 1, warps=4, stages=3),
+        _cfg(64, 256, 1, warps=4, stages=3),
         _cfg(128, 32, 1, warps=4, stages=2),
         _cfg(128, 64, 1, warps=4, stages=3),
         _cfg(128, 128, 1, warps=8, stages=3),
+        _cfg(128, 256, 1, warps=8, stages=3),
         # fmt: on
     ]
 
@@ -390,6 +394,9 @@ def _attn_kernel(
         acc = acc.reshape((Q_BLOCKSIZE_H, Q_BLOCKSIZE_T, HEAD_DIM))
         l_i = l_i.reshape((Q_BLOCKSIZE_H, Q_BLOCKSIZE_T))
         m_i = m_i.reshape((Q_BLOCKSIZE_H, Q_BLOCKSIZE_T))
+        offs_q_h_2d = off_kv_h * Q_HEADS_PER_KV + off_q_h_tile * Q_BLOCKSIZE_H + tl.arange(0, Q_BLOCKSIZE_H)[:, None]
+        offs_q_t_2d = start_m * Q_BLOCKSIZE_T + tl.arange(0, Q_BLOCKSIZE_T)[None, :]
+        q_mask_2d = offs_q_t_2d < Q_CTX
         tl.store(
             partial_o_ptr
             + off_kv_split * partial_o_stride0
@@ -404,19 +411,19 @@ def _attn_kernel(
             partial_l_ptr
             + off_kv_split * partial_l_stride0
             + off_b * partial_l_stride1
-            + offs_q_h[:, :, 0] * partial_l_stride2
-            + offs_q_t[:, :, 0] * partial_l_stride3,
+            + offs_q_h_2d * partial_l_stride2
+            + offs_q_t_2d * partial_l_stride3,
             l_i,
-            mask=q_mask[:, :, 0],
+            mask=q_mask_2d,
         )
         tl.store(
             partial_m_ptr
             + off_kv_split * partial_m_stride0
             + off_b * partial_m_stride1
-            + offs_q_h[:, :, 0] * partial_m_stride2
-            + offs_q_t[:, :, 0] * partial_m_stride3,
+            + offs_q_h_2d * partial_m_stride2
+            + offs_q_t_2d * partial_m_stride3,
             m_i,
-            mask=q_mask[:, :, 0],
+            mask=q_mask_2d,
         )
     else:
         acc = acc / l_i[:, None]
