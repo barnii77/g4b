@@ -158,6 +158,45 @@ def finish_rmsnorm_out(x: Tensor, y: Tensor, x_rsos: Tensor, x_rmsnorm_w: Tensor
     )
 
 
+@triton.jit
+def _apply_weight_out_kernel(
+    x_ptr, y_ptr, w_ptr,
+    x_shape0: tl.constexpr, x_shape1: tl.constexpr,
+    w_shape0: tl.constexpr,
+    x_stride0: tl.constexpr, x_stride1: tl.constexpr,
+    y_stride0: tl.constexpr, y_stride1: tl.constexpr,
+    w_stride0: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr,
+):
+    # y = x * w  (w is a per-feature row vector, broadcast over rows). No normalization: the consuming
+    # matmul applies the rmsnorm division via input_rmsnorm_sum_of_squares so that act buffers are uniformly
+    # "residual * input_weight" (unnormalized) across all layers.
+    tl.static_assert(w_shape0 == x_shape1)
+    pid_b = tl.program_id(1)
+    pid_d = tl.program_id(0)
+    offs_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None]
+    offs_d = pid_d * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :]
+    mask = (offs_b < x_shape0) & (offs_d < x_shape1)
+    x = tl.load(x_ptr + offs_b * x_stride0 + offs_d * x_stride1, mask=mask)
+    w = tl.load(w_ptr + offs_d * w_stride0, mask=offs_d < w_shape0)
+    tl.store(y_ptr + offs_b * y_stride0 + offs_d * y_stride1, x * w, mask=mask)
+
+
+def apply_weight_out(x: Tensor, y: Tensor, w: Tensor):
+    assert x.shape == y.shape
+    assert x.shape[-1:] == w.shape
+    x = x.reshape((-1, x.shape[-1]))
+    y = y.reshape((-1, y.shape[-1]))
+    w = w.reshape((-1,))
+    grid_fn = lambda META: (
+        triton.cdiv(x.shape[1], META["BLOCKSIZE1"]),
+        triton.cdiv(x.shape[0], META["BLOCKSIZE0"]),
+    )
+    return launch[_apply_weight_out_kernel, grid_fn](
+        x=x, y=y, w=w, BLOCKSIZE0=1, BLOCKSIZE1=1024, num_warps=4,
+    )
+
+
 # to do take epsilon parameter
 # to do autotune block sizes
 @triton.jit

@@ -125,10 +125,13 @@ class Tensor:
         return device.stream.record(event)
 
     def is_contiguous(self) -> bool:
+        # PyTorch-style: size-1 dims may carry any stride and do not break contiguity. This matters because
+        # prefix-slicing the time dim of a [B, t, ...] buffer down to t_now=1 (or B=1) leaves the sliced dim's
+        # stride at the full-buffer value, yet the underlying data block is still contiguous.
         expected = contiguous_strides_for_shape(self.shape)
         if _is_quantized_dtype(self.dtype):
             expected = _storage_based_strides_from_q_elem_strides(expected, self.dtype)
-        return list(self.stride) == expected
+        return all(self.stride[i] == expected[i] for i in range(len(self.shape)) if self.shape[i] != 1)
 
     def reshape(self, shape: Sequence[int]) -> Tensor:
         # TODO validate if this reshape is actually possible given the strides and update strides properly
@@ -138,6 +141,44 @@ class Tensor:
         if _is_quantized_dtype(self.dtype):
             strides = _storage_based_strides_from_q_elem_strides(strides, self.dtype)
         return Tensor(self.buffer, self.dtype, shape, strides, self._base_ptr_byte_offset)
+
+    def flatten_leading_dims_preserve_last(self) -> Tensor:
+        assert len(self.shape) >= 2
+        return self.merge_leading_dims(1)
+
+    def merge_leading_dims(self, num_keep: int) -> Tensor:
+        # Collapse all but the last `num_keep` dims into a single leading dim, keeping the trailing
+        # dims as-is. Tolerates size-1 leading dims (whose stride is irrelevant), so a prefix-sliced
+        # buffer like [1, t_now, H, D] (sliced from [1, t, H, D]) can still be merged on the batch dim.
+        assert 0 <= num_keep <= len(self.shape)
+        n_lead = len(self.shape) - num_keep
+        keep_shape = list(self.shape[n_lead:])
+        keep_stride = list(self.stride[n_lead:])
+        lead_shape = list(self.shape[:n_lead])
+        lead_stride = list(self.stride[:n_lead])
+        merged_size = math.prod(lead_shape) if lead_shape else 1
+        non_unit = [(s, st) for s, st in zip(lead_shape, lead_stride) if s != 1]
+        for i in range(len(non_unit) - 1):
+            assert non_unit[i][1] == non_unit[i + 1][0] * non_unit[i + 1][1], (
+                "leading dims are not contiguous and cannot be merged into a single stride"
+            )
+        if non_unit:
+            merged_stride = non_unit[-1][1]
+        elif keep_stride:
+            merged_stride = keep_shape[0] * keep_stride[0]
+        else:
+            merged_stride = 1
+        return Tensor(
+            self.buffer,
+            self.dtype,
+            [merged_size, *keep_shape],
+            [merged_stride, *keep_stride],
+            self._base_ptr_byte_offset,
+        )
+
+    def flatten_regular(self) -> Tensor:
+        assert len(self.shape) >= 1
+        return self.merge_leading_dims(0)
 
     def view(self, dtype: DType) -> Tensor:
         # attempts to resize last dim, fails if shape[-1] or stride[-1] not divisible to cleanly fit new dtype

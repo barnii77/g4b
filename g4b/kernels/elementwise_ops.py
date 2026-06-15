@@ -113,12 +113,12 @@ def _elementwise_2d(
     b_rsos: Tensor | None = None,
     b_rmsnorm_w: Tensor | None = None,
 ):
-    a = a.reshape((-1, a.shape[-1]))
-    out = out.reshape((-1, out.shape[-1]))
-    b = b.reshape((-1, b.shape[-1]))
+    a = a.flatten_leading_dims_preserve_last()
+    out = out.flatten_leading_dims_preserve_last()
+    b = b.flatten_leading_dims_preserve_last()
 
     if b_rsos is not None:
-        b_rsos = b_rsos.reshape((-1,))
+        b_rsos = b_rsos.flatten_regular()
     if b_rmsnorm_w is not None:
         b_rmsnorm_w = b_rmsnorm_w.reshape((-1,))
 

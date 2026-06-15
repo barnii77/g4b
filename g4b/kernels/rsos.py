@@ -45,8 +45,8 @@ def compute_rsos(x: Tensor, rsos: Tensor, scale: float = 1.0):
     assert rsos.shape == x.shape[:-1]
     assert rsos.is_contiguous(), "sum of squares buffer must be contiguous"
 
-    x = x.reshape((-1, x.shape[-2], x.shape[-1]))
-    rsos = rsos.reshape((-1, x.shape[1]))
+    x = x.merge_leading_dims(2)
+    rsos = rsos.merge_leading_dims(1)
 
     grid_fn = lambda META: (
         triton.cdiv(x.shape[2], META["BLOCKSIZE2"]),

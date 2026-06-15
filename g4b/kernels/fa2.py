@@ -84,8 +84,8 @@ def _attn_inner(
             + offs_d[None, :] * k_cache_stride3,
             mask=kv_mask[:, None],
             other=0.0,
-        ).T
-        qk = tl.dot(q, k)
+        ).to(tl.float16).T
+        qk = tl.dot(q.to(tl.float16), k)
         qk *= 1.44269504  # 1 / log(2), because this kernel uses exp2.
         qk = qk + tl.where(kv_mask[None, :], 0, -1.0e6)
 
@@ -122,7 +122,7 @@ def _attn_inner(
             + offs_d[None, :] * v_cache_stride3,
             mask=kv_mask[:, None],
             other=0.0,
-        )
+        ).to(tl.float16)
         p = p.to(tl.float16)
         acc = tl.dot(p, v, acc)
 
@@ -267,14 +267,15 @@ def _attn_kernel(
         tl.static_assert(partial_l_shape1 == o_shape0 and partial_l_shape2 == o_shape1 and partial_l_shape3 == o_shape2)
         tl.static_assert(partial_m_shape0 >= NUM_KV_SPLITS)
         tl.static_assert(partial_m_shape1 == o_shape0 and partial_m_shape2 == o_shape1 and partial_m_shape3 == o_shape2)
-    tl.static_assert(q_stride1 == q_shape2 * q_stride2 and q_stride0 == q_shape1 * q_stride1)
+    # NOTE: q and o are permuted views of physical [B, t, H, D] scratchpads, so they are NOT contiguous in
+    # [B, H, t, D] layout. The kernel only ever accesses them via explicit strides (loads/stores below), so
+    # contiguity is not required for correctness; do not assert it for q/o.
     tl.static_assert(
         k_cache_stride1 == k_cache_shape2 * k_cache_stride2 and k_cache_stride0 == k_cache_shape1 * k_cache_stride1
     )
     tl.static_assert(
         v_cache_stride1 == v_cache_shape2 * v_cache_stride2 and v_cache_stride0 == v_cache_shape1 * v_cache_stride1
     )
-    tl.static_assert(o_stride1 == o_shape2 * o_stride2 and o_stride0 == o_shape1 * o_stride1)
 
     start_m = tl.program_id(0)
     off_kv_split = tl.program_id(1)

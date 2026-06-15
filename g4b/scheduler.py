@@ -98,14 +98,21 @@ class Scheduler:
                 toks = [rq.input_tokens[max(0, len(rq.input_tokens) - 1)]]
             toks = toks + [toks[-1]] * (t - len(toks))
             token_cols.append(toks)
-            cache_offsets.append(rq._context_len)
+            start_offset = rq._context_len
+            cache_offsets.append(start_offset)
             rq._prefill_pos = end
             rq._context_len += real_n
             rq._last_sample_t_idx = real_n - 1
-            time_sizes_after.append(rq._context_len)
+            # The model always processes a full t-wide chunk of query positions and writes t KV slots
+            # starting at start_offset, so the attention window must span all t of them (start_offset + t),
+            # NOT just the real_n valid tokens. FA derives q_t_base = window_size - t; using real_n here
+            # would make q_t_base negative for a short/padded prompt, so every query attends to zero keys
+            # and produces 0/0 = NaN. _context_len still advances by real_n for the next step's offset.
+            time_sizes_after.append(start_offset + t)
             phases.append(0)
 
         self._copy_tokens_t_by_b(token_cols)
+        # TODO this and similar ops should be done in the model impl, not here. if needed, create new Model public methods.
         self._copy_i32(self._model.cache_offsets_B_int32, cache_offsets)
         self._copy_i32(self._model.time_dim_sizes_B_int32, time_sizes_after)
         self._copy_u8(self._model.user_in_prefill_or_decode_B_uint8, phases)

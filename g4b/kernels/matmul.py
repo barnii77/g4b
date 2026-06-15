@@ -24,6 +24,13 @@ from g4b.utils import contiguous_strides_for_shape
 #  custom format with better block layout at load time... However I fear such a repack would be lossy.
 
 
+def _contiguous_ignoring_unit_dims(shape, strides):
+    # size-1 dims may carry any stride (their data occupies nothing), so the underlying block is still
+    # contiguous. This lets t_now=1 / B=1 prefix slices pass the contiguity requirement.
+    expected = contiguous_strides_for_shape(shape)
+    return all(strides[i] == expected[i] for i in range(len(shape)) if shape[i] != 1)
+
+
 def _pre_hook(args):
     split_k = args["NUM_K_SPLITS"]
     shape = [args["c_shape0"], args["c_shape1"], args["c_shape2"]]
@@ -31,11 +38,11 @@ def _pre_hook(args):
     if args.get("c_rmsnorm_sum_of_squares_ptr") is not None:
         shape_norm = shape[:-1]
         strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
-        assert contiguous_strides_for_shape(shape_norm) == strides_norm, "sum of squares buffer must be contiguous"
+        assert _contiguous_ignoring_unit_dims(shape_norm, strides_norm), "sum of squares buffer must be contiguous"
         memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape[:-1]), 0)
     if split_k > 1:
         # TODO not inherently, but I don't want to write more memcpy kernels
-        assert contiguous_strides_for_shape(shape) == strides, "split k requires contiguous output buffer"
+        assert _contiguous_ignoring_unit_dims(shape, strides), "split k requires contiguous output buffer"
         if not args["KEEP_C"]:
             memset_contiguous_by_ptr(args["c_ptr"], math.prod(shape), 0)
 
@@ -302,14 +309,12 @@ def _matmul_a3d_b2d_kernel(
         # Handle upcasting.
         tl.static_assert(a.dtype == tl.float32 or a.dtype == tl.float16 or a.dtype == tl.bfloat16)
         tl.static_assert(b.dtype == tl.float32 or b.dtype == tl.float16 or b.dtype == tl.bfloat16)
-        tl.static_assert(a.dtype == b.dtype or a.dtype == tl.float32 or b.dtype == tl.float32)
-        if a.dtype == tl.float32 or b.dtype == tl.float32:
-            UPCAST_TY = tl.float32
-        elif a.dtype == b.dtype:
+        # If a and b have the same float dtype we keep it (fp16/bf16 -> tensor cores); otherwise (e.g. bf16
+        # activations against fp16-dequantized weights) we upcast both to fp32 for a correct, if slower, mma.
+        if a.dtype == b.dtype:
             UPCAST_TY = a.dtype
         else:
             UPCAST_TY = tl.float32
-            assert False
 
         a_upcast = a.to(UPCAST_TY)
 
@@ -396,7 +401,7 @@ def matmul_a3d_b2d_b_loader_jfn(
         or conceptual_dtype == tensor.q6_k.name
     )
     if not is_quantized:
-        return desc.load((off0, off1, off2))
+        return desc.load((off0, off1, off2)).to(tl.float16)
 
     # desc not used, we manually tl.load
     ptr_u8 = ptr.to(tl.pointer_type(tl.uint8))

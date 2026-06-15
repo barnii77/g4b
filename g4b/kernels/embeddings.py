@@ -3,6 +3,7 @@ from triton import language as tl
 from g4b.tensor import Tensor
 from g4b.kernels.utils import launch, default_bencher
 from g4b.kernels.memset import memset_contiguous
+from g4b.kernels.matmul import matmul_a3d_b2d_b_loader_jfn
 
 
 def _cfg(
@@ -27,30 +28,11 @@ def _cfg(
 @triton.autotune(
     # fmt: off
     configs=[
-        # ---- decode / tiny token count ----
-        # One token row per program, varying embedding-dim tile.
-        _cfg(1, 1, 64, warps=1),
-        _cfg(1, 1, 128, warps=2),
+        # The embedding table is K-quantized, so each program dequantizes ONE token row over a tile of the
+        # embedding dim (BLOCKSIZE2 must be a superblock-aligned >=32 column block). BLOCKSIZE0/1 are forced
+        # to 1 because the dequant loader handles a single row at a time.
         _cfg(1, 1, 256, warps=4),
-        # ---- small prefill / a few positions per program ----
-        _cfg(1, 2, 64, warps=1),
-        _cfg(1, 2, 128, warps=2),
-        _cfg(1, 2, 256, warps=4),
-        _cfg(1, 4, 64, warps=2),
-        _cfg(1, 4, 128, warps=4),
-        _cfg(1, 4, 256, warps=4),
-        # ---- more position batching ----
-        # Useful if token_ids are reasonably contiguous / output write is nicely laid out.
-        _cfg(1, 8, 64, warps=4),
-        _cfg(1, 8, 128, warps=4),
-        # ---- batch batching ----
-        # Useful if z batch dimension is small-but-nontrivial and z_stride0/z_stride1 are sane.
-        _cfg(2, 1, 64, warps=1),
-        _cfg(2, 1, 128, warps=2),
-        _cfg(2, 2, 64, warps=2),
-        _cfg(2, 2, 128, warps=4),
-        _cfg(4, 1, 64, warps=2),
-        _cfg(4, 1, 128, warps=4),
+        _cfg(1, 1, 256, warps=8),
     ],
     # fmt: on
     key=[
@@ -82,6 +64,7 @@ def _gather_token_embeddings_kernel(
     embed_stride0: tl.constexpr, embed_stride1: tl.constexpr,
     token_ids_stride0: tl.constexpr, token_ids_stride1: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
+    EMBED_DTYPE: tl.constexpr = None,
     z_rsos_ptr = None,
     z_rsos_shape0: tl.constexpr = 0, z_rsos_shape1: tl.constexpr = 0,
     z_rsos_stride0: tl.constexpr = 0, z_rsos_stride1: tl.constexpr = 0,
@@ -92,45 +75,37 @@ def _gather_token_embeddings_kernel(
     tl.static_assert(token_ids_shape1 == z_shape0)  # batch size
     tl.static_assert(z_rsos_shape0 == 0 or z_rsos_shape0 == z_shape0)
     tl.static_assert(z_rsos_shape1 == 0 or z_rsos_shape1 == z_shape1)
+    tl.static_assert(BLOCKSIZE0 == 1 and BLOCKSIZE1 == 1)  # dequant loader handles one token row per program
 
     pid_d = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_b = tl.program_id(2)
 
-    pid_off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)
-    pid_off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)
-    pid_off_d = pid_d * BLOCKSIZE2 + tl.arange(0, BLOCKSIZE2)
+    first_col = pid_d * BLOCKSIZE2
+    pid_off_b = pid_b + tl.arange(0, 1)
+    pid_off_t = pid_t + tl.arange(0, 1)
+    pid_off_d = first_col + tl.arange(0, BLOCKSIZE2)
 
-    rb_off_t = pid_off_t[None, :]
-    rb_off_b = pid_off_b[:, None]
-    rb_off = rb_off_t * token_ids_stride0 + rb_off_b * token_ids_stride1
+    # one (b, t) -> one row (token id) per program
+    token_id = tl.load(token_ids_ptr + pid_t * token_ids_stride0 + pid_b * token_ids_stride1)
 
-    token_ids = tl.load(
-        token_ids_ptr + rb_off,
-        mask=(rb_off_t < token_ids_shape0) & (rb_off_b < token_ids_shape1),
-        other=embed_shape0,
+    # dequantize embed[token_id, first_col : first_col + BLOCKSIZE2] -> tile shape (1, 1, BLOCKSIZE2)
+    embed_tile = matmul_a3d_b2d_b_loader_jfn(
+        "embed", None, 0, token_id, first_col, embed_ptr,
+        1, embed_shape0, embed_shape1,
+        0, embed_stride0, embed_stride1,
+        1, 1, BLOCKSIZE2,
+        EMBED_DTYPE,
     )
+    embeddings = scaling_factor * embed_tile.reshape((1, 1, BLOCKSIZE2)).to(z_ptr.dtype.element_ty)
 
-    embed_off_d = pid_off_d[None, None, :]
-    embed_off = token_ids[:, :, None] * embed_stride0 + embed_off_d * embed_stride1
-    embeddings = scaling_factor * tl.load(
-        embed_ptr + embed_off,
-        mask=(token_ids[:, :, None] < embed_shape0) & (embed_off_d < embed_shape1),
-    )
-
-    z_off_b = pid_off_b[:, None, None]
-    z_off_t = pid_off_t[None, :, None]
     z_off_d = pid_off_d[None, None, :]
-    z_off = z_off_b * z_stride0 + z_off_t * z_stride1 + z_off_d * z_stride2
-    tl.device_assert(z_off_b >= 0)
-    tl.device_assert(z_off_t >= 0)
-    tl.device_assert(z_off_d >= 0)
-
-    tl.store(z_ptr + z_off, embeddings, mask=(z_off_b < z_shape0) & (z_off_t < z_shape1) & (z_off_d < z_shape2))
+    z_off = pid_off_b[:, None, None] * z_stride0 + pid_off_t[None, :, None] * z_stride1 + z_off_d * z_stride2
+    tl.store(z_ptr + z_off, embeddings, mask=z_off_d < z_shape2)
     if z_rsos_ptr is not None:
         tl.atomic_add(
             z_rsos_ptr + pid_off_b[:, None] * z_rsos_stride0 + pid_off_t[None, :] * z_rsos_stride1,
-            (embeddings * embeddings).sum(-1),
+            (embeddings.to(tl.float32) * embeddings.to(tl.float32)).sum(-1),
             mask=(pid_off_b[:, None] < z_rsos_shape0) & (pid_off_t[None, :] < z_rsos_shape1),
         )
 
@@ -154,5 +129,6 @@ def gather_token_embeddings(
         embed=embed,
         token_ids=token_ids,
         scaling_factor=scaling_factor,
+        EMBED_DTYPE=embed.dtype.name,
     )
     return k1, k2

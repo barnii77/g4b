@@ -1,4 +1,5 @@
 import math
+import os
 import struct
 import warnings
 from dataclasses import dataclass
@@ -76,9 +77,9 @@ class Attention:
     shared_q_scratchpad_Bhtk_dta: Tensor
     shared_k_scratchpad_Bgtk_dta: Tensor
     shared_v_scratchpad_Bgtv_dta: Tensor
-    shared_q_rsos_Bht_dtss: Tensor
-    shared_k_rsos_Bgt_dtss: Tensor
-    shared_v_rsos_Bgt_dtss: Tensor
+    shared_q_rsos_Bth_dtss: Tensor
+    shared_k_rsos_Btg_dtss: Tensor
+    shared_v_rsos_Btg_dtss: Tensor
     shared_o_proj_input_scratchpad_Bhtv_dta: Tensor
     shared_last_and_this_layer_output_scratchpad_BtD_dtr: Tensor
     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss: Tensor
@@ -132,6 +133,7 @@ class Embeddings:
     # runtime state
     ple_LBtP_dtple: Tensor
     ple_proj_BtLP_dtple: Tensor
+    ple_lookup_BtLP_dtple: Tensor
     ple_proj_rsos_BtL_dtss: Tensor
 
 
@@ -188,6 +190,19 @@ class Gemma4E(Model):
     def prefill_chunk(self, sched: Scheduler):
         self._forward(t_now=self.prefill_chunk_size, phase="prefill")
 
+    def _dbg(self, label: str, t: Tensor):
+        if not os.environ.get("G4B_DBG"):
+            return
+        raw = t.to_bytes_sync()
+        n = math.prod(t.shape)
+        vals = struct.unpack(f"<{n}f", raw[: 4 * n])
+        nan = sum(1 for v in vals if v != v)
+        inf = sum(1 for v in vals if v == float("inf") or v == float("-inf"))
+        finite = [v for v in vals if v == v and abs(v) != float("inf")]
+        mn = min(finite) if finite else 0.0
+        mx = max(finite) if finite else 0.0
+        print(f"  [dbg] {label:32s} shape={list(t.shape)} nan={nan} inf={inf} min={mn:.4g} max={mx:.4g}")
+
     def _forward(self, t_now: int, phase: str):
         eps = self.rmsnorm_epsilon
         residual = _slice_t(self.residual_BtD_dtr, t_now)
@@ -203,17 +218,23 @@ class Gemma4E(Model):
             token_ids,
             math.sqrt(residual.shape[-1]),
         )
+        self._dbg("after gather embed (residual)", residual)
+        self._dbg("after gather embed (rsos)", residual_rsos)
         self._prepare_ple(token_ids, residual, t_now)
-        kernels.rmsnorm.finish_rmsnorm_out(
+        self._dbg("after prepare_ple (residual)", residual)
+        # act = residual * input_weight (UNnormalized). The q/k/v matmul normalizes by rms(residual) via
+        # input_rmsnorm_sum_of_squares=act_rsos, matching how later layers' act buffers are produced by
+        # update_residual_stream. residual_rsos already holds sos(residual) (set by gather_token_embeddings).
+        kernels.rmsnorm.apply_weight_out(
             residual,
             act,
-            residual_rsos,
             self.layers[0].attn.input_rmsnorm_w_D_fp32,
-            eps,
         )
 
+        self._dbg("after first rmsnorm (act)", act)
         for i, layer in enumerate(self.layers):
             self._attention(layer.attn, act, residual, act_rsos, t_now, phase)
+            self._dbg(f"L{i} after attention (attn out)", _slice_t(layer.attn.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now))
             next_w = layer.mlp.input_rmsnorm_w_D_fp32
             kernels.update_residual_stream.update_residual_stream(
                 residual,
@@ -225,7 +246,9 @@ class Gemma4E(Model):
                 eps,
             )
 
+            self._dbg(f"L{i} after attn resid (residual)", residual)
             self._mlp(layer.mlp, act, residual, act_rsos, t_now)
+            self._dbg(f"L{i} after mlp (mlp out)", _slice_t(layer.mlp.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now))
             kernels.update_residual_stream.update_residual_stream(
                 residual,
                 _slice_t(layer.mlp.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now),
@@ -236,7 +259,9 @@ class Gemma4E(Model):
                 eps,
             )
 
+            self._dbg(f"L{i} after mlp resid (residual)", residual)
             self._ple(layer.ple, residual, act_rsos, i, t_now)
+            self._dbg(f"L{i} after ple (ple out)", _slice_t(layer.ple.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now))
             next_layer_w = self.layers[i + 1].attn.input_rmsnorm_w_D_fp32 if i + 1 < len(self.layers) else self.lm_head.rmsnorm_w_D_fp32
             kernels.update_residual_stream.update_residual_stream(
                 residual,
@@ -248,7 +273,10 @@ class Gemma4E(Model):
                 eps,
                 layer.layer_output_scale_1_fp32,
             )
+            self._dbg(f"L{i} after ple resid (residual)", residual)
+            self._dbg(f"L{i} act_rsos", act_rsos)
 
+        self._dbg("final act_rsos (for logits)", act_rsos)
         logits = _slice_t(self.lm_head.logits_BtV_dtsamp, t_now)
         matmul_a3d_b2d(
             logits,
@@ -259,6 +287,7 @@ class Gemma4E(Model):
             input_rmsnorm_sum_of_squares=act_rsos,
             rmsnorm_eps=eps,
         )
+        self._dbg("logits", logits)
         kernels.sample_logits.sample_logits(
             logits,
             _slice_t(self.sampling_state.out_token_ids_Bt_int32, t_now),
@@ -269,22 +298,28 @@ class Gemma4E(Model):
             self.sampling_state.top_k,
             self.sampling_state.top_p,
             self.sampling_state.top_k_logits_scratchpad_Bt__num_splits__top_k__dtsamp.shape[2],
+            logit_softcap=self.lm_head.logit_softcap,
         )
 
     def _prepare_ple(self, token_ids: Tensor, residual: Tensor, t_now: int):
         B, _, D = residual.shape
         L = len(self.layers)
         P = self.embeddings.ple_rmsnorm_w_P_fp32.shape[0]
-        ple_lookup_flat = _slice_t(self.embeddings.ple_proj_BtLP_dtple, t_now)
+        # NOTE: ple_lookup and ple_proj MUST be separate buffers; they previously aliased the same buffer so the
+        # matmul overwrote the gathered lookup before the add (computing proj+norm(proj) instead of lookup+norm(proj)).
+        ple_lookup_flat = _slice_t(self.embeddings.ple_lookup_BtLP_dtple, t_now)
         ple_proj = _slice_t(self.embeddings.ple_proj_BtLP_dtple, t_now)
         ple_table = self.embeddings.ple_table_VLP_q5.reshape((self.embeddings.ple_table_VLP_q5.shape[0], L * P))
-        ple_proj_w = self.embeddings.ple_proj_DLP_bf16.reshape((D, L * P))
-        kernels.embeddings.gather_token_embeddings(ple_lookup_flat, None, ple_table, token_ids, 1.0)
-        matmul_a3d_b2d(ple_proj, None, residual, ple_proj_w, rmsnorm_eps=self.rmsnorm_epsilon)
+        # ple_proj_DLP_bf16 is stored conventionally as [L*P, D]; matmul computes residual @ W^T.
+        ple_proj_w = self.embeddings.ple_proj_DLP_bf16
+        # reference: ple_lookup = per_layer_embeddings[ids] * sqrt(ple_dim)
+        kernels.embeddings.gather_token_embeddings(ple_lookup_flat, None, ple_table, token_ids, math.sqrt(P))
+        matmul_a3d_b2d(ple_proj, None, residual, ple_proj_w, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
         ple_proj_4d = ple_proj.reshape((B, t_now, L, P))
         ple_lookup_4d = ple_lookup_flat.reshape((B, t_now, L, P))
         ple_rsos = _slice_t(self.embeddings.ple_proj_rsos_BtL_dtss, t_now)
-        kernels.rsos.compute_rsos(ple_proj_4d, ple_rsos, scale=D ** -1)
+        # rmsnorm is scale-invariant, so the reference's D^-0.5 on ple_proj cancels: just rmsnorm the raw projection.
+        kernels.rsos.compute_rsos(ple_proj_4d, ple_rsos, scale=1.0)
         for layer_idx in range(L):
             kernels.elementwise_ops.add(
                 ple_lookup_4d.slice_at(2, layer_idx),
@@ -301,22 +336,29 @@ class Gemma4E(Model):
         k_flat = _flat_head_out(attn.shared_k_scratchpad_Bgtk_dta, t_now)
         v_flat = _flat_head_out(attn.shared_v_scratchpad_Bgtv_dta, t_now)
         o_flat = _flat_head_out(attn.shared_o_proj_input_scratchpad_Bhtv_dta, t_now)
-        q_rsos = _slice_heads_t(attn.shared_q_rsos_Bht_dtss, t_now)
-        k_rsos = _slice_heads_t(attn.shared_k_rsos_Bgt_dtss, t_now)
-        v_rsos = _slice_heads_t(attn.shared_v_rsos_Bgt_dtss, t_now)
+        # rsos buffers are physically [B, t, n_heads]; compute_rsos needs a contiguous output whose shape
+        # matches the (contiguous, physical [B, t, H, D]) scratchpad's leading dims. We then hand a permuted
+        # [B, n_heads, t] *view* to rope / add_kv (those kernels read rsos purely via strides).
+        q_rsos_phys = _slice_t(attn.shared_q_rsos_Bth_dtss, t_now)
+        k_rsos_phys = _slice_t(attn.shared_k_rsos_Btg_dtss, t_now)
+        v_rsos_phys = _slice_t(attn.shared_v_rsos_Btg_dtss, t_now)
+        q_rsos = q_rsos_phys.permute((0, 2, 1))
+        k_rsos = k_rsos_phys.permute((0, 2, 1))
+        v_rsos = v_rsos_phys.permute((0, 2, 1))
         out_rsos = _slice_t(attn.shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss, t_now)
         out = _slice_t(attn.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
 
-        matmul_a3d_b2d(q_flat, None, act, attn.q_proj_Dhk_q4, rmsnorm_eps=self.rmsnorm_epsilon)
-        matmul_a3d_b2d(k_flat, None, act, attn.k_proj_Dgk_q6, rmsnorm_eps=self.rmsnorm_epsilon)
-        matmul_a3d_b2d(v_flat, None, act, attn.v_proj_Dgv_q6, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(q_flat, None, act, attn.q_proj_Dhk_q4, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(k_flat, None, act, attn.k_proj_Dgk_q6, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(v_flat, None, act, attn.v_proj_Dgv_q6, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
+        # compute rsos on the contiguous physical [B, t, n_heads, D] scratchpads
+        kernels.rsos.compute_rsos(_slice_t(attn.shared_q_scratchpad_Bhtk_dta, t_now), q_rsos_phys)
+        kernels.rsos.compute_rsos(_slice_t(attn.shared_k_scratchpad_Bgtk_dta, t_now), k_rsos_phys)
+        kernels.rsos.compute_rsos(_slice_t(attn.shared_v_scratchpad_Bgtv_dta, t_now), v_rsos_phys)
         q = _attn_view(attn.shared_q_scratchpad_Bhtk_dta, t_now)
         k = _attn_view(attn.shared_k_scratchpad_Bgtk_dta, t_now)
         v = _attn_view(attn.shared_v_scratchpad_Bgtv_dta, t_now)
         o = _attn_view(attn.shared_o_proj_input_scratchpad_Bhtv_dta, t_now)
-        kernels.rsos.compute_rsos(q, q_rsos)
-        kernels.rsos.compute_rsos(k, k_rsos)
-        kernels.rsos.compute_rsos(v, v_rsos)
         kernels.rope.apply_rope(q, k, attn.rope_freqs_k_fp32, self.cache_offsets_B_int32, q_rsos, k_rsos, attn.q_rmsnorm_w_k_fp32, attn.k_rmsnorm_w_k_fp32, self.rmsnorm_epsilon)
         if attn.owns_kv_cache:
             kernels.add_kv_to_cache.add_kv_to_cache(k, attn.k_cache_Bg__T_or_W__k__dtkv, self.cache_offsets_B_int32, self.rmsnorm_epsilon)
@@ -332,14 +374,16 @@ class Gemma4E(Model):
             phase,
             use_grouped_query_tile=True,
         )
-        matmul_a3d_b2d(out, out_rsos, o_flat, attn.o_proj_hvD_q4, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(out, out_rsos, o_flat, attn.o_proj_hvD_q4, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
+        self._dbg("  o_proj out", out)
+        self._dbg("  o_proj out_rsos", out_rsos)
 
     def _mlp(self, mlp: MLP, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int):
         h = _slice_t(mlp.shared_down_proj_input_scratchpad_BtU_dth, t_now)
         out = _slice_t(mlp.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
         out_rsos = _slice_t(mlp.shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss, t_now)
-        matmul_a3d_b2d(h, None, act, mlp.up_proj_DU_q4, mlp.gate_proj_DU_q4, c_c2_merge_tiles_fn=geglu_fusion_matmul_merge_tiles_mixin_jfn, rmsnorm_eps=self.rmsnorm_epsilon)
-        matmul_a3d_b2d(out, out_rsos, h, mlp.down_proj_UD_q6, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(h, None, act, mlp.up_proj_DU_q4, mlp.gate_proj_DU_q4, c_c2_merge_tiles_fn=geglu_fusion_matmul_merge_tiles_mixin_jfn, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(out, out_rsos, h, mlp.down_proj_UD_q6, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
 
     def _ple(self, ple: PerLayerEmbeddings, residual: Tensor, act_rsos: Tensor, layer_idx: int, t_now: int):
         P = ple.shared_out_proj_input_scratchpad_BtP_dtple.shape[-1]
@@ -347,8 +391,9 @@ class Gemma4E(Model):
         h = _slice_t(ple.shared_out_proj_input_scratchpad_BtP_dtple, t_now)
         out = _slice_t(ple.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
         out_rsos = _slice_t(ple.shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss, t_now)
-        matmul_a3d_b2d(h, None, residual, ple.gate_proj_DP_fp32, storer_extra=ple_vals, storer_fn=ple_gate_storer_jfn, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
-        matmul_a3d_b2d(out, out_rsos, h, ple.out_proj_PD_fp32, rmsnorm_eps=self.rmsnorm_epsilon)
+        # reference PLE applies gate_proj to the RAW residual (no input rmsnorm): gate = gelu(gate_proj(x)).
+        matmul_a3d_b2d(h, None, residual, ple.gate_proj_DP_fp32, storer_extra=ple_vals, storer_fn=ple_gate_storer_jfn, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(out, out_rsos, h, ple.out_proj_PD_fp32, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon)
 
     # TODO the attn kernel needs two separate args: clen and T (though one is derived from the other I guess)
     @classmethod
@@ -408,6 +453,7 @@ class Gemma4E(Model):
         ple_norm = Tensor.from_gguf_tensor(ts["per_layer_proj_norm.weight"])
         ple_buf = Tensor.alloc_empty(DTPLE, [L, B, t, P])
         ple_proj_buf = Tensor.alloc_empty(DTPLE, [B, t, L * P])
+        ple_lookup_buf = Tensor.alloc_empty(DTPLE, [B, t, L * P])
         ple_proj_rsos = Tensor.alloc_empty(DTSS, [B, t, L])
         embeddings = Embeddings(
             embeddings_VD_q5=token_embeddings,
@@ -416,6 +462,7 @@ class Gemma4E(Model):
             ple_rmsnorm_w_P_fp32=ple_norm,
             ple_LBtP_dtple=ple_buf,
             ple_proj_BtLP_dtple=ple_proj_buf,
+            ple_lookup_BtLP_dtple=ple_lookup_buf,
             ple_proj_rsos_BtL_dtss=ple_proj_rsos,
         )
 
@@ -460,16 +507,16 @@ class Gemma4E(Model):
         k_gqa_scratchpad = Tensor.alloc_empty(DTA, [B, t, g, k_gqa])
         v_gqa_scratchpad = Tensor.alloc_empty(DTA, [B, t, g, v_gqa])
         o_gqa_proj_input_scratchpad = Tensor.alloc_empty(DTA, [B, t, h, v_gqa])
-        q_gqa_rsos = Tensor.alloc_empty(DTSS, [B, h, t])
-        k_gqa_rsos = Tensor.alloc_empty(DTSS, [B, g, t])
-        v_gqa_rsos = Tensor.alloc_empty(DTSS, [B, g, t])
+        q_gqa_rsos = Tensor.alloc_empty(DTSS, [B, t, h])
+        k_gqa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
+        v_gqa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
         q_swa_scratchpad = Tensor.alloc_empty(DTA, [B, t, h, k_swa])
         k_swa_scratchpad = Tensor.alloc_empty(DTA, [B, t, g, k_swa])
         v_swa_scratchpad = Tensor.alloc_empty(DTA, [B, t, g, v_swa])
         o_swa_proj_input_scratchpad = Tensor.alloc_empty(DTA, [B, t, h, v_swa])
-        q_swa_rsos = Tensor.alloc_empty(DTSS, [B, h, t])
-        k_swa_rsos = Tensor.alloc_empty(DTSS, [B, g, t])
-        v_swa_rsos = Tensor.alloc_empty(DTSS, [B, g, t])
+        q_swa_rsos = Tensor.alloc_empty(DTSS, [B, t, h])
+        k_swa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
+        v_swa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
         rope_freqs_gqa = _compute_rope_freqs(
             ts[f"rope_freqs.weight"],
             meta["gemma4.rope.freq_base"],
@@ -537,9 +584,9 @@ class Gemma4E(Model):
                     shared_q_scratchpad_Bhtk_dta=q_swa_scratchpad,
                     shared_k_scratchpad_Bgtk_dta=k_swa_scratchpad,
                     shared_v_scratchpad_Bgtv_dta=v_swa_scratchpad,
-                    shared_q_rsos_Bht_dtss=q_swa_rsos,
-                    shared_k_rsos_Bgt_dtss=k_swa_rsos,
-                    shared_v_rsos_Bgt_dtss=v_swa_rsos,
+                    shared_q_rsos_Bth_dtss=q_swa_rsos,
+                    shared_k_rsos_Btg_dtss=k_swa_rsos,
+                    shared_v_rsos_Btg_dtss=v_swa_rsos,
                     shared_o_proj_input_scratchpad_Bhtv_dta=o_swa_proj_input_scratchpad,
                     shared_last_and_this_layer_output_scratchpad_BtD_dtr=layer_output_scratchpad,
                     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss=layer_output_sos_scratchpad,
@@ -566,9 +613,9 @@ class Gemma4E(Model):
                     shared_q_scratchpad_Bhtk_dta=q_gqa_scratchpad,
                     shared_k_scratchpad_Bgtk_dta=k_gqa_scratchpad,
                     shared_v_scratchpad_Bgtv_dta=v_gqa_scratchpad,
-                    shared_q_rsos_Bht_dtss=q_gqa_rsos,
-                    shared_k_rsos_Bgt_dtss=k_gqa_rsos,
-                    shared_v_rsos_Bgt_dtss=v_gqa_rsos,
+                    shared_q_rsos_Bth_dtss=q_gqa_rsos,
+                    shared_k_rsos_Btg_dtss=k_gqa_rsos,
+                    shared_v_rsos_Btg_dtss=v_gqa_rsos,
                     shared_o_proj_input_scratchpad_Bhtv_dta=o_gqa_proj_input_scratchpad,
                     shared_last_and_this_layer_output_scratchpad_BtD_dtr=layer_output_scratchpad,
                     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss=layer_output_sos_scratchpad,

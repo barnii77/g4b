@@ -381,6 +381,7 @@ def sample_logits(
     top_k: int,
     top_p: float,
     NUM_V_SPLITS: int,
+    logit_softcap: float | None = None,
 ):
     assert list(seed.shape) == [2]
     grid_fn_parallel_reduce = lambda META: (
@@ -408,6 +409,7 @@ def sample_logits(
         top_k=to_int_exact(top_k),
         top_p=float(top_p),
         NUM_V_SPLITS=NUM_V_SPLITS,
+        logit_softcap=(float(logit_softcap) if logit_softcap else None),
     )
     k3 = launch[_sample_logits_update_seed_kernel, (1,)](seed=seed, logits=logits)
     return k1, k2, k3
