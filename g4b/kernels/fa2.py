@@ -1,5 +1,7 @@
 # TODO flash decode, i.e. tile across not only Q time dim but also with different tile size across KV time dim and have
 #  it write into temp buffers and have a second kernel reduce the partial results.
+# TODO autotune if the all-queries-in-group-at-once optimization is better than baseline (not always true for prefill).
+#  let autotuner control if enabled for a shape.
 # TODO since this kernel is probably the one which deals with the largest indices, I'll have to consider doing some
 #  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
 #  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
@@ -167,12 +169,7 @@ def _configs():
 
 def _prune_invalid_configs(configs, named_args, **kwargs):
     Q_CTX = kwargs["q_shape2"]
-    max_kv_splits = min(
-        kwargs.get("partial_o_shape0", 0),
-        kwargs.get("partial_l_shape0", 0),
-        kwargs.get("partial_m_shape0", 0),
-        1,
-    )
+    max_kv_splits = kwargs["MAX_KV_SPLITS"]
 
     # Filter out configs where Q_BLOCKSIZE_T > Q_CTX
     return [
@@ -202,7 +199,8 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "partial_o_stride0", "partial_o_stride1", "partial_o_stride2", "partial_o_stride3", "partial_o_stride4",
         "partial_l_stride0", "partial_l_stride1", "partial_l_stride2", "partial_l_stride3",
         "partial_m_stride0", "partial_m_stride1", "partial_m_stride2", "partial_m_stride3",
-        "ctx_window_size", "Q_BLOCKSIZE_H", "PHASE", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
+        "ctx_window_size", "Q_BLOCKSIZE_H", "MAX_KV_SPLITS",
+        "PHASE", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
         # fmt: on
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_configs},
@@ -223,7 +221,7 @@ def _attn_kernel(
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
     time_dim_sizes_stride0: tl.constexpr, user_in_prefill_or_decode_stride0: tl.constexpr,
-    ctx_window_size: tl.constexpr, Q_BLOCKSIZE_H: tl.constexpr,
+    ctx_window_size: tl.constexpr, Q_BLOCKSIZE_H: tl.constexpr, MAX_KV_SPLITS: tl.constexpr,
     PHASE: tl.constexpr, STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr, NUM_KV_SPLITS: tl.constexpr,
     partial_o_ptr=None, partial_l_ptr=None, partial_m_ptr=None,
@@ -233,6 +231,7 @@ def _attn_kernel(
     partial_o_stride0: tl.constexpr = 0, partial_o_stride1: tl.constexpr = 0, partial_o_stride2: tl.constexpr = 0, partial_o_stride3: tl.constexpr = 0, partial_o_stride4: tl.constexpr = 0,
     partial_l_stride0: tl.constexpr = 0, partial_l_stride1: tl.constexpr = 0, partial_l_stride2: tl.constexpr = 0, partial_l_stride3: tl.constexpr = 0,
     partial_m_stride0: tl.constexpr = 0, partial_m_stride1: tl.constexpr = 0, partial_m_stride2: tl.constexpr = 0, partial_m_stride3: tl.constexpr = 0,
+    partial_o: None = None, partial_l: None = None, partial_m: None = None,
     # fmt: on
 ):
     HEAD_DIM: tl.constexpr = q_shape3
@@ -250,7 +249,8 @@ def _attn_kernel(
     tl.static_assert(q_shape1 % k_cache_shape1 == 0)
     tl.static_assert((q_shape1 // k_cache_shape1) % Q_BLOCKSIZE_H == 0)
     tl.static_assert(ctx_window_size <= k_cache_shape2)
-    if NUM_KV_SPLITS > 1:
+    tl.static_assert(NUM_KV_SPLITS <= MAX_KV_SPLITS)
+    if MAX_KV_SPLITS > 1:
         tl.static_assert(partial_o_shape0 >= NUM_KV_SPLITS)
         tl.static_assert(
             partial_o_shape1 == o_shape0
@@ -539,6 +539,9 @@ def flash_attention(
         phase_id = PHASE_DECODE
     else:
         raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}")
+    if (partial_o is None) != (partial_l is None) or (partial_o is None) != (partial_m is None):
+        raise ValueError("partial_o, partial_l, and partial_m must be provided together")
+    max_kv_splits = min(partial_o.shape[0], partial_l.shape[0], partial_m.shape[0]) if partial_o is not None else 1
     selected_num_kv_splits = 1
 
     def grid_fn(META):
@@ -562,6 +565,7 @@ def flash_attention(
         partial_m=partial_m,
         ctx_window_size=int(ctx_window_size),
         Q_BLOCKSIZE_H=q_blocksize_h,
+        MAX_KV_SPLITS=max_kv_splits,
         PHASE=phase_id,
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
@@ -569,8 +573,6 @@ def flash_attention(
     )
     k2 = None
     if selected_num_kv_splits > 1:
-        if partial_o is None or partial_l is None or partial_m is None:
-            raise ValueError("partial_o, partial_l, and partial_m are required when NUM_KV_SPLITS > 1")
         reduce_grid_fn = lambda META: (
             triton.cdiv(o.shape[2], META["Q_BLOCKSIZE_T"]),
             o.shape[0] * o.shape[1],
