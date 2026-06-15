@@ -1,7 +1,4 @@
-# TODO separate Q (current from residual) from KV (cache) time dim size
-# TODO use context_window_offsets
 # TODO skip decode-batch-dim-indices for prefill and vice versa + more advanced job assignment based on per-B seq lens
-# TODO GQA support
 # TODO foreach KV group (GQA) I should load all corresponding queries in a single thread-block so I can get a
 #  ((g*tile_T1) x d_k) @ (d_k x tile_T2) tl.dot operation -> better arithmetic intensity than loading KV tiles for each
 #  query separately.
@@ -15,6 +12,8 @@
 #  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
 #  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
 #  cache is pretty common after all.
+# TODO can I, for chunked prefill, within a qk tile, split them into subtiles and skip some fully masked subtiles?
+#  tradeoff: smaller tile sizes for less wasted compute
 # TODO one could potentially try introducing an extra reduction loop across the head dim (innermost dim), though that
 #  would increase flash attn memory traffic by ~50% so probably bad unless it massively boosts MMA throughput because
 #  of better tile shapes. May be interesting though for gemma 4 specifically because of the huge 512 head dim, which
@@ -42,18 +41,21 @@ INNER_STAGE_FULL_CONSTEXPR = tl.constexpr(3)
 @triton.jit
 def _attn_inner(
     # fmt: off
-    acc, l_i, m_i, q, k_cache_ptr, v_cache_ptr, cache_offsets_ptr,
+    acc, l_i, m_i, q, k_cache_ptr, v_cache_ptr, time_dim_sizes_ptr,
     off_b, off_kv_h, start_m,
     k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
-    cache_offsets_stride0: tl.constexpr,
+    time_dim_sizes_stride0: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, HEAD_DIM: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-    Q_CTX: tl.constexpr, KV_CTX: tl.constexpr,
+    Q_CTX: tl.constexpr, KV_CTX: tl.constexpr, ctx_window_size: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     # fmt: on
 ):
-    q_t_base: tl.constexpr = KV_CTX - Q_CTX
+    time_dim_size = tl.load(time_dim_sizes_ptr + off_b * time_dim_sizes_stride0)
+    window_size = tl.minimum(time_dim_size, ctx_window_size)
+    ring_start = tl.maximum(time_dim_size - ctx_window_size, 0) % KV_CTX
+    q_t_base = window_size - Q_CTX
     q_tile_start = q_t_base + start_m * Q_BLOCKSIZE_T
     # range of values handled by this stage
     if STAGE == INNER_STAGE_OFF_BAND_CONSTEXPR:
@@ -62,9 +64,8 @@ def _attn_inner(
         lo, hi = q_tile_start, q_tile_start + Q_BLOCKSIZE_T
     else:
         # causal = False
-        lo, hi = 0, KV_CTX
+        lo, hi = 0, window_size
 
-    cache_offset = tl.load(cache_offsets_ptr + off_b * cache_offsets_stride0)
     offs_d = tl.arange(0, HEAD_DIM)
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, KV_BLOCKSIZE_T, warp_specialize=WARP_SPECIALIZE):
@@ -73,7 +74,7 @@ def _attn_inner(
         # compute qk
         kv_logical_t = start_n + offs_n
         kv_mask = kv_logical_t < hi
-        offs_kv_t = (cache_offset + start_n + offs_n) % KV_CTX  # index into KV ring buffers
+        offs_kv_t = (ring_start + kv_logical_t) % KV_CTX
         k = tl.load(
             k_cache_ptr
             + off_b * k_cache_stride0
@@ -171,13 +172,13 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "k_cache_shape0", "k_cache_shape1", "k_cache_shape2", "k_cache_shape3",
         "v_cache_shape0", "v_cache_shape1", "v_cache_shape2", "v_cache_shape3",
         "o_shape0", "o_shape1", "o_shape2", "o_shape3",
-        "cache_offsets_shape0",
+        "time_dim_sizes_shape0",
         "q_stride0", "q_stride1", "q_stride2", "q_stride3",
         "k_cache_stride0", "k_cache_stride1", "k_cache_stride2", "k_cache_stride3",
         "v_cache_stride0", "v_cache_stride1", "v_cache_stride2", "v_cache_stride3",
         "o_stride0", "o_stride1", "o_stride2", "o_stride3",
-        "cache_offsets_stride0",
-        "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
+        "time_dim_sizes_stride0",
+        "ctx_window_size", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
         # fmt: on
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_configs},
@@ -187,18 +188,18 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
 @triton.jit
 def _attn_kernel(
     # fmt: off
-    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, cache_offsets_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, time_dim_sizes_ptr,
     q_shape0: tl.constexpr, q_shape1: tl.constexpr, q_shape2: tl.constexpr, q_shape3: tl.constexpr,
     k_cache_shape0: tl.constexpr, k_cache_shape1: tl.constexpr, k_cache_shape2: tl.constexpr, k_cache_shape3: tl.constexpr,
     v_cache_shape0: tl.constexpr, v_cache_shape1: tl.constexpr, v_cache_shape2: tl.constexpr, v_cache_shape3: tl.constexpr,
     o_shape0: tl.constexpr, o_shape1: tl.constexpr, o_shape2: tl.constexpr, o_shape3: tl.constexpr,
-    cache_offsets_shape0: tl.constexpr,
+    time_dim_sizes_shape0: tl.constexpr,
     q_stride0: tl.constexpr, q_stride1: tl.constexpr, q_stride2: tl.constexpr, q_stride3: tl.constexpr,
     k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
-    cache_offsets_stride0: tl.constexpr,
-    STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
+    time_dim_sizes_stride0: tl.constexpr,
+    ctx_window_size: tl.constexpr, STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
     # fmt: on
 ):
@@ -209,11 +210,12 @@ def _attn_kernel(
     G: tl.constexpr = k_cache_shape1
     tl.static_assert(KV_BLOCKSIZE_T <= HEAD_DIM)
     tl.static_assert(q_shape0 == k_cache_shape0 and q_shape0 == v_cache_shape0 and q_shape0 == o_shape0)
-    tl.static_assert(q_shape0 == cache_offsets_shape0)
+    tl.static_assert(q_shape0 == time_dim_sizes_shape0)
     tl.static_assert(q_shape1 == o_shape1 and q_shape2 == o_shape2 and q_shape3 == o_shape3)
     tl.static_assert(k_cache_shape1 == v_cache_shape1 and k_cache_shape2 == v_cache_shape2)
     tl.static_assert(q_shape3 == k_cache_shape3 and q_shape3 == v_cache_shape3)
     tl.static_assert(q_shape1 % k_cache_shape1 == 0)
+    tl.static_assert(ctx_window_size <= k_cache_shape2)
     tl.static_assert(q_stride1 == q_shape2 * q_stride2 and q_stride0 == q_shape1 * q_stride1)
     tl.static_assert(k_cache_stride1 == k_cache_shape2 * k_cache_stride2 and k_cache_stride0 == k_cache_shape1 * k_cache_stride1)
     tl.static_assert(v_cache_stride1 == v_cache_shape2 * v_cache_stride2 and v_cache_stride0 == v_cache_shape1 * v_cache_stride1)
@@ -260,13 +262,13 @@ def _attn_kernel(
             q,
             k_cache_ptr,
             v_cache_ptr,
-            cache_offsets_ptr,
+            time_dim_sizes_ptr,
             off_b,
             off_kv_h,
             start_m,
             k_cache_stride0, k_cache_stride1, k_cache_stride2, k_cache_stride3,
             v_cache_stride0, v_cache_stride1, v_cache_stride2, v_cache_stride3,
-            cache_offsets_stride0,
+            time_dim_sizes_stride0,
             Q_BLOCKSIZE_T,
             HEAD_DIM,
             KV_BLOCKSIZE_T,
@@ -275,6 +277,7 @@ def _attn_kernel(
             offs_n,
             Q_CTX,
             KV_CTX,
+            ctx_window_size,
             WARP_SPECIALIZE,
             IS_HOPPER,
         )
@@ -288,13 +291,13 @@ def _attn_kernel(
             q,
             k_cache_ptr,
             v_cache_ptr,
-            cache_offsets_ptr,
+            time_dim_sizes_ptr,
             off_b,
             off_kv_h,
             start_m,
             k_cache_stride0, k_cache_stride1, k_cache_stride2, k_cache_stride3,
             v_cache_stride0, v_cache_stride1, v_cache_stride2, v_cache_stride3,
-            cache_offsets_stride0,
+            time_dim_sizes_stride0,
             Q_BLOCKSIZE_T,
             HEAD_DIM,
             KV_BLOCKSIZE_T,
@@ -303,6 +306,7 @@ def _attn_kernel(
             offs_n,
             Q_CTX,
             KV_CTX,
+            ctx_window_size,
             WARP_SPECIALIZE,
             IS_HOPPER,
         )
@@ -317,7 +321,8 @@ def flash_attention(
     k_cache: Tensor,
     v_cache: Tensor,
     o: Tensor,
-    time_dim_offsets: Tensor,
+    time_dim_sizes: Tensor,
+    ctx_window_size: int,
     *,
     warp_specialize: bool = False,
     is_hopper: bool = False,
@@ -332,7 +337,8 @@ def flash_attention(
         k_cache=k_cache,
         v_cache=v_cache,
         o=o,
-        cache_offsets=time_dim_offsets,
+        time_dim_sizes=time_dim_sizes,
+        ctx_window_size=int(ctx_window_size),
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
         STAGE=stage,
