@@ -36,10 +36,21 @@ def _pre_hook(args):
     shape = [args["c_shape0"], args["c_shape1"], args["c_shape2"]]
     strides = [args["c_stride0"], args["c_stride1"], args["c_stride2"]]
     if args.get("c_rmsnorm_sum_of_squares_ptr") is not None:
-        shape_norm = shape[:-1]
-        strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
+        head_dim = args.get("RSOS_HEAD_DIM", 0) or 0
+        if head_dim > 0:
+            # per-head rsos buffer is [B, t, n_heads]; n_heads = N // head_dim
+            n_heads = shape[2] // head_dim
+            shape_norm = [shape[0], shape[1], n_heads]
+            strides_norm = [
+                args["c_rmsnorm_sum_of_squares_stride0"],
+                args["c_rmsnorm_sum_of_squares_stride1"],
+                args["c_rmsnorm_sum_of_squares_stride2"],
+            ]
+        else:
+            shape_norm = shape[:-1]
+            strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
         assert _contiguous_ignoring_unit_dims(shape_norm, strides_norm), "sum of squares buffer must be contiguous"
-        memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape[:-1]), 0)
+        memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape_norm), 0)
     if split_k > 1:
         # TODO not inherently, but I don't want to write more memcpy kernels
         assert _contiguous_ignoring_unit_dims(shape, strides), "split k requires contiguous output buffer"
@@ -128,7 +139,8 @@ def _matmul_3d_autotune_configs():
         # memory layout
         "c_stride0", "c_stride1", "c_stride2", "a_stride0", "a_stride1", "a_stride2", "b_stride0", "b_stride1",
         # optional fused rmsnorm output layout
-        "c_rmsnorm_sum_of_squares_stride0", "c_rmsnorm_sum_of_squares_stride1",
+        "c_rmsnorm_sum_of_squares_stride0", "c_rmsnorm_sum_of_squares_stride1", "c_rmsnorm_sum_of_squares_stride2",
+        "RSOS_HEAD_DIM",
         # optional second B matrix for SwiGLU / GeGLU-style fusion
         "b2_stride0", "b2_stride1",
         # optional epilogue inputs
@@ -177,6 +189,7 @@ def _matmul_a3d_b2d_kernel(
     c_rmsnorm_sum_of_squares_ptr = None, b2_ptr = None, storer_extra_ptr = None,
     input_rmsnorm_sum_of_squares_ptr = None,
     c_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, c_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
+    c_rmsnorm_sum_of_squares_stride2: tl.constexpr = 0,
     b2_stride0: tl.constexpr = 0, b2_stride1: tl.constexpr = 0,
     input_rmsnorm_sum_of_squares_shape0: tl.constexpr = 0, input_rmsnorm_sum_of_squares_shape1: tl.constexpr = 0,
     input_rmsnorm_sum_of_squares_stride0: tl.constexpr = 0, input_rmsnorm_sum_of_squares_stride1: tl.constexpr = 0,
@@ -185,6 +198,10 @@ def _matmul_a3d_b2d_kernel(
     storer_extra_stride0: tl.constexpr = 0, storer_extra_stride1: tl.constexpr = 0,
     storer_extra_stride2: tl.constexpr = 0,
     rmsnorm_eps: tl.constexpr = 0.0,
+    # RSOS_HEAD_DIM > 0 selects a PER-HEAD segmented output-rsos reduction (for q/k/v): the storer reduces
+    # (tile*tile) within each head_dim-wide segment and scatters into a [B, t, n_heads] rsos buffer instead of
+    # the default full-output-row [B, t] reduction. 0 = default full-row behavior.
+    RSOS_HEAD_DIM: tl.constexpr = 0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
     b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None,
@@ -201,8 +218,10 @@ def _matmul_a3d_b2d_kernel(
         )
     tl.static_assert(a_shape2 % NUM_K_SPLITS == 0)
 
-    if b2_ptr is not None:
-        # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2)
+    if b2_ptr is not None or RSOS_HEAD_DIM > 0:
+        # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2).
+        # RSOS_HEAD_DIM>0 (per-head fused rsos) must match the wrapper's k_split_allowed=False: a partial-K
+        # program can't compute a correct sum-of-squares of the full output row.
         NUM_K_SPLITS = 1
 
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
@@ -368,6 +387,7 @@ def _matmul_a3d_b2d_kernel(
         a_shape2, rmsnorm_eps,
         storer_extra_shape0, storer_extra_shape1, storer_extra_shape2,
         storer_extra_stride0, storer_extra_stride1, storer_extra_stride2,
+        c_rmsnorm_sum_of_squares_stride2, RSOS_HEAD_DIM,
     )
     # fmt: on
 
@@ -693,13 +713,20 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     rmsnorm_dim: tl.constexpr = 0, rmsnorm_eps: tl.constexpr = 0.0,
     extra_shape0: tl.constexpr = 0, extra_shape1: tl.constexpr = 0, extra_shape2: tl.constexpr = 0,
     extra_stride0: tl.constexpr = 0, extra_stride1: tl.constexpr = 0, extra_stride2: tl.constexpr = 0,
+    rsos_stride2: tl.constexpr = 0, RSOS_HEAD_DIM: tl.constexpr = 0,
     # fmt: on
 ):
     if rsos_ptr is not None and NUM_K_SPLITS == 1:
         rsos = (tile * tile).sum(-1)
         rsos_offsets0 = (off0 + tl.arange(0, tile.shape[0]))[:, None]
         rsos_offsets1 = (off1 + tl.arange(0, tile.shape[1]))[None, :]
-        rsos_offsets = rsos_offsets0 * rsos_stride0 + rsos_offsets1 * rsos_stride1
+        if RSOS_HEAD_DIM > 0:
+            # per-head segmented reduction: the whole output-col tile lies in one head (head_dim % tile width == 0),
+            # so head index is a scalar and we scatter into the [B, t, n_heads] rsos buffer's head slot.
+            head = off2 // RSOS_HEAD_DIM
+            rsos_offsets = rsos_offsets0 * rsos_stride0 + rsos_offsets1 * rsos_stride1 + head * rsos_stride2
+        else:
+            rsos_offsets = rsos_offsets0 * rsos_stride0 + rsos_offsets1 * rsos_stride1
         tl.atomic_add(
             rsos_ptr + rsos_offsets,
             rsos.to(rsos_ptr.dtype.element_ty),
@@ -727,11 +754,13 @@ def matmul_a3d_b2d(
     transpose_b_before_mma: bool = False,
     *,
     input_rmsnorm_sum_of_squares: Tensor | None = None,
+    rsos_head_dim: int = 0,
     rmsnorm_eps: float,
 ):
     assert (b2 is None) == (c_c2_merge_tiles_fn is None)
-
-    k_split_allowed = b2 is None
+    # per-head segmented output rsos (q/k/v) accumulates across N-tiles via atomic_add and isn't sound across
+    # K-splits, so disable split-K when it's active (matches forward.txt note).
+    k_split_allowed = b2 is None and rsos_head_dim == 0
     selected_num_k_splits = 1
 
     # TODO this grid_fn is hacky and I'm not sure launching the pre-hook in the grid_fn is ideal because it is part of
@@ -771,6 +800,7 @@ def matmul_a3d_b2d(
         ACCUM_DTYPE=accum_dtype,
         KEEP_C=keep_c,
         TRANSPOSE_B_BEFORE_MMA=transpose_b_before_mma,
+        RSOS_HEAD_DIM=int(rsos_head_dim),
         rmsnorm_eps=float(rmsnorm_eps),
         _a_loader_fn_key=jfn_cache_key(a_loader_fn),
         _b_loader_fn_key=jfn_cache_key(b_loader_fn),

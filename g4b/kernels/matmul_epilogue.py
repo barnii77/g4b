@@ -93,6 +93,7 @@ def ple_gate_storer_jfn(
     rmsnorm_dim: tl.constexpr, rmsnorm_eps: tl.constexpr,
     extra_shape0: tl.constexpr, extra_shape1: tl.constexpr, extra_shape2: tl.constexpr,
     extra_stride0: tl.constexpr, extra_stride1: tl.constexpr, extra_stride2: tl.constexpr,
+    rsos_stride2: tl.constexpr = 0, RSOS_HEAD_DIM: tl.constexpr = 0,
     # fmt: on
 ):
     # fmt: off
@@ -119,5 +120,50 @@ def ple_gate_storer_jfn(
         rmsnorm_dim, rmsnorm_eps,
         extra_shape0, extra_shape1, extra_shape2,
         extra_stride0, extra_stride1, extra_stride2,
+        rsos_stride2, RSOS_HEAD_DIM,
+    )
+    # fmt: on
+
+
+@triton.jit
+def qkv_input_rmsnorm_per_head_rsos_storer_jfn(
+    # fmt: off
+    name: tl.constexpr, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
+    rsos_shape0: tl.constexpr, rsos_shape1: tl.constexpr,
+    rsos_stride0: tl.constexpr, rsos_stride1: tl.constexpr,
+    NUM_K_SPLITS: tl.constexpr, C_DTYPE: tl.constexpr,
+    input_rsos_ptr,
+    input_rsos_shape0: tl.constexpr, input_rsos_shape1: tl.constexpr,
+    input_rsos_stride0: tl.constexpr, input_rsos_stride1: tl.constexpr,
+    rmsnorm_dim: tl.constexpr, rmsnorm_eps: tl.constexpr,
+    extra_shape0: tl.constexpr, extra_shape1: tl.constexpr, extra_shape2: tl.constexpr,
+    extra_stride0: tl.constexpr, extra_stride1: tl.constexpr, extra_stride2: tl.constexpr,
+    rsos_stride2: tl.constexpr = 0, RSOS_HEAD_DIM: tl.constexpr = 0,
+    # fmt: on
+):
+    # q/k/v projection epilogue: apply the input rmsnorm (using the residual's sum-of-squares) to the
+    # projected tile, then compute the PER-HEAD output sum-of-squares (rsos_ptr is the [B, t, n_heads]
+    # buffer; RSOS_HEAD_DIM is the head size) and store. This fuses what used to be a separate
+    # kernels.rsos.compute_rsos call per q/k/v.
+    # fmt: off
+    tile, _ = apply_input_rsos_in_epilogue_mixin_jfn(
+        tile, None, off0, off1,
+        input_rsos_ptr,
+        input_rsos_shape0, input_rsos_shape1,
+        input_rsos_stride0, input_rsos_stride1,
+        rmsnorm_dim, rmsnorm_eps,
+    )
+    matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
+        name, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
+        rsos_shape0, rsos_shape1,
+        rsos_stride0, rsos_stride1,
+        NUM_K_SPLITS, C_DTYPE,
+        input_rsos_ptr,
+        input_rsos_shape0, input_rsos_shape1,
+        input_rsos_stride0, input_rsos_stride1,
+        rmsnorm_dim, rmsnorm_eps,
+        extra_shape0, extra_shape1, extra_shape2,
+        extra_stride0, extra_stride1, extra_stride2,
+        rsos_stride2, RSOS_HEAD_DIM,
     )
     # fmt: on

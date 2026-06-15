@@ -13,7 +13,7 @@ from g4b.utils import gguf_tensors_by_name
 from g4b import kernels, device
 from g4b.kernels.memset import memset_contiguous
 from g4b.kernels.matmul import matmul_a3d_b2d
-from g4b.kernels.matmul_epilogue import geglu_fusion_matmul_merge_tiles_mixin_jfn, ple_gate_storer_jfn
+from g4b.kernels.matmul_epilogue import geglu_fusion_matmul_merge_tiles_mixin_jfn, ple_gate_storer_jfn, qkv_input_rmsnorm_per_head_rsos_storer_jfn
 
 # TODO if I wanted to support MoE models:
 #  I could allocate a tensor for every expert host-side, then build a cuda graph where the router kernel produces
@@ -353,13 +353,12 @@ class Gemma4E(Model):
         out_rsos = _slice_t(attn.shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss, t_now)
         out = _slice_t(attn.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
 
-        matmul_a3d_b2d(q_flat, None, act, attn.q_proj_Dhk_q4, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
-        matmul_a3d_b2d(k_flat, None, act, attn.k_proj_Dgk_q6, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
-        matmul_a3d_b2d(v_flat, None, act, attn.v_proj_Dgv_q6, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rmsnorm_eps=self.rmsnorm_epsilon)
-        # compute rsos on the contiguous physical [B, t, n_heads, D] scratchpads
-        kernels.rsos.compute_rsos(_slice_t(attn.shared_q_scratchpad_Bhtk_dta, t_now), q_rsos_phys)
-        kernels.rsos.compute_rsos(_slice_t(attn.shared_k_scratchpad_Bgtk_dta, t_now), k_rsos_phys)
-        kernels.rsos.compute_rsos(_slice_t(attn.shared_v_scratchpad_Bgtv_dta, t_now), v_rsos_phys)
+        # q/k/v projections fuse, in the matmul epilogue storer: (1) the input rmsnorm (using resid sos act_rsos)
+        # and (2) the PER-HEAD output sum-of-squares written into the [B,t,n_heads] rsos buffers (rsos_head_dim is
+        # the head size). This replaces 3 separate compute_rsos launches per layer.
+        matmul_a3d_b2d(q_flat, q_rsos_phys, act, attn.q_proj_Dhk_q4, storer_fn=qkv_input_rmsnorm_per_head_rsos_storer_jfn, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rsos_head_dim=attn.head_size_qk, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(k_flat, k_rsos_phys, act, attn.k_proj_Dgk_q6, storer_fn=qkv_input_rmsnorm_per_head_rsos_storer_jfn, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rsos_head_dim=attn.head_size_qk, rmsnorm_eps=self.rmsnorm_epsilon)
+        matmul_a3d_b2d(v_flat, v_rsos_phys, act, attn.v_proj_Dgv_q6, storer_fn=qkv_input_rmsnorm_per_head_rsos_storer_jfn, transpose_b_before_mma=True, input_rmsnorm_sum_of_squares=act_rsos, rsos_head_dim=attn.head_size_v, rmsnorm_eps=self.rmsnorm_epsilon)
         q = _attn_view(attn.shared_q_scratchpad_Bhtk_dta, t_now)
         k = _attn_view(attn.shared_k_scratchpad_Bgtk_dta, t_now)
         v = _attn_view(attn.shared_v_scratchpad_Bgtv_dta, t_now)
