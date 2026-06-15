@@ -1,13 +1,11 @@
 # TODO skip decode-batch-dim-indices for prefill and vice versa + more advanced job assignment based on per-B seq lens
-# TODO foreach KV group (GQA) I should load all corresponding queries in a single thread-block so I can get a
-#  ((g*tile_T1) x d_k) @ (d_k x tile_T2) tl.dot operation -> better arithmetic intensity than loading KV tiles for each
-#  query separately.
 # TODO flash decode, i.e. tile across not only Q time dim but also with different tile size across KV time dim and have
 #  it write into temp buffers and have a second kernel reduce the partial results.
 # TODO I will also likely need to come up with fancy work partitioning strategies involving persistent kernels and
 #  blackwell-style work-stealing-ish dynamically-scheduled work assignment to deal with the highly heterogeneous nature
 #  of the decode phase especially but also prefill, since the context length between users differs greatly, likely
 #  following a long-tailed distribution.
+#  >> Skip decode-batch-dim-indices for prefill and vice versa + more advanced job assignment based on per-B seq lens
 # TODO since this kernel is probably the one which deals with the largest indices, I'll have to consider doing some
 #  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
 #  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
@@ -46,8 +44,8 @@ def _attn_inner(
     k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     time_dim_sizes_stride0: tl.constexpr,
-    Q_BLOCKSIZE_T: tl.constexpr, HEAD_DIM: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
-    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
+    Q_BLOCKSIZE_H: tl.constexpr, Q_BLOCKSIZE_T: tl.constexpr, HEAD_DIM: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
+    STAGE: tl.constexpr, offs_q_t: tl.constexpr, offs_n: tl.constexpr,
     Q_CTX: tl.constexpr, KV_CTX: tl.constexpr, ctx_window_size: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     # fmt: on
@@ -90,7 +88,7 @@ def _attn_inner(
 
         # causal mask if required
         if STAGE == INNER_STAGE_ON_BAND_CONSTEXPR:
-            q_logical_t = q_t_base + offs_m
+            q_logical_t = q_t_base + offs_q_t
             mask = q_logical_t[:, None] >= kv_logical_t[None, :]
             qk = qk + tl.where(mask, 0, -1.0e6)
 
@@ -140,6 +138,15 @@ def _cfg(m: int, n: int, *, warps: int, stages: int):
 def _configs():
     return [
         # fmt: off
+        _cfg(1, 32, warps=4, stages=2),
+        _cfg(1, 64, warps=4, stages=3),
+        _cfg(1, 128, warps=4, stages=3),
+        _cfg(16, 32, warps=4, stages=2),
+        _cfg(16, 64, warps=4, stages=3),
+        _cfg(16, 128, warps=4, stages=3),
+        _cfg(32, 32, warps=4, stages=2),
+        _cfg(32, 64, warps=4, stages=3),
+        _cfg(32, 128, warps=4, stages=3),
         _cfg(64, 32, warps=4, stages=2),
         _cfg(64, 64, warps=4, stages=3),
         _cfg(64, 128, warps=4, stages=3),
@@ -152,15 +159,12 @@ def _configs():
 
 def _prune_invalid_configs(configs, named_args, **kwargs):
     Q_CTX = kwargs["q_shape2"]
-    STAGE = kwargs["STAGE"]
 
     # Filter out configs where Q_BLOCKSIZE_T > Q_CTX
-    # Filter out configs where Q_BLOCKSIZE_T < KV_BLOCKSIZE_T when causal is True
     return [
         conf
         for conf in configs
         if conf.kwargs.get("Q_BLOCKSIZE_T", 0) <= Q_CTX
-        and (conf.kwargs.get("Q_BLOCKSIZE_T", 0) >= conf.kwargs.get("KV_BLOCKSIZE_T", 0) or STAGE == STAGE_FULL)
     ]
 
 
@@ -178,7 +182,7 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "v_cache_stride0", "v_cache_stride1", "v_cache_stride2", "v_cache_stride3",
         "o_stride0", "o_stride1", "o_stride2", "o_stride3",
         "time_dim_sizes_stride0",
-        "ctx_window_size", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
+        "ctx_window_size", "Q_BLOCKSIZE_H", "STAGE", "WARP_SPECIALIZE", "IS_HOPPER",
         # fmt: on
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_configs},
@@ -199,7 +203,8 @@ def _attn_kernel(
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
     time_dim_sizes_stride0: tl.constexpr,
-    ctx_window_size: tl.constexpr, STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
+    ctx_window_size: tl.constexpr, Q_BLOCKSIZE_H: tl.constexpr,
+    STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     Q_BLOCKSIZE_T: tl.constexpr, KV_BLOCKSIZE_T: tl.constexpr,
     # fmt: on
 ):
@@ -215,6 +220,7 @@ def _attn_kernel(
     tl.static_assert(k_cache_shape1 == v_cache_shape1 and k_cache_shape2 == v_cache_shape2)
     tl.static_assert(q_shape3 == k_cache_shape3 and q_shape3 == v_cache_shape3)
     tl.static_assert(q_shape1 % k_cache_shape1 == 0)
+    tl.static_assert((q_shape1 // k_cache_shape1) % Q_BLOCKSIZE_H == 0)
     tl.static_assert(ctx_window_size <= k_cache_shape2)
     tl.static_assert(q_stride1 == q_shape2 * q_stride2 and q_stride0 == q_shape1 * q_stride1)
     tl.static_assert(k_cache_stride1 == k_cache_shape2 * k_cache_stride2 and k_cache_stride0 == k_cache_shape1 * k_cache_stride1)
@@ -222,33 +228,36 @@ def _attn_kernel(
     tl.static_assert(o_stride1 == o_shape2 * o_stride2 and o_stride0 == o_shape1 * o_stride1)
 
     start_m = tl.program_id(0)
-    off_bh = tl.program_id(1)
-    off_b = off_bh // H
-    off_h = off_bh % H
-    off_kv_h = off_h // (H // G)
+    off_bgh = tl.program_id(1)
+    Q_HEADS_PER_KV: tl.constexpr = H // G
+    Q_HEAD_TILES_PER_KV: tl.constexpr = Q_HEADS_PER_KV // Q_BLOCKSIZE_H
+    off_b = off_bgh // (G * Q_HEAD_TILES_PER_KV)
+    off_gqh = off_bgh % (G * Q_HEAD_TILES_PER_KV)
+    off_kv_h = off_gqh // Q_HEAD_TILES_PER_KV
+    off_q_h_tile = off_gqh % Q_HEAD_TILES_PER_KV
 
-    y_dim: tl.constexpr = q_shape0 * q_shape1 * q_shape2
-    # fmt: off
-    desc_q = tl.make_tensor_descriptor(
-        q_ptr, shape=(y_dim, HEAD_DIM), strides=(q_stride2, q_stride3), block_shape=(Q_BLOCKSIZE_T, HEAD_DIM)
-    )
-    desc_o = tl.make_tensor_descriptor(
-        o_ptr, shape=(y_dim, HEAD_DIM), strides=(o_stride2, o_stride3), block_shape=(Q_BLOCKSIZE_T, HEAD_DIM)
-    )
-    # fmt: on
-
-    offset_y = off_b * (Q_CTX * H) + off_h * Q_CTX
-    qo_offset_y = offset_y + start_m * Q_BLOCKSIZE_T
-    # initialize offsets
-    offs_m = start_m * Q_BLOCKSIZE_T + tl.arange(0, Q_BLOCKSIZE_T)
+    offs_q_h = off_kv_h * Q_HEADS_PER_KV + off_q_h_tile * Q_BLOCKSIZE_H + tl.arange(0, Q_BLOCKSIZE_H)[:, None, None]
+    offs_q_t = start_m * Q_BLOCKSIZE_T + tl.arange(0, Q_BLOCKSIZE_T)[None, :, None]
+    offs_d = tl.arange(0, HEAD_DIM)[None, None, :]
     offs_n = tl.arange(0, KV_BLOCKSIZE_T)
 
     # initialize pointer to m and l
-    m_i = tl.zeros([Q_BLOCKSIZE_T], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([Q_BLOCKSIZE_T], dtype=tl.float32) + 1.0
-    acc = tl.zeros([Q_BLOCKSIZE_T, HEAD_DIM], dtype=tl.float32)
-    # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
+    q_mask = offs_q_t < Q_CTX
+    q = tl.load(
+        q_ptr
+        + off_b * q_stride0
+        + offs_q_h * q_stride1
+        + offs_q_t * q_stride2
+        + offs_d * q_stride3,
+        mask=q_mask,
+        other=0.0,
+    ).reshape((Q_BLOCKSIZE_H * Q_BLOCKSIZE_T, HEAD_DIM))
+    offs_q_t_flat = offs_q_t.broadcast_to((Q_BLOCKSIZE_H, Q_BLOCKSIZE_T, 1)).reshape(
+        (Q_BLOCKSIZE_H * Q_BLOCKSIZE_T,)
+    )
+    m_i = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T], dtype=tl.float32) + 1.0
+    acc = tl.zeros([Q_BLOCKSIZE_H * Q_BLOCKSIZE_T, HEAD_DIM], dtype=tl.float32)
 
     # stage 1: off-band
     # For causal attention this handles all complete K/V blocks before the diagonal block.
@@ -269,11 +278,12 @@ def _attn_kernel(
             k_cache_stride0, k_cache_stride1, k_cache_stride2, k_cache_stride3,
             v_cache_stride0, v_cache_stride1, v_cache_stride2, v_cache_stride3,
             time_dim_sizes_stride0,
+            Q_BLOCKSIZE_H,
             Q_BLOCKSIZE_T,
             HEAD_DIM,
             KV_BLOCKSIZE_T,
             INNER_STAGE,
-            offs_m,
+            offs_q_t_flat,
             offs_n,
             Q_CTX,
             KV_CTX,
@@ -298,11 +308,12 @@ def _attn_kernel(
             k_cache_stride0, k_cache_stride1, k_cache_stride2, k_cache_stride3,
             v_cache_stride0, v_cache_stride1, v_cache_stride2, v_cache_stride3,
             time_dim_sizes_stride0,
+            Q_BLOCKSIZE_H,
             Q_BLOCKSIZE_T,
             HEAD_DIM,
             KV_BLOCKSIZE_T,
             INNER_STAGE_ON_BAND_CONSTEXPR,
-            offs_m,
+            offs_q_t_flat,
             offs_n,
             Q_CTX,
             KV_CTX,
@@ -313,7 +324,16 @@ def _attn_kernel(
 
     # epilogue
     acc = acc / l_i[:, None]
-    desc_o.store([qo_offset_y, 0], acc.to(tl.float16))
+    acc = acc.reshape((Q_BLOCKSIZE_H, Q_BLOCKSIZE_T, HEAD_DIM))
+    tl.store(
+        o_ptr
+        + off_b * o_stride0
+        + offs_q_h * o_stride1
+        + offs_q_t * o_stride2
+        + offs_d * o_stride3,
+        acc.to(tl.float16),
+        mask=q_mask,
+    )
 
 
 def flash_attention(
@@ -324,13 +344,16 @@ def flash_attention(
     time_dim_sizes: Tensor,
     ctx_window_size: int,
     *,
+    use_grouped_query_tile: bool = True,
     warp_specialize: bool = False,
     is_hopper: bool = False,
     stage: int = STAGE_CAUSAL,
 ):
+    q_heads_per_kv = q.shape[1] // k_cache.shape[1]
+    q_blocksize_h = q_heads_per_kv if use_grouped_query_tile else 1
     grid_fn = lambda META: (
         triton.cdiv(q.shape[2], META["Q_BLOCKSIZE_T"]),
-        q.shape[0] * q.shape[1],
+        q.shape[0] * k_cache.shape[1] * triton.cdiv(q_heads_per_kv, q_blocksize_h),
     )
     return launch[_attn_kernel, grid_fn](
         q=q,
@@ -339,6 +362,7 @@ def flash_attention(
         o=o,
         time_dim_sizes=time_dim_sizes,
         ctx_window_size=int(ctx_window_size),
+        Q_BLOCKSIZE_H=q_blocksize_h,
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
         STAGE=stage,
