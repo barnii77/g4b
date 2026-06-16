@@ -31,7 +31,8 @@ from g4b.kernels.utils import launch, default_bencher, gated_configs
 @triton.jit
 def _advance_decode_state_kernel(
     # fmt: off
-    input_token_ids_ptr, out_token_ids_ptr, cache_offsets_ptr, time_dim_sizes_ptr, user_in_prefill_or_decode_ptr,
+    input_token_ids_ptr, out_token_ids_ptr, cache_offsets_ptr,
+    time_dim_sizes_ptr, user_in_prefill_or_decode_ptr,
     input_token_ids_shape0: tl.constexpr, input_token_ids_shape1: tl.constexpr,
     out_token_ids_shape0: tl.constexpr, out_token_ids_shape1: tl.constexpr,
     cache_offsets_shape0: tl.constexpr, time_dim_sizes_shape0: tl.constexpr, user_in_prefill_or_decode_shape0: tl.constexpr,
