@@ -201,6 +201,12 @@ class _UserChatManager:
             toks = toks[: toks.index(_tokenizer.eos)]
 
         text = _tokenizer.detokenize(toks)  # TODO technically this may be incorrect unless I buffer a few tokens
+
+        # <start_of_turn>/<end_of_turn> are chat-template structural tokens that
+        # the tokenizer detokenizes back into literal text. They must not leak to
+        # the client; they are added by the chat template at the next turn.
+        text = text.replace("<start_of_turn>", "").replace("<end_of_turn>", "")
+
         if not text:
             return []
 
