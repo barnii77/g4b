@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 from queue import SimpleQueue
 from typing import TYPE_CHECKING
 
@@ -30,6 +32,8 @@ class Request:
 
 
 class Scheduler:
+    _STATS_INTERVAL = 128
+
     def __init__(self, model: "g4b.models.Model"):
         self._model = model
         self._queue: SimpleQueue[Request] = SimpleQueue()
@@ -37,21 +41,31 @@ class Scheduler:
         self._phase_active: list[bool] = [False] * model.max_batch_size()
         self._last_phase: str | None = None
 
+        self._print_stats = bool(os.environ.get("G4B_PRINT_STATS"))
+        self._total_prefill_tokens = 0
+        self._total_decode_tokens = 0
+        self._tokens_since_log = 0
+        self._start_time = time.perf_counter()
+
     def step(self):
         self._fill_free_slots()
         if not any(rq is not None and not rq._done for rq in self._active):
             return
 
         phase = "decode" if any(self._needs_decode(rq) for rq in self._active if rq is not None) else "prefill"
+        prefill_tokens = 0
+        decode_tokens = 0
         if phase == "prefill":
-            self._prepare_prefill_inputs()
+            prefill_tokens = self._prepare_prefill_inputs()
             self._model.prefill_chunk(self)
         else:
-            self._prepare_decode_inputs()
+            decode_tokens = self._prepare_decode_inputs()
             self._model.decode(self)
         self._last_phase = phase
         self._collect_outputs(phase)
         self._drop_done_slots()
+        if self._print_stats:
+            self._update_stats(prefill_tokens, decode_tokens)
 
     def submit(self, request: Request):
         self._queue.put(request)
@@ -83,13 +97,14 @@ class Scheduler:
     def _needs_decode(self, rq: Request) -> bool:
         return not rq._done and not self._needs_prefill(rq)
 
-    def _prepare_prefill_inputs(self):
+    def _prepare_prefill_inputs(self) -> int:
         t = self._model.max_prefill_chunk_size()
         token_cols: list[list[int]] = []
         cache_offsets: list[int] = []
         time_sizes_after: list[int] = []
         sample_positions: list[int] = []
         phase_active: list[bool] = []
+        total_real = 0
         for rq in self._active:
             if rq is None or rq._done or not self._needs_prefill(rq):
                 token_cols.append([0] * t)
@@ -103,6 +118,7 @@ class Scheduler:
             start = rq._prefill_pos
             end = min(start + t, len(rq.input_tokens))
             real_n = max(1, end - start)
+            total_real += real_n
             toks = rq.input_tokens[start:end]
             if not toks:
                 toks = [rq.input_tokens[max(0, len(rq.input_tokens) - 1)]]
@@ -124,8 +140,9 @@ class Scheduler:
 
         self._phase_active = phase_active
         self._model.prepare_prefill_inputs(token_cols, cache_offsets, time_sizes_after, sample_positions)
+        return total_real
 
-    def _prepare_decode_inputs(self):
+    def _prepare_decode_inputs(self) -> int:
         t = self._model.max_prefill_chunk_size()
         token_cols: list[list[int]] = []
         cache_offsets: list[int] = []
@@ -133,6 +150,7 @@ class Scheduler:
         sample_positions: list[int] = []
         phase_active: list[bool] = []
         needs_upload = False
+        total_decode = 0
         for rq in self._active:
             if rq is None or rq._done or self._needs_prefill(rq):
                 token_cols.append([0] * t)
@@ -142,6 +160,7 @@ class Scheduler:
                 phase_active.append(False)
                 continue
             phase_active.append(True)
+            total_decode += 1
             tok = rq.input_tokens[-1] if not rq._output_tokens else rq._output_tokens[-1]
             token_cols.append([tok] * t)
             cache_offsets.append(rq._context_len)
@@ -157,9 +176,32 @@ class Scheduler:
             for rq in self._active:
                 if rq is not None and not rq._done and not self._needs_prefill(rq):
                     rq._decode_state_prepared = True
+        return total_decode
+
+    def _update_stats(self, prefill_tokens: int, decode_tokens: int):
+        self._total_prefill_tokens += prefill_tokens
+        self._total_decode_tokens += decode_tokens
+        self._tokens_since_log += prefill_tokens + decode_tokens
+        if self._tokens_since_log >= self._STATS_INTERVAL:
+            self._log_stats()
+            self._tokens_since_log %= self._STATS_INTERVAL
+
+    def _log_stats(self):
+        now = time.perf_counter()
+        elapsed = now - self._start_time
+        prefill_tps = self._total_prefill_tokens / elapsed if elapsed > 0 else 0.0
+        decode_tps = self._total_decode_tokens / elapsed if elapsed > 0 else 0.0
+        active = sum(1 for rq in self._active if rq is not None and not rq._done)
+        context_len = sum(rq._context_len for rq in self._active if rq is not None)
+        print(
+            f"stats tokens={self._total_prefill_tokens + self._total_decode_tokens} "
+            f"tps_prefill={prefill_tps:.2f} tps_decode={decode_tps:.2f} "
+            f"active={active} context_len={context_len}",
+            flush=True,
+        )
 
     def _collect_outputs(self, phase: str):
-        t = self._model.max_prefill_chunk_size()
+        self._model.max_prefill_chunk_size()
         vals = self._model.collect_output_token_ids()
         for b, rq in enumerate(self._active):
             if rq is None or rq._done or not self._phase_active[b]:
