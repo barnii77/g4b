@@ -1,3 +1,4 @@
+import os
 import argparse
 import traceback
 import warnings
@@ -83,11 +84,19 @@ def main():
     serve.register_max_ctx_len(config.context_len)
     uvicorn = serve.Uvicorn.start(config.host, config.port)
 
+    is_profiling = bool(os.environ.get("G4B_PROFILE"))
+
+    if is_profiling:
+        device.cuda_profiler_start()
+
     try:
         while True:
             scheduler.step()
     except Exception:
         traceback.print_exc()
+
+    if is_profiling:
+        device.cuda_profiler_stop()
 
     uvicorn.stop()
     device.teardown()

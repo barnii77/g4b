@@ -1,7 +1,9 @@
-import importlib.util
 import sys
+import ctypes
+import ctypes.util
+import importlib.util
+from typing import Any
 from cuda.core import Device, Stream, Buffer, Event, EventOptions, PinnedMemoryResource
-
 from g4b.utils import runtime_error
 from g4b import _torch_stub
 
@@ -9,6 +11,8 @@ device: Device
 stream: Stream
 _alloc_stream: Stream
 _pinned_mr: PinnedMemoryResource
+_cudaProfilerStart: Any
+_cudaProfilerStop: Any
 
 _buffers: list[Buffer] = []
 _events: list[Event] = []
@@ -72,13 +76,29 @@ def sync_all_streams():
     _alloc_stream.sync()
 
 
+def cuda_profiler_start():
+    assert callable(_cudaProfilerStart)
+    err = _cudaProfilerStart()
+    if err != 0:
+        raise RuntimeError(f"cudaProfilerStart failed with CUDA error {err}")
+
+
+def cuda_profiler_stop():
+    assert callable(_cudaProfilerStop)
+    err = _cudaProfilerStop()
+    if err != 0:
+        raise RuntimeError(f"cudaProfilerStop failed with CUDA error {err}")
+
+
 def _init_cuda(device_id: int):
-    global device, stream, _alloc_stream, _pinned_mr
+    global device, stream, _alloc_stream, _pinned_mr, _cudaProfilerStart, _cudaProfilerStop
     device = Device(device_id)
     device.set_current()
     stream = device.create_stream()
     _alloc_stream = device.create_stream()
     _pinned_mr = PinnedMemoryResource()
+    _cudaProfilerStart = _cuda_profiler_func("cudaProfilerStart")
+    _cudaProfilerStop = _cuda_profiler_func("cudaProfilerStop")
 
 
 def _init_triton():
@@ -106,3 +126,14 @@ def _init_triton():
 
 def _real_torch_available() -> bool:
     return importlib.util.find_spec("torch") is not None
+
+
+def _cuda_profiler_func(name: str):
+    libname = ctypes.util.find_library("cudart")
+    if libname is None:
+        # Common fallback on CUDA installs.
+        libname = "libcudart.so"
+    libcudart = ctypes.CDLL(libname)
+    fn = getattr(libcudart, name)
+    fn.restype = ctypes.c_int
+    return fn
