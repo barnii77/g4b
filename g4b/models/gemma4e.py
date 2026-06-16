@@ -34,6 +34,7 @@ DTMM = int8  # DType for MatMul tensor core ops
 DTSS = float32  # DType for Sum-of-Squares accumulation for rmsnorm
 DTPLE = float32  # DType for computations in the per-layer-embeddings low-rank space
 DTSAMP = float32
+FA_MAX_KV_SPLITS = 16
 # The shape names, explained:
 #   - B: batch size
 #   - T: context window size
@@ -83,6 +84,9 @@ class Attention:
     shared_k_rsos_Btg_dtss: Tensor
     shared_v_rsos_Btg_dtss: Tensor
     shared_o_proj_input_scratchpad_Bhtv_dta: Tensor
+    shared_fa_partial_o_SBHtv_f16: Tensor
+    shared_fa_partial_l_SBHt_fp32: Tensor
+    shared_fa_partial_m_SBHt_fp32: Tensor
     shared_last_and_this_layer_output_scratchpad_BtD_dtr: Tensor
     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss: Tensor
 
@@ -457,6 +461,9 @@ class Gemma4E(Model):
         k = _attn_view(attn.shared_k_scratchpad_Bgtk_dta, t_now)
         v = _attn_view(attn.shared_v_scratchpad_Bgtv_dta, t_now)
         o = _attn_view(attn.shared_o_proj_input_scratchpad_Bhtv_dta, t_now)
+        partial_o = attn.shared_fa_partial_o_SBHtv_f16.slice_until(3, t_now) if phase == "decode" else None
+        partial_l = attn.shared_fa_partial_l_SBHt_fp32.slice_until(3, t_now) if phase == "decode" else None
+        partial_m = attn.shared_fa_partial_m_SBHt_fp32.slice_until(3, t_now) if phase == "decode" else None
         kernels.rope.apply_rope(q, k, attn.rope_freqs_k_fp32, self.cache_offsets_B_int32, q_rsos, k_rsos, attn.q_rmsnorm_w_k_fp32, attn.k_rmsnorm_w_k_fp32, self.rmsnorm_epsilon)
         if attn.owns_kv_cache:
             kernels.add_kv_to_cache.add_kv_to_cache(k, attn.k_cache_Bg__T_or_W__k__dtkv, self.cache_offsets_B_int32, self.rmsnorm_epsilon)
@@ -470,6 +477,9 @@ class Gemma4E(Model):
             self.user_in_prefill_or_decode_B_uint8,
             attn.context_window_size,
             phase,
+            partial_o,
+            partial_l,
+            partial_m,
             use_grouped_query_tile=True,
             use_fp32_dot=bool(os.environ.get("G4B_FA_FP32_DOT")),
         )
@@ -620,6 +630,9 @@ class Gemma4E(Model):
         q_gqa_rsos = Tensor.alloc_empty(DTSS, [B, t, h])
         k_gqa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
         v_gqa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
+        fa_gqa_partial_o = Tensor.alloc_empty(float16, [FA_MAX_KV_SPLITS, B, h, t, v_gqa])
+        fa_gqa_partial_l = Tensor.alloc_empty(float32, [FA_MAX_KV_SPLITS, B, h, t])
+        fa_gqa_partial_m = Tensor.alloc_empty(float32, [FA_MAX_KV_SPLITS, B, h, t])
         q_swa_scratchpad = Tensor.alloc_empty(DTA, [B, t, h, k_swa])
         k_swa_scratchpad = Tensor.alloc_empty(DTA, [B, t, g, k_swa])
         v_swa_scratchpad = Tensor.alloc_empty(DTA, [B, t, g, v_swa])
@@ -627,6 +640,9 @@ class Gemma4E(Model):
         q_swa_rsos = Tensor.alloc_empty(DTSS, [B, t, h])
         k_swa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
         v_swa_rsos = Tensor.alloc_empty(DTSS, [B, t, g])
+        fa_swa_partial_o = Tensor.alloc_empty(float16, [FA_MAX_KV_SPLITS, B, h, t, v_swa])
+        fa_swa_partial_l = Tensor.alloc_empty(float32, [FA_MAX_KV_SPLITS, B, h, t])
+        fa_swa_partial_m = Tensor.alloc_empty(float32, [FA_MAX_KV_SPLITS, B, h, t])
         rope_freqs_gqa = _compute_rope_freqs(
             ts[f"rope_freqs.weight"],
             meta["gemma4.rope.freq_base"],
@@ -698,6 +714,9 @@ class Gemma4E(Model):
                     shared_k_rsos_Btg_dtss=k_swa_rsos,
                     shared_v_rsos_Btg_dtss=v_swa_rsos,
                     shared_o_proj_input_scratchpad_Bhtv_dta=o_swa_proj_input_scratchpad,
+                    shared_fa_partial_o_SBHtv_f16=fa_swa_partial_o,
+                    shared_fa_partial_l_SBHt_fp32=fa_swa_partial_l,
+                    shared_fa_partial_m_SBHt_fp32=fa_swa_partial_m,
                     shared_last_and_this_layer_output_scratchpad_BtD_dtr=layer_output_scratchpad,
                     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss=layer_output_sos_scratchpad,
                 )
@@ -727,6 +746,9 @@ class Gemma4E(Model):
                     shared_k_rsos_Btg_dtss=k_gqa_rsos,
                     shared_v_rsos_Btg_dtss=v_gqa_rsos,
                     shared_o_proj_input_scratchpad_Bhtv_dta=o_gqa_proj_input_scratchpad,
+                    shared_fa_partial_o_SBHtv_f16=fa_gqa_partial_o,
+                    shared_fa_partial_l_SBHt_fp32=fa_gqa_partial_l,
+                    shared_fa_partial_m_SBHt_fp32=fa_gqa_partial_m,
                     shared_last_and_this_layer_output_scratchpad_BtD_dtr=layer_output_scratchpad,
                     shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss=layer_output_sos_scratchpad,
                 )

@@ -14,6 +14,7 @@
 #  tradeoff: smaller tile sizes for less wasted compute
 
 import triton
+import os
 from typing import Literal
 from triton import language as tl
 from g4b.tensor import Tensor
@@ -148,8 +149,17 @@ def _cfg(m: int, n: int, splits: int, *, warps: int, stages: int):
 
 
 def _configs():
+    if forced := os.environ.get("G4B_FA_FORCE_CONFIG"):
+        m, n, splits, warps, stages = map(int, forced.split(","))
+        return [_cfg(m, n, splits, warps=warps, stages=stages)]
     return gated_configs(
-        default=[_cfg(1, 32, 1, warps=4, stages=2)],
+        default=[
+            _cfg(1, 32, 1, warps=4, stages=2),
+            _cfg(1, 32, 2, warps=4, stages=2),
+            _cfg(1, 32, 4, warps=4, stages=2),
+            _cfg(1, 32, 8, warps=4, stages=2),
+            _cfg(1, 32, 16, warps=4, stages=2),
+        ],
         tuned=[
             _cfg(1, 64, 1, warps=4, stages=3),
             _cfg(1, 128, 1, warps=4, stages=3),
@@ -180,13 +190,43 @@ def _configs():
 def _prune_invalid_configs(configs, named_args, **kwargs):
     Q_CTX = kwargs["q_shape2"]
     max_kv_splits = kwargs["MAX_KV_SPLITS"]
+    phase = kwargs["PHASE"]
+    ctx_window_size = kwargs["ctx_window_size"]
 
     # Filter out configs where Q_BLOCKSIZE_T > Q_CTX
-    return [
+    valid = [
         conf
         for conf in configs
         if conf.kwargs.get("Q_BLOCKSIZE_T", 0) <= Q_CTX and conf.kwargs.get("NUM_KV_SPLITS", 1) <= max_kv_splits
     ]
+    if os.environ.get("G4B_FA_FORCE_CONFIG"):
+        return valid
+
+    if phase != PHASE_DECODE or Q_CTX != 1:
+        return [conf for conf in valid if conf.kwargs.get("NUM_KV_SPLITS", 1) == 1]
+
+    if max_kv_splits <= 1 or ctx_window_size <= 4096:
+        target_splits = 1
+    elif ctx_window_size < 8192:
+        target_splits = 4
+    elif ctx_window_size < 32768:
+        target_splits = 8
+    else:
+        target_splits = 16
+    target_splits = min(target_splits, max_kv_splits)
+
+    while target_splits > 1 and not any(
+        conf.kwargs.get("KV_BLOCKSIZE_T") == 32 and conf.kwargs.get("NUM_KV_SPLITS") == target_splits
+        for conf in valid
+    ):
+        target_splits //= 2
+
+    target = [
+        conf
+        for conf in valid
+        if conf.kwargs.get("KV_BLOCKSIZE_T") == 32 and conf.kwargs.get("NUM_KV_SPLITS") == target_splits
+    ]
+    return target or valid[:1]
 
 
 @triton.autotune(
@@ -546,9 +586,9 @@ def _reduce_split_kv_kernel(
     offs_t = pid_q_t * BLOCKSIZE_T + tl.arange(0, BLOCKSIZE_T)[None, None, :, None]
     offs_d = tl.arange(0, HEAD_DIM)[None, None, None, :]
 
-    m = tl.full((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, 1), float("-inf"), dtype=partial_m_ptr.dtype.element_ty)
-    l = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, 1), dtype=partial_l_ptr.dtype.element_ty)
-    accum = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, HEAD_DIM), dtype=partial_o_ptr.dtype.element_ty)
+    m = tl.full((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, 1), float("-inf"), dtype=tl.float32)
+    l = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, 1), dtype=tl.float32)
+    accum = tl.zeros((BLOCKSIZE_B, BLOCKSIZE_H, BLOCKSIZE_T, HEAD_DIM), dtype=tl.float32)
     for split_i in tl.range(0, NUM_KV_SPLITS):
         accum_i = tl.load(
             partial_o_ptr
@@ -583,7 +623,7 @@ def _reduce_split_kv_kernel(
         alpha_new = tl.exp2(m_i - m_new)
         alpha_cur = tl.exp2(m - m_new)
 
-        accum = accum * alpha_cur + accum_i * alpha_new
+        accum = accum * alpha_cur + accum_i.to(tl.float32) * alpha_new
         l = l * alpha_cur + l_i * alpha_new
         m = m_new
 
@@ -626,10 +666,12 @@ def flash_attention(
         raise ValueError("partial_o, partial_l, and partial_m must be provided together")
     max_kv_splits = min(partial_o.shape[0], partial_l.shape[0], partial_m.shape[0]) if partial_o is not None else 1
     selected_num_kv_splits = 1
+    selected_meta = {}
 
     def grid_fn(META):
-        nonlocal selected_num_kv_splits
+        nonlocal selected_num_kv_splits, selected_meta
         selected_num_kv_splits = META["NUM_KV_SPLITS"]
+        selected_meta = dict(META)
         return (
             triton.cdiv(q.shape[2], META["Q_BLOCKSIZE_T"]),
             selected_num_kv_splits,
@@ -655,6 +697,16 @@ def flash_attention(
         USE_FP32_DOT=use_fp32_dot,
         STAGE=stage,
     )
+    if os.environ.get("G4B_FA_PRINT_CONFIG"):
+        print(
+            "fa2 selected",
+            {
+                "Q_BLOCKSIZE_T": selected_meta.get("Q_BLOCKSIZE_T"),
+                "KV_BLOCKSIZE_T": selected_meta.get("KV_BLOCKSIZE_T"),
+                "NUM_KV_SPLITS": selected_meta.get("NUM_KV_SPLITS"),
+                "Q_BLOCKSIZE_H": q_blocksize_h,
+            },
+        )
     k2 = None
     if selected_num_kv_splits > 1:
         reduce_grid_fn = lambda META: (
