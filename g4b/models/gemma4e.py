@@ -193,7 +193,6 @@ class Gemma4E(Model):
     sample_positions_B_int32: Tensor
     cache_offsets_B_int32: Tensor
     time_dim_sizes_B_int32: Tensor  # time dim is dynamically sized
-    # TODO update this in separate kernel after sampling, update triggered by scheduler.py through some new Model method
     user_in_prefill_or_decode_B_uint8: Tensor  # 0 -> prefill, 1 -> decode
     output_copy_ring: tuple[OutputCopySlot, ...]
     output_copy_ring_idx: list[int]
