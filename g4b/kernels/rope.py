@@ -259,7 +259,7 @@ def _populate_rope_frequencies_kernel(
 
     if freq_scalars_ptr is not None:
         freq_scalars = tl.load(freq_scalars_ptr + offs * freq_scalars_stride0, mask=offs < out_shape0)
-        out *= freq_scalars
+        out /= freq_scalars
 
     tl.store(out_ptr + offs * out_stride0, out, mask=offs < out_shape0)
 
