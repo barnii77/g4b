@@ -84,26 +84,46 @@ class _UserChatManager:
         return [tokenizer_mod.ResponseFragment(text)] if text else []
 
     async def continue_processing(self):
-        while True:
-            done, _ = await asyncio.wait(
-                [self.change_cv.wait()], timeout=RESPONSE_CHUNK_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+        wait_task = asyncio.ensure_future(self._wait_for_change())
+        try:
+            done, pending = await asyncio.wait(
+                [wait_task], timeout=RESPONSE_CHUNK_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
             )
-            if self.active_request and done:
-                break
-            else:
-                # timeout: must drain at least every RESPONSE_CHUNK_TIMEOUT seconds to ensure smooth UX
-                assert _tokenizer.eos not in self.token_buf
-                return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), False)
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        except asyncio.CancelledError:
+            wait_task.cancel()
+            raise
 
-        new_toks = self.active_request.get_new_tokens()
+        signaled = wait_task in done
+        if not signaled:
+            # Timeout: drain whatever we have so the client sees smooth progress.
+            return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), False)
+
+        new_toks = self.active_request.get_new_tokens() if self.active_request else []
         self.token_buf.extend(new_toks)
 
-        if (is_terminal := _tokenizer.eos in new_toks) or len(self.token_buf) > RESPONSE_CHUNK_BUFFER_SIZE:
+        request_done = bool(self.active_request and self.active_request._done)
+        is_terminal = request_done or _tokenizer.eos in new_toks
+        if request_done:
+            self.active_request = None
+
+        if is_terminal or len(self.token_buf) > RESPONSE_CHUNK_BUFFER_SIZE:
             return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), is_terminal)
         return _UserChatManagerEvent([], False)
 
+    async def _wait_for_change(self):
+        async with self.change_cv:
+            await self.change_cv.wait()
+
     def submit(self, frag: _ModelInput):
         self.chat_fragments.append(frag)
+        if self.active_request and self.active_request._done:
+            self.active_request = None
         if self.active_request:
             return
         inp = _chat_template.apply(self.chat_fragments)
@@ -126,23 +146,22 @@ async def chat(ws: WebSocket):
 
     is_init = False
     state = _UserChatManager()
+    recv_task = asyncio.create_task(ws.receive_json())
+    continue_task = asyncio.create_task(state.continue_processing())
     try:
-        continue_processing_coro = state.continue_processing()
-        recv_json_coro = ws.receive_json()
-
         while True:
-            done, pending = await asyncio.wait(
-                [recv_json_coro, continue_processing_coro], return_when=asyncio.FIRST_COMPLETED
+            done, _pending = await asyncio.wait(
+                {recv_task, continue_task}, return_when=asyncio.FIRST_COMPLETED
             )
 
-            if recv_json_coro in done:
-                event = recv_json_coro.result()
-                recv_json_coro = ws.receive_json()
-            else:
-                event = None
-            if continue_processing_coro in done:
-                advancements: _UserChatManagerEvent = continue_processing_coro.result()
-                continue_processing_coro = state.continue_processing()
+            event = None
+            if recv_task in done:
+                event = recv_task.result()
+                recv_task = asyncio.create_task(ws.receive_json())
+
+            if continue_task in done:
+                advancements: _UserChatManagerEvent = continue_task.result()
+                continue_task = asyncio.create_task(state.continue_processing())
             else:
                 advancements: _UserChatManagerEvent = _UserChatManagerEvent([], False)
 
@@ -240,6 +259,19 @@ async def chat(ws: WebSocket):
 
     except WebSocketDisconnect:
         pass
+    finally:
+        if not recv_task.done():
+            recv_task.cancel()
+            try:
+                await recv_task
+            except asyncio.CancelledError:
+                pass
+        if not continue_task.done():
+            continue_task.cancel()
+            try:
+                await continue_task
+            except asyncio.CancelledError:
+                pass
 
 
 class Uvicorn:
@@ -265,7 +297,7 @@ class Uvicorn:
 
 
 async def _chat_err(ws: WebSocket, error: str, code: int = GENERIC_ERROR):
-    await ws.send_json({"type": "error", "detail": error})
+    await ws.send_json({"type": "error", "code": code, "detail": error})
     await ws.close(code=4000, reason=error)
     raise RuntimeError(error)
 
@@ -285,6 +317,6 @@ async def _assert_dict(x, err: str, ws) -> dict:
 def _add_obfuscation(resp: dict) -> dict:
     l = len(json.dumps(resp))
     n = round(random.uniform(l // 2, 3 * l // 2))
-    obfuscation = base64.b64encode(secrets.token_bytes(n))
+    obfuscation = base64.b64encode(secrets.token_bytes(n)).decode("ascii")
     resp["obfuscation"] = obfuscation
     return resp
