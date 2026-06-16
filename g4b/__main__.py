@@ -80,6 +80,7 @@ def main():
     serve.register_scheduler(scheduler)
     serve.register_tokenizer(tokenizer)
     serve.register_chat_template(chat_template)
+    serve.register_max_ctx_len(config.context_len)
     uvicorn = serve.Uvicorn.start(config.host, config.port)
 
     try:

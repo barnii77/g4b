@@ -44,6 +44,7 @@ app = FastAPI()
 _scheduler: "scheduler_mod.Scheduler"
 _tokenizer: "tokenizer_mod.Tokenizer"
 _chat_template: "tokenizer_mod.ChatTemplate"
+_max_ctx_len: int
 
 RESPONSE_CHUNK_TIMEOUT = 5
 RESPONSE_CHUNK_BUFFER_SIZE = 48  # tokens
@@ -67,6 +68,11 @@ def register_chat_template(ct: "tokenizer_mod.ChatTemplate"):
     _chat_template = ct
 
 
+def register_max_ctx_len(clen: int):
+    global _max_ctx_len
+    _max_ctx_len = clen
+
+
 type _ModelOutput = tokenizer_mod.ResponseFragment | tokenizer_mod.ToolCall
 type _ModelInput = tokenizer_mod.PromptFragment | tokenizer_mod.ToolOutput
 
@@ -87,7 +93,8 @@ async def _notify_condition(cv: asyncio.Condition):
 
 
 class _UserChatManager:
-    def __init__(self):
+    def __init__(self, max_context_len: int):
+        self.max_context_len = max_context_len
         self.chat_fragments: list["tokenizer_mod.ChatFragment"] = []
         self.active_request: "scheduler_mod.Request | None" = None
 
@@ -106,29 +113,48 @@ class _UserChatManager:
         self._current_response_parts: list[str] = []
         self._terminal_pending = False
 
-    def init(self, chat_fragments: list["tokenizer_mod.ChatFragment"]):
+    def init(self, chat_fragments: list["tokenizer_mod.ChatFragment"]) -> int:
+        """
+        Initialize history. Returns MAX_CONTEXT_WINDOW_EXCEEDED_ERROR if the
+        serialized history already exceeds max_context_len, otherwise 0.
+        """
         self.chat_fragments = chat_fragments
         self.active_request = None
         self.token_buf.clear()
         self._current_response_parts.clear()
         self._terminal_pending = False
+        if self._tokenize_history_len() > self.max_context_len:
+            return MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
+        return 0
 
-    def submit(self, frag: _ModelInput) -> bool:
+    def _tokenize_history_len(self) -> int:
+        if not self.chat_fragments:
+            return 0
+        inp = _chat_template.apply(self.chat_fragments)
+        return len(_tokenizer.tokenize(inp))
+
+    def submit(self, frag: _ModelInput) -> tuple[bool, int | None]:
         """
         Submit a user/tool fragment.
 
-        Returns False if a request is already active. Crucially, the fragment is
-        not appended to chat history in that case, avoiding silent history
-        corruption.
+        Returns (ok, error_code).  ok is False if a request is already active
+        or if the resulting token sequence would exceed max_context_len.
+        Crucially, on failure the fragment is not appended to chat history,
+        avoiding silent history corruption.
         """
         self._poll_active_request()
 
         if self.active_request is not None or self._terminal_pending:
-            return False
+            return False, GENERIC_ERROR
 
         self.chat_fragments.append(frag)
         inp = _chat_template.apply(self.chat_fragments)
         toks = _tokenizer.tokenize(inp)
+
+        if len(toks) > self.max_context_len:
+            # Roll back the history append because we cannot honor this request.
+            self.chat_fragments.pop()
+            return False, MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
 
         rq = scheduler_mod.Request(toks, self.change_cv)
         _scheduler.submit(rq)
@@ -137,7 +163,7 @@ class _UserChatManager:
         self.token_buf.clear()
         self._current_response_parts.clear()
         self._terminal_pending = False
-        return True
+        return True, None
 
     def abort(self) -> bool:
         """
@@ -289,7 +315,7 @@ async def chat(ws: WebSocket):
     await ws.accept()
 
     is_init = False
-    state = _UserChatManager()
+    state = _UserChatManager(_max_ctx_len)
 
     recv_task = asyncio.create_task(ws.receive_json())
     continue_task = asyncio.create_task(state.continue_processing())
@@ -393,7 +419,13 @@ async def chat(ws: WebSocket):
 
                             parsed_events.append(parsed_ev)
 
-                        state.init(parsed_events)
+                        err_code = state.init(parsed_events)
+                        if err_code != 0:
+                            await _chat_err(
+                                ws,
+                                f"provided chat history exceeds max context length ({state.max_context_len} tokens)",
+                                code=err_code,
+                            )
                         is_init = True
 
                     case "user.prompt":
@@ -403,12 +435,18 @@ async def chat(ws: WebSocket):
                         content = await _assert_string(event.get("content"), "`content` must be string", ws)
                         parsed = tokenizer_mod.PromptFragment(content)
 
-                        if not state.submit(parsed):
+                        ok, err_code = state.submit(parsed)
+                        if not ok:
+                            detail = (
+                                "request already active; send user.abort before submitting a new prompt"
+                                if err_code != MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
+                                else f"prompt exceeds max context length ({state.max_context_len} tokens); truncate the conversation"
+                            )
                             await ws.send_json(
                                 {
                                     "type": "error",
-                                    "code": GENERIC_ERROR,
-                                    "detail": "request already active; send user.abort before submitting a new prompt",
+                                    "code": err_code,
+                                    "detail": detail,
                                 }
                             )
 
@@ -419,12 +457,18 @@ async def chat(ws: WebSocket):
                         output = await _assert_string(event.get("output"), "`output` must be string", ws)
                         parsed = tokenizer_mod.ToolOutput(output)
 
-                        if not state.submit(parsed):
+                        ok, err_code = state.submit(parsed)
+                        if not ok:
+                            detail = (
+                                "request already active; send user.abort before submitting tool output"
+                                if err_code != MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
+                                else f"tool output exceeds max context length ({state.max_context_len} tokens); truncate the conversation"
+                            )
                             await ws.send_json(
                                 {
                                     "type": "error",
-                                    "code": GENERIC_ERROR,
-                                    "detail": "request already active; send user.abort before submitting tool output",
+                                    "code": err_code,
+                                    "detail": detail,
                                 }
                             )
 
@@ -440,7 +484,8 @@ async def chat(ws: WebSocket):
     except (WebSocketDisconnect, _ChatClosed):
         pass
     finally:
-        state.abort()
+        with contextlib.suppress(Exception):
+            state.abort()
         await _cancel_task(recv_task)
         await _cancel_task(continue_task)
 
