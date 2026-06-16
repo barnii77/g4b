@@ -2,24 +2,28 @@ import triton
 from triton import language as tl
 from typing import Literal
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 128}),
-        triton.Config({"BLOCKSIZE0": 16, "BLOCKSIZE1": 128}),
-        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 256}),
-        triton.Config({"BLOCKSIZE0": 8, "BLOCKSIZE1": 256}),
-        triton.Config({"BLOCKSIZE0": 2, "BLOCKSIZE1": 256}),
-        triton.Config({"BLOCKSIZE0": 4, "BLOCKSIZE1": 512}),
-        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 512}),
-        triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 1024}),
-        triton.Config({"BLOCKSIZE0": 4, "BLOCKSIZE1": 1024}),
-        triton.Config({"BLOCKSIZE0": 16, "BLOCKSIZE1": 256}),
-        triton.Config({"BLOCKSIZE0": 64, "BLOCKSIZE1": 512}),
-        triton.Config({"BLOCKSIZE0": 32, "BLOCKSIZE1": 1024}),
-    ],
+    configs=gated_configs(
+        default=[
+            triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 256}),
+        ],
+        tuned=[
+            triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 128}),
+            triton.Config({"BLOCKSIZE0": 16, "BLOCKSIZE1": 128}),
+            triton.Config({"BLOCKSIZE0": 8, "BLOCKSIZE1": 256}),
+            triton.Config({"BLOCKSIZE0": 2, "BLOCKSIZE1": 256}),
+            triton.Config({"BLOCKSIZE0": 4, "BLOCKSIZE1": 512}),
+            triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 512}),
+            triton.Config({"BLOCKSIZE0": 1, "BLOCKSIZE1": 1024}),
+            triton.Config({"BLOCKSIZE0": 4, "BLOCKSIZE1": 1024}),
+            triton.Config({"BLOCKSIZE0": 16, "BLOCKSIZE1": 256}),
+            triton.Config({"BLOCKSIZE0": 64, "BLOCKSIZE1": 512}),
+            triton.Config({"BLOCKSIZE0": 32, "BLOCKSIZE1": 1024}),
+        ],
+    ),
     key=[
         # fmt: off
         "OP",

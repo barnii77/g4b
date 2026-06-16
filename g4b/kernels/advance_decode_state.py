@@ -2,15 +2,19 @@ import triton
 from triton import language as tl
 from g4b.tensor import Tensor
 from g4b.kernels.fa2 import PHASE_DECODE_CONSTEXPR
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCKSIZE0": 128}),
-        triton.Config({"BLOCKSIZE0": 256}),
-        triton.Config({"BLOCKSIZE0": 512}),
-    ],
+    configs=gated_configs(
+        default=[
+            triton.Config({"BLOCKSIZE0": 256}),
+        ],
+        tuned=[
+            triton.Config({"BLOCKSIZE0": 128}),
+            triton.Config({"BLOCKSIZE0": 512}),
+        ],
+    ),
     key=[
         # fmt: off
         "input_token_ids_shape0", "input_token_ids_shape1",

@@ -1,16 +1,20 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCKSIZE0": 128}),
-        triton.Config({"BLOCKSIZE0": 256}),
-        triton.Config({"BLOCKSIZE0": 512}),
-        triton.Config({"BLOCKSIZE0": 1024}),
-    ],
+    configs=gated_configs(
+        default=[
+            triton.Config({"BLOCKSIZE0": 256}),
+        ],
+        tuned=[
+            triton.Config({"BLOCKSIZE0": 128}),
+            triton.Config({"BLOCKSIZE0": 512}),
+            triton.Config({"BLOCKSIZE0": 1024}),
+        ],
+    ),
     key=["x_shape0", "x_stride0"],
     do_bench=default_bencher,
     cache_results=True,

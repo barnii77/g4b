@@ -2,7 +2,7 @@ import math
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher, tanh_jfn
+from g4b.kernels.utils import launch, default_bencher, tanh_jfn, gated_configs
 from g4b.utils import to_int_exact
 
 
@@ -82,25 +82,29 @@ def _bitonic_scan_find_top_k_logits_jfn(
 # TODO these configs assume top_k <= 64, but really I should filter them based on whether this is true
 @triton.autotune(
     # fmt: off
-    configs=[
-        # ---- decode / one sample row per program ----
-        # TODO one of these configs seems to be triggering a triton bug?
-        _cfg(1, 1, 64, warps=1),
-        _cfg(1, 1, 64, warps=2),
-        _cfg(1, 1, 64, warps=4),
-        # _cfg(1, 1, 128, warps=4),
-        # _cfg(1, 1, 256, warps=8),
-        # _cfg(1, 1, 512, warps=8),
-        # ---- small token batching ----
-        # _cfg(1, 2, 128, warps=4),
-        # _cfg(1, 2, 256, warps=8),
-        # _cfg(1, 4, 128, warps=4),
-        # _cfg(1, 4, 256, warps=8),
-        # ---- batch batching ----
-        # _cfg(2, 1, 128, warps=4),
-        # _cfg(2, 1, 256, warps=8),
-        # _cfg(4, 1, 128, warps=4),
-    ],
+    configs=gated_configs(
+        default=[
+            _cfg(1, 1, 64, warps=1),
+        ],
+        tuned=[
+            # ---- decode / one sample row per program ----
+            # TODO one of these configs seems to be triggering a triton bug?
+            # _cfg(1, 1, 64, warps=2),
+            # _cfg(1, 1, 64, warps=4),
+            # _cfg(1, 1, 128, warps=4),
+            # _cfg(1, 1, 256, warps=8),
+            # _cfg(1, 1, 512, warps=8),
+            # ---- small token batching ----
+            # _cfg(1, 2, 128, warps=4),
+            # _cfg(1, 2, 256, warps=8),
+            # _cfg(1, 4, 128, warps=4),
+            # _cfg(1, 4, 256, warps=8),
+            # ---- batch batching ----
+            # _cfg(2, 1, 128, warps=4),
+            # _cfg(2, 1, 256, warps=8),
+            # _cfg(4, 1, 128, warps=4),
+        ]
+    ),
     # fmt: on
     key=[
         # fmt: off
@@ -205,25 +209,29 @@ def _sample_logits_parallel_reduce_kernel(
 # TODO these configs assume top_k <= 64, but really I should filter them based on whether this is true
 @triton.autotune(
     # fmt: off
-    configs=[
-        # ---- decode / one sample row per program ----
-        # TODO one of these configs seems to be triggering a triton bug?
-        _cfg(1, 1, 64, warps=1),
-        _cfg(1, 1, 64, warps=2),
-        _cfg(1, 1, 64, warps=4),
-        # _cfg(1, 1, 128, warps=4),
-        # _cfg(1, 1, 256, warps=8),
-        # _cfg(1, 1, 512, warps=8),
-        # ---- small token batching ----
-        # _cfg(1, 2, 128, warps=4),
-        # _cfg(1, 2, 256, warps=8),
-        # _cfg(1, 4, 128, warps=4),
-        # _cfg(1, 4, 256, warps=8),
-        # ---- batch batching ----
-        # _cfg(2, 1, 128, warps=4),
-        # _cfg(2, 1, 256, warps=8),
-        # _cfg(4, 1, 128, warps=4),
-    ],
+    configs=gated_configs(
+        default=[
+            _cfg(1, 1, 64, warps=1),
+        ],
+        tuned=[
+            # ---- decode / one sample row per program ----
+            # TODO one of these configs seems to be triggering a triton bug?
+            # _cfg(1, 1, 64, warps=2),
+            # _cfg(1, 1, 64, warps=4),
+            # _cfg(1, 1, 128, warps=4),
+            # _cfg(1, 1, 256, warps=8),
+            # _cfg(1, 1, 512, warps=8),
+            # ---- small token batching ----
+            # _cfg(1, 2, 128, warps=4),
+            # _cfg(1, 2, 256, warps=8),
+            # _cfg(1, 4, 128, warps=4),
+            # _cfg(1, 4, 256, warps=8),
+            # ---- batch batching ----
+            # _cfg(2, 1, 128, warps=4),
+            # _cfg(2, 1, 256, warps=8),
+            # _cfg(4, 1, 128, warps=4),
+        ]
+    ),
     # fmt: on
     key=[
         # fmt: off

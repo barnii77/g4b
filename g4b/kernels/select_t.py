@@ -1,7 +1,7 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 
 
 def _cfg(b0: int, b2: int, *, warps: int, stages: int = 3):
@@ -9,13 +9,17 @@ def _cfg(b0: int, b2: int, *, warps: int, stages: int = 3):
 
 
 @triton.autotune(
-    configs=[
-        _cfg(1, 64, warps=1),
-        _cfg(1, 128, warps=2),
-        _cfg(1, 256, warps=4),
-        _cfg(2, 128, warps=2),
-        _cfg(4, 64, warps=2),
-    ],
+    configs=gated_configs(
+        default=[
+            _cfg(1, 128, warps=2),
+        ],
+        tuned=[
+            _cfg(1, 64, warps=1),
+            _cfg(1, 256, warps=4),
+            _cfg(2, 128, warps=2),
+            _cfg(4, 64, warps=2),
+        ],
+    ),
     key=[
         # fmt: off
         "x_shape0", "x_shape1", "x_shape2",

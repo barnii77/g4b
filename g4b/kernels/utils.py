@@ -1,9 +1,26 @@
 import math
+import os
 import triton
 from triton import language as tl
 from triton.runtime import Autotuner, Heuristics
 from triton.experimental.gluon import language as gl
 from g4b import tensor
+
+G4B_SKIP_TUNING = bool(os.environ.get("G4B_SKIP_TUNING"))
+
+
+def gated_configs(default, *, tuned=()):
+    """Gate autotune configs on G4B_SKIP_TUNING.
+
+    When G4B_SKIP_TUNING is set we only expose `default` (the hand-picked config(s) currently used in production),
+    which skips the (expensive) autotuning search. Otherwise we expose `default + tuned`, i.e. the full search space.
+
+    `default` is always returned first so the cached/first config stays identical to today's behaviour.
+    """
+    default = list(default)
+    if G4B_SKIP_TUNING:
+        return default
+    return default + list(tuned)
 
 
 @triton.jit

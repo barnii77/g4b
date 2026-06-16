@@ -1,7 +1,7 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 from g4b.kernels.memset import memset_contiguous
 
 
@@ -26,29 +26,33 @@ def _cfg(
 
 @triton.autotune(
     # fmt: off
-    configs=[
-        # ---- decode / tiny token count ----
-        _cfg(1, 1, 64, warps=1),
-        _cfg(1, 1, 128, warps=2),
-        _cfg(1, 1, 256, warps=4),
-        # ---- small prefill / a few positions per program ----
-        _cfg(1, 2, 64, warps=1),
-        _cfg(1, 2, 128, warps=2),
-        _cfg(1, 2, 256, warps=4),
-        _cfg(1, 4, 64, warps=2),
-        _cfg(1, 4, 128, warps=4),
-        _cfg(1, 4, 256, warps=4),
-        # ---- more position batching ----
-        _cfg(1, 8, 64, warps=4),
-        _cfg(1, 8, 128, warps=4),
-        # ---- batch batching ----
-        _cfg(2, 1, 64, warps=1),
-        _cfg(2, 1, 128, warps=2),
-        _cfg(2, 2, 64, warps=2),
-        _cfg(2, 2, 128, warps=4),
-        _cfg(4, 1, 64, warps=2),
-        _cfg(4, 1, 128, warps=4),
-    ],
+    configs=gated_configs(
+        default=[
+            _cfg(1, 1, 128, warps=2),
+        ],
+        tuned=[
+            # ---- decode / tiny token count ----
+            _cfg(1, 1, 64, warps=1),
+            _cfg(1, 1, 256, warps=4),
+            # ---- small prefill / a few positions per program ----
+            _cfg(1, 2, 64, warps=1),
+            _cfg(1, 2, 128, warps=2),
+            _cfg(1, 2, 256, warps=4),
+            _cfg(1, 4, 64, warps=2),
+            _cfg(1, 4, 128, warps=4),
+            _cfg(1, 4, 256, warps=4),
+            # ---- more position batching ----
+            _cfg(1, 8, 64, warps=4),
+            _cfg(1, 8, 128, warps=4),
+            # ---- batch batching ----
+            _cfg(2, 1, 64, warps=1),
+            _cfg(2, 1, 128, warps=2),
+            _cfg(2, 2, 64, warps=2),
+            _cfg(2, 2, 128, warps=4),
+            _cfg(4, 1, 64, warps=2),
+            _cfg(4, 1, 128, warps=4),
+        ],
+    ),
     # fmt: on
     key=[
         # fmt: off

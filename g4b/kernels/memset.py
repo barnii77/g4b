@@ -5,7 +5,7 @@ from g4b.kernels.utils import launch, default_bencher
 
 
 @triton.autotune(
-    configs=[triton.Config({"BLOCKSIZE": 2**i}) for i in range(6, 13)],
+    configs=[triton.Config({"BLOCKSIZE": 256})],
     key=["x_shape0"],
     do_bench=default_bencher,
     cache_results=True,

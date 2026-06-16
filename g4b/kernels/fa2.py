@@ -17,7 +17,7 @@ import triton
 from typing import Literal
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 
 STAGE_FULL = 1
 STAGE_ON_BAND = 2
@@ -148,33 +148,33 @@ def _cfg(m: int, n: int, splits: int, *, warps: int, stages: int):
 
 
 def _configs():
-    return [
-        # fmt: off
-        _cfg(1, 32, 1, warps=4, stages=2),
-        _cfg(1, 64, 1, warps=4, stages=3),
-        _cfg(1, 128, 1, warps=4, stages=3),
-        _cfg(1, 64, 2, warps=4, stages=3),
-        _cfg(1, 128, 2, warps=4, stages=3),
-        _cfg(1, 64, 4, warps=4, stages=3),
-        _cfg(1, 128, 4, warps=4, stages=3),
-        _cfg(16, 32, 1, warps=4, stages=2),
-        _cfg(16, 64, 1, warps=4, stages=3),
-        _cfg(16, 128, 1, warps=4, stages=3),
-        _cfg(16, 256, 1, warps=4, stages=3),
-        _cfg(32, 32, 1, warps=4, stages=2),
-        _cfg(32, 64, 1, warps=4, stages=3),
-        _cfg(32, 128, 1, warps=4, stages=3),
-        _cfg(32, 256, 1, warps=4, stages=3),
-        _cfg(64, 32, 1, warps=4, stages=2),
-        _cfg(64, 64, 1, warps=4, stages=3),
-        _cfg(64, 128, 1, warps=4, stages=3),
-        _cfg(64, 256, 1, warps=4, stages=3),
-        _cfg(128, 32, 1, warps=4, stages=2),
-        _cfg(128, 64, 1, warps=4, stages=3),
-        _cfg(128, 128, 1, warps=8, stages=3),
-        _cfg(128, 256, 1, warps=8, stages=3),
-        # fmt: on
-    ]
+    return gated_configs(
+        default=[_cfg(1, 32, 1, warps=4, stages=2)],
+        tuned=[
+            _cfg(1, 64, 1, warps=4, stages=3),
+            _cfg(1, 128, 1, warps=4, stages=3),
+            _cfg(1, 64, 2, warps=4, stages=3),
+            _cfg(1, 128, 2, warps=4, stages=3),
+            _cfg(1, 64, 4, warps=4, stages=3),
+            _cfg(1, 128, 4, warps=4, stages=3),
+            _cfg(16, 32, 1, warps=4, stages=2),
+            _cfg(16, 64, 1, warps=4, stages=3),
+            _cfg(16, 128, 1, warps=4, stages=3),
+            _cfg(16, 256, 1, warps=4, stages=3),
+            _cfg(32, 32, 1, warps=4, stages=2),
+            _cfg(32, 64, 1, warps=4, stages=3),
+            _cfg(32, 128, 1, warps=4, stages=3),
+            _cfg(32, 256, 1, warps=4, stages=3),
+            _cfg(64, 32, 1, warps=4, stages=2),
+            _cfg(64, 64, 1, warps=4, stages=3),
+            _cfg(64, 128, 1, warps=4, stages=3),
+            _cfg(64, 256, 1, warps=4, stages=3),
+            _cfg(128, 32, 1, warps=4, stages=2),
+            _cfg(128, 64, 1, warps=4, stages=3),
+            _cfg(128, 128, 1, warps=8, stages=3),
+            _cfg(128, 256, 1, warps=8, stages=3),
+        ],
+    )
 
 
 def _prune_invalid_configs(configs, named_args, **kwargs):
@@ -457,22 +457,22 @@ def _reduce_cfg(b: int, h: int, t: int, *, warps: int, stages: int = 3):
 
 
 def _reduce_configs():
-    return [
-        # fmt: off
-        _reduce_cfg(1, 1, 1, warps=1, stages=2),
-        _reduce_cfg(1, 2, 1, warps=1, stages=2),
-        _reduce_cfg(1, 4, 1, warps=2, stages=2),
-        _reduce_cfg(2, 1, 1, warps=1, stages=2),
-        _reduce_cfg(4, 1, 1, warps=2, stages=2),
-        _reduce_cfg(1, 1, 16, warps=2, stages=2),
-        _reduce_cfg(1, 2, 16, warps=4, stages=2),
-        _reduce_cfg(1, 4, 16, warps=4, stages=2),
-        _reduce_cfg(1, 1, 32, warps=4, stages=2),
-        _reduce_cfg(1, 2, 32, warps=4, stages=2),
-        _reduce_cfg(1, 1, 64, warps=4, stages=3),
-        _reduce_cfg(1, 2, 64, warps=4, stages=3),
-        # fmt: on
-    ]
+    return gated_configs(
+        default=[_reduce_cfg(1, 1, 1, warps=1, stages=2)],
+        tuned=[
+            _reduce_cfg(1, 2, 1, warps=1, stages=2),
+            _reduce_cfg(1, 4, 1, warps=2, stages=2),
+            _reduce_cfg(2, 1, 1, warps=1, stages=2),
+            _reduce_cfg(4, 1, 1, warps=2, stages=2),
+            _reduce_cfg(1, 1, 16, warps=2, stages=2),
+            _reduce_cfg(1, 2, 16, warps=4, stages=2),
+            _reduce_cfg(1, 4, 16, warps=4, stages=2),
+            _reduce_cfg(1, 1, 32, warps=4, stages=2),
+            _reduce_cfg(1, 2, 32, warps=4, stages=2),
+            _reduce_cfg(1, 1, 64, warps=4, stages=3),
+            _reduce_cfg(1, 2, 64, warps=4, stages=3),
+        ],
+    )
 
 
 def _prune_invalid_reduce_configs(configs, named_args, **kwargs):

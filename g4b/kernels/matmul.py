@@ -3,7 +3,7 @@ import triton
 from triton import language as tl
 from g4b import tensor
 from g4b.tensor import Tensor, DType
-from g4b.kernels.utils import launch, default_bencher, jfn_cache_key
+from g4b.kernels.utils import launch, default_bencher, jfn_cache_key, gated_configs
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.kernels.rsos import compute_rsos
 from g4b.utils import contiguous_strides_for_shape
@@ -84,50 +84,52 @@ def _cfg(
 
 
 def _matmul_3d_autotune_configs():
-    return [
-        # ---- aggressive ----
-        _cfg(1, 32, 32, 32, 8, warps=4, stages=3),
-        _cfg(1, 64, 32, 32, 8, warps=4, stages=3),
-        _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
-        _cfg(1, 64, 32, 128, 8, split_k=2, warps=4, stages=3),
-        _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
-        _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
-        _cfg(1, 64, 64, 64, 8, warps=4, stages=3),
-        _cfg(1, 64, 64, 256, 8, warps=4, stages=3),
-        _cfg(1, 64, 128, 64, 8, warps=4, stages=3),
-        _cfg(1, 64, 128, 256, 8, warps=4, stages=3),
-        _cfg(2, 64, 64, 128, 8, warps=4, stages=3),
-        _cfg(2, 64, 128, 128, 8, warps=4, stages=3),
-        # ---- small / skinny-N / decode-ish ----
-        # Effective MxN: 16x16, 16x32, 32x16, 32x32
-        # _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
-        # # _cfg(1, 16, 64, 32, 8, warps=4, stages=3),
-        # # _cfg(2, 16, 64, 16, 8, warps=4, stages=3),
-        # _cfg(2, 16, 64, 32, 8, warps=4, stages=3),
-        # # ---- normal balanced tiles ----
-        # # Effective MxN: 32x64, 64x32, 64x64
-        # # _cfg(2, 16, 64, 64, 8, warps=4, stages=3),
-        # # _cfg(4, 16, 64, 32, 8, warps=4, stages=3),
-        # _cfg(4, 16, 64, 64, 8, warps=4, stages=3),
-        # # Larger K tile: usually good when K is big and register pressure is fine.
-        # # _cfg(2, 16, 128, 64, 8, warps=4, stages=3),
-        # # _cfg(4, 16, 128, 32, 8, warps=4, stages=3),
-        # _cfg(4, 16, 128, 64, 8, warps=4, stages=3),
-        # # ---- bigger output tiles ----
-        # # Effective MxN: 64x128, 128x64, 128x128
-        # # _cfg(4, 16, 64, 128, 8, warps=4, stages=4),
-        # # _cfg(8, 16, 64, 64, 8, warps=4, stages=4),
-        # # _cfg(8, 16, 64, 128, 8, warps=8, stages=4),
-        # _cfg(4, 16, 128, 128, 8, warps=4, stages=4),
-        # # _cfg(8, 16, 128, 64, 8, warps=4, stages=4),
-        # _cfg(8, 16, 128, 128, 8, warps=8, stages=4),
-        # # ---- split-K variants ----
-        # _cfg(2, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
-        # # _cfg(4, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
-        # # _cfg(4, 16, 128, 64, 8, split_k=2, warps=4, stages=4),
-        # # _cfg(2, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
-        # _cfg(4, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
-    ]
+    return gated_configs(
+        default=[_cfg(1, 32, 32, 32, 8, warps=4, stages=3)],
+        tuned=[
+            # ---- aggressive ----
+            _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
+            _cfg(1, 64, 32, 32, 8, warps=4, stages=3),
+            _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
+            _cfg(1, 64, 32, 128, 8, split_k=2, warps=4, stages=3),
+            _cfg(1, 128, 32, 128, 8, warps=4, stages=3),
+            _cfg(1, 64, 64, 64, 8, warps=4, stages=3),
+            _cfg(1, 64, 64, 256, 8, warps=4, stages=3),
+            _cfg(1, 64, 128, 64, 8, warps=4, stages=3),
+            _cfg(1, 64, 128, 256, 8, warps=4, stages=3),
+            _cfg(2, 64, 64, 128, 8, warps=4, stages=3),
+            _cfg(2, 64, 128, 128, 8, warps=4, stages=3),
+            # ---- small / skinny-N / decode-ish ----
+            # Effective MxN: 16x16, 16x32, 32x16, 32x32
+            # _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
+            # # _cfg(1, 16, 64, 32, 8, warps=4, stages=3),
+            # # _cfg(2, 16, 64, 16, 8, warps=4, stages=3),
+            # _cfg(2, 16, 64, 32, 8, warps=4, stages=3),
+            # # ---- normal balanced tiles ----
+            # # Effective MxN: 32x64, 64x32, 64x64
+            # # _cfg(2, 16, 64, 64, 8, warps=4, stages=3),
+            # # _cfg(4, 16, 64, 32, 8, warps=4, stages=3),
+            # _cfg(4, 16, 64, 64, 8, warps=4, stages=3),
+            # # Larger K tile: usually good when K is big and register pressure is fine.
+            # # _cfg(2, 16, 128, 64, 8, warps=4, stages=3),
+            # # _cfg(4, 16, 128, 32, 8, warps=4, stages=3),
+            # _cfg(4, 16, 128, 64, 8, warps=4, stages=3),
+            # # ---- bigger output tiles ----
+            # # Effective MxN: 64x128, 128x64, 128x128
+            # # _cfg(4, 16, 64, 128, 8, warps=4, stages=4),
+            # # _cfg(8, 16, 64, 64, 8, warps=4, stages=4),
+            # # _cfg(8, 16, 64, 128, 8, warps=8, stages=4),
+            # _cfg(4, 16, 128, 128, 8, warps=4, stages=4),
+            # # _cfg(8, 16, 128, 64, 8, warps=4, stages=4),
+            # _cfg(8, 16, 128, 128, 8, warps=8, stages=4),
+            # # ---- split-K variants ----
+            # _cfg(2, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
+            # # _cfg(4, 16, 64, 64, 8, split_k=2, warps=4, stages=3),
+            # # _cfg(4, 16, 128, 64, 8, split_k=2, warps=4, stages=4),
+            # # _cfg(2, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
+            # _cfg(4, 16, 64, 64, 8, split_k=4, warps=4, stages=3),
+        ],
+    )
 
 
 @triton.autotune(
@@ -666,10 +668,7 @@ def matmul_a3d_b2d_b_loader_jfn(
         ql_byte_offs = (col_offs // 128) * 64 + (col_offs % 64)
         ql_shift = (((col_offs // 64) % 2) * 4).to(tl.uint8)
         ql_packed = tl.load(
-            ptr_u8
-            + offs_row * stride_row
-            + sb_first_byte_col_off
-            + ql_byte_offs,
+            ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + ql_byte_offs,
             mask=mask,
             other=0.0,
         )
@@ -677,10 +676,7 @@ def matmul_a3d_b2d_b_loader_jfn(
         qh_byte_offs = 128 + (col_offs // 128) * 32 + (col_offs % 32)
         qh_shift = (((col_offs % 128) // 32) * 2).to(tl.uint8)
         qh_packed = tl.load(
-            ptr_u8
-            + offs_row * stride_row
-            + sb_first_byte_col_off
-            + qh_byte_offs,
+            ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + qh_byte_offs,
             mask=mask,
             other=0.0,
         )

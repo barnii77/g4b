@@ -187,6 +187,8 @@ class Gemma4E(Model):
     # writes the new residual's sos here (out_rsos arg); if they aliased, the wrapper's memset(out_rsos,0)
     # would zero the sublayer sos before it's read -> inv_rms=rsqrt(eps)~1000 -> residual explosion.
     residual_rsos_Bt_dtss: Tensor
+    # debug_layer_residuals_LB1D_dtr: Tensor
+    # debug_layer_rsos_LB1_dtss: Tensor
     input_token_ids_tB_int32: Tensor
     sample_positions_B_int32: Tensor
     cache_offsets_B_int32: Tensor
@@ -353,6 +355,13 @@ class Gemma4E(Model):
             )
             self._dbg(f"L{i} after ple resid (residual)", residual)
             self._dbg(f"L{i} act_rsos", act_rsos)
+            # if os.environ.get("G4B_CAPTURE_LAYER_RESIDUALS"):
+            #     kernels.select_t.select_t(residual, self.sample_positions_B_int32, self.debug_layer_residuals_LB1D_dtr.slice_at(0, i))
+            #     kernels.select_t.select_t(
+            #         act_rsos.reshape((act_rsos.shape[0], act_rsos.shape[1], 1)),
+            #         self.sample_positions_B_int32,
+            #         self.debug_layer_rsos_LB1_dtss.slice_at(0, i).reshape((self.debug_layer_rsos_LB1_dtss.shape[1], 1, 1)),
+            #     )
 
         self._dbg("final act_rsos (for logits)", act_rsos)
         kernels.select_t.select_t(act, self.sample_positions_B_int32, self.lm_head.input_B1D_dtr)
@@ -579,6 +588,8 @@ class Gemma4E(Model):
         # create global state tensors
         residual = Tensor.alloc_empty(DTR, [B, t, D])
         residual_rsos = Tensor.alloc_empty(DTSS, [B, t])
+        # debug_layer_residuals = Tensor.alloc_empty(DTR, [L, B, 1, D])
+        # debug_layer_rsos = Tensor.alloc_empty(DTSS, [L, B, 1])
         input_token_ids = Tensor.alloc_empty(int32, [t, B])
         sample_positions = Tensor.alloc_empty(int32, [B])
         cache_offsets = Tensor.alloc_empty(int32, [B])
@@ -765,6 +776,8 @@ class Gemma4E(Model):
             identity_rmsnorm_w_D_fp32=identity_rmsnorm_w,
             residual_BtD_dtr=residual,
             residual_rsos_Bt_dtss=residual_rsos,
+            # debug_layer_residuals_LB1D_dtr=debug_layer_residuals,
+            # debug_layer_rsos_LB1_dtss=debug_layer_rsos,
             input_token_ids_tB_int32=input_token_ids,
             sample_positions_B_int32=sample_positions,
             cache_offsets_B_int32=cache_offsets,

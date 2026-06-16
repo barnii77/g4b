@@ -1,7 +1,7 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher
+from g4b.kernels.utils import launch, default_bencher, gated_configs
 from g4b.kernels.memset import memset_contiguous
 from g4b.kernels.matmul import matmul_a3d_b2d_b_loader_jfn
 
@@ -27,13 +27,17 @@ def _cfg(
 
 @triton.autotune(
     # fmt: off
-    configs=[
+    configs=gated_configs(
         # The embedding table is K-quantized, so each program dequantizes ONE token row over a tile of the
         # embedding dim (BLOCKSIZE2 must be a superblock-aligned >=32 column block). BLOCKSIZE0/1 are forced
         # to 1 because the dequant loader handles a single row at a time.
-        _cfg(1, 1, 256, warps=4),
-        _cfg(1, 1, 256, warps=8),
-    ],
+        default=[
+            _cfg(1, 1, 256, warps=4),
+        ],
+        tuned=[
+            _cfg(1, 1, 256, warps=8),
+        ],
+    ),
     # fmt: on
     key=[
         # fmt: off
