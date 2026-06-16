@@ -9,31 +9,42 @@ API SPEC:
     - {"type": "tool.output", "output": "... (may be serialized json) ...", "obfuscation": <obfuscation>}
     - {"type": "ping"}
   - server -> client:
-    - {"type": "tool.call", "call": {"name": "mytool", args: {"arg1": <anything>, "arg2": <anything>}}, "obfuscation": <obfuscation>}
-    - {"type": "assistant.response.chunk", content: "...", "obfuscation": <obfuscation>}
+    - {"type": "tool.call", "call": {"name": "mytool", "args": {"arg1": <anything>, "arg2": <anything>}}, "obfuscation": <obfuscation>}
+    - {"type": "assistant.response.chunk", "content": "...", "obfuscation": <obfuscation>}
     - {"type": "assistant.response.done", "obfuscation": <obfuscation>}
     - {"type": "pong"}
     - {"type": "error", "code": <uint32>, "detail": "..."}
-- <obfuscation>: An optional but recommended crypto-random base64-encoded sequence of X bytes where X is the absolute value of a sample from a uniform distribution U[L/2, 3L/2] and L is the length of the payload without obfuscation. The purpose of this is to prevent certain side channel attacks. Google "openai api obfuscation strings" for more information.
+- <obfuscation>: An optional but recommended crypto-random base64-encoded sequence of X bytes
+  where X is the absolute value of a sample from a uniform distribution U[L/2, 3L/2]
+  and L is the length of the payload without obfuscation.
 - <event>: any context-management-related json event documented above except user.init and user.abort
 """
 
-import uvicorn
-import threading
+from __future__ import annotations
+
 import asyncio
-import time
-import secrets
-import random
-import json
 import base64
+import contextlib
+import json
+import random
+import secrets
+import threading
+import time
+from typing import Any
+
+import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
 from g4b import scheduler as scheduler_mod
 from g4b import tokenizer as tokenizer_mod
 
+
 app = FastAPI()
+
 _scheduler: "scheduler_mod.Scheduler"
 _tokenizer: "tokenizer_mod.Tokenizer"
 _chat_template: "tokenizer_mod.ChatTemplate"
+
 RESPONSE_CHUNK_TIMEOUT = 5
 RESPONSE_CHUNK_BUFFER_SIZE = 48  # tokens
 
@@ -60,84 +71,211 @@ type _ModelOutput = tokenizer_mod.ResponseFragment | tokenizer_mod.ToolCall
 type _ModelInput = tokenizer_mod.PromptFragment | tokenizer_mod.ToolOutput
 
 
+class _ChatClosed(Exception):
+    pass
+
+
 class _UserChatManagerEvent:
     def __init__(self, frags: list[_ModelOutput], is_terminal: bool):
         self.frags = frags
         self.is_terminal = is_terminal
 
 
+async def _notify_condition(cv: asyncio.Condition):
+    async with cv:
+        cv.notify_all()
+
+
 class _UserChatManager:
     def __init__(self):
         self.chat_fragments: list["tokenizer_mod.ChatFragment"] = []
         self.active_request: "scheduler_mod.Request | None" = None
+
+        self.loop = asyncio.get_running_loop()
         self.change_cv = asyncio.Condition()
+
+        # Compatibility with current scheduler._notify(), which reads cv._loop.
+        # The manager itself does not rely on this private field.
+        with contextlib.suppress(Exception):
+            self.change_cv._loop = self.loop  # type: ignore[attr-defined]
+
         self.token_buf: list[int] = []
+
+        # Streaming chunks are sent to the client as they arrive, but committed
+        # to chat history as one assistant turn when terminal.
+        self._current_response_parts: list[str] = []
+        self._terminal_pending = False
+
+    def init(self, chat_fragments: list["tokenizer_mod.ChatFragment"]):
+        self.chat_fragments = chat_fragments
+        self.active_request = None
+        self.token_buf.clear()
+        self._current_response_parts.clear()
+        self._terminal_pending = False
+
+    def submit(self, frag: _ModelInput) -> bool:
+        """
+        Submit a user/tool fragment.
+
+        Returns False if a request is already active. Crucially, the fragment is
+        not appended to chat history in that case, avoiding silent history
+        corruption.
+        """
+        self._poll_active_request()
+
+        if self.active_request is not None or self._terminal_pending:
+            return False
+
+        self.chat_fragments.append(frag)
+        inp = _chat_template.apply(self.chat_fragments)
+        toks = _tokenizer.tokenize(inp)
+
+        rq = scheduler_mod.Request(toks, self.change_cv)
+        _scheduler.submit(rq)
+        self.active_request = rq
+
+        self.token_buf.clear()
+        self._current_response_parts.clear()
+        self._terminal_pending = False
+        return True
+
+    def abort(self) -> bool:
+        """
+        Abort current request.
+
+        Returns True if anything active/partial existed. The websocket handler
+        emits assistant.response.done immediately so the frontend can stop its
+        spinner deterministically.
+        """
+        had_active = (
+            self.active_request is not None
+            or bool(self.token_buf)
+            or bool(self._current_response_parts)
+            or self._terminal_pending
+        )
+
+        if self.active_request is not None:
+            _scheduler.abort(self.active_request)
+
+        self.active_request = None
+        self.token_buf.clear()
+        self._current_response_parts.clear()
+        self._terminal_pending = False
+
+        self._notify_from_any_thread()
+        return had_active
+
+    def _notify_from_any_thread(self):
+        try:
+            self.loop.call_soon_threadsafe(lambda: asyncio.create_task(_notify_condition(self.change_cv)))
+        except Exception:
+            pass
+
+    def _poll_active_request(self):
+        """
+        Pull tokens from the scheduler Request into the local token buffer.
+
+        This is deliberately called on wakeup and on timeout, so correctness does
+        not depend on every condition notification being delivered.
+        """
+        rq = self.active_request
+        if rq is None:
+            return
+
+        new_toks = rq.get_new_tokens()
+        if new_toks:
+            self.token_buf.extend(new_toks)
+
+        if rq._done or _tokenizer.eos in new_toks:
+            self.active_request = None
+            self._terminal_pending = True
 
     def _drain_token_buffer_as_far_as_possible(self) -> list[_ModelOutput]:
         if not self.token_buf:
             return []
+
         toks = self.token_buf
         self.token_buf = []
+
         if _tokenizer.eos in toks:
             toks = toks[: toks.index(_tokenizer.eos)]
-        text = _tokenizer.detokenize(toks)
-        return [tokenizer_mod.ResponseFragment(text)] if text else []
 
-    async def continue_processing(self):
-        wait_task = asyncio.ensure_future(self._wait_for_change())
-        try:
-            done, pending = await asyncio.wait(
-                [wait_task], timeout=RESPONSE_CHUNK_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        except asyncio.CancelledError:
-            wait_task.cancel()
-            raise
+        text = _tokenizer.detokenize(toks)  # TODO technically this may be incorrect unless I buffer a few tokens
+        if not text:
+            return []
 
-        signaled = wait_task in done
-        if not signaled:
-            # Timeout: drain whatever we have so the client sees smooth progress.
-            return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), False)
+        self._current_response_parts.append(text)
+        return [tokenizer_mod.ResponseFragment(text)]
 
-        new_toks = self.active_request.get_new_tokens() if self.active_request else []
-        self.token_buf.extend(new_toks)
+    def _commit_current_response_to_history(self):
+        if not self._current_response_parts:
+            return
 
-        request_done = bool(self.active_request and self.active_request._done)
-        is_terminal = request_done or _tokenizer.eos in new_toks
-        if request_done:
-            self.active_request = None
+        full_text = "".join(self._current_response_parts)
+        self._current_response_parts.clear()
 
-        if is_terminal or len(self.token_buf) > RESPONSE_CHUNK_BUFFER_SIZE:
-            return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), is_terminal)
-        return _UserChatManagerEvent([], False)
+        if full_text:
+            self.chat_fragments.append(tokenizer_mod.ResponseFragment(full_text))
+
+    def _make_terminal_event(self) -> _UserChatManagerEvent:
+        frags = self._drain_token_buffer_as_far_as_possible()
+        self._commit_current_response_to_history()
+        self._terminal_pending = False
+        return _UserChatManagerEvent(frags, True)
 
     async def _wait_for_change(self):
         async with self.change_cv:
             await self.change_cv.wait()
 
-    def submit(self, frag: _ModelInput):
-        self.chat_fragments.append(frag)
-        if self.active_request and self.active_request._done:
-            self.active_request = None
-        if self.active_request:
-            return
-        inp = _chat_template.apply(self.chat_fragments)
-        toks = _tokenizer.tokenize(inp)
-        rq = scheduler_mod.Request(toks, self.change_cv)
-        _scheduler.submit(rq)
-        self.active_request = rq
+    async def continue_processing(self) -> _UserChatManagerEvent:
+        """
+        Wait for model progress or timeout and return websocket-visible fragments.
 
-    def abort(self):
-        if self.active_request:
-            _scheduler.abort(self.active_request)
+        Timeout still polls the Request, so a lost notify only causes latency,
+        not a permanently stuck stream.
+        """
+        self._poll_active_request()
 
-    def init(self, chat_fragments: list["tokenizer_mod.ChatFragment"]):
-        self.chat_fragments = chat_fragments
+        if self._terminal_pending:
+            return self._make_terminal_event()
+
+        if len(self.token_buf) > RESPONSE_CHUNK_BUFFER_SIZE:
+            return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), False)
+
+        wait_task = asyncio.create_task(self._wait_for_change())
+        try:
+            done, pending = await asyncio.wait(
+                {wait_task},
+                timeout=RESPONSE_CHUNK_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        except asyncio.CancelledError:
+            wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wait_task
+            raise
+
+        signaled = wait_task in done
+
+        self._poll_active_request()
+
+        if self._terminal_pending:
+            return self._make_terminal_event()
+
+        if not signaled:
+            # Timeout: drain whatever is available so UX remains smooth.
+            return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), False)
+
+        if len(self.token_buf) > RESPONSE_CHUNK_BUFFER_SIZE:
+            return _UserChatManagerEvent(self._drain_token_buffer_as_far_as_possible(), False)
+
+        return _UserChatManagerEvent([], False)
 
 
 @app.websocket("/api/v1/chat")
@@ -146,59 +284,68 @@ async def chat(ws: WebSocket):
 
     is_init = False
     state = _UserChatManager()
+
     recv_task = asyncio.create_task(ws.receive_json())
     continue_task = asyncio.create_task(state.continue_processing())
+
     try:
         while True:
             done, _pending = await asyncio.wait(
-                {recv_task, continue_task}, return_when=asyncio.FIRST_COMPLETED
+                {recv_task, continue_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
-            event = None
+            event: dict[str, Any] | None = None
+            advancements = _UserChatManagerEvent([], False)
+
             if recv_task in done:
                 event = recv_task.result()
                 recv_task = asyncio.create_task(ws.receive_json())
 
             if continue_task in done:
-                advancements: _UserChatManagerEvent = continue_task.result()
+                advancements = continue_task.result()
                 continue_task = asyncio.create_task(state.continue_processing())
-            else:
-                advancements: _UserChatManagerEvent = _UserChatManagerEvent([], False)
 
             # Handle server -> client event(s)
-            if advancements.frags:
-                for frag in advancements.frags:
-                    if isinstance(frag, tokenizer_mod.ResponseFragment):
-                        await ws.send_json(
-                            _add_obfuscation(
-                                {
-                                    "type": "assistant.response.chunk",
-                                    "content": frag.content,
-                                }
-                            )
+            for frag in advancements.frags:
+                if isinstance(frag, tokenizer_mod.ResponseFragment):
+                    await ws.send_json(
+                        _add_obfuscation(
+                            {
+                                "type": "assistant.response.chunk",
+                                "content": frag.content,
+                            }
                         )
-                    else:
-                        assert isinstance(frag, tokenizer_mod.ToolCall)
-                        await ws.send_json(
-                            _add_obfuscation(
-                                {
-                                    "type": "tool.call",
-                                    "call": frag.call,
-                                }
-                            )
+                    )
+                else:
+                    assert isinstance(frag, tokenizer_mod.ToolCall)
+                    await ws.send_json(
+                        _add_obfuscation(
+                            {
+                                "type": "tool.call",
+                                "call": frag.call,
+                            }
                         )
+                    )
+
             if advancements.is_terminal:
                 await ws.send_json(_add_obfuscation({"type": "assistant.response.done"}))
 
             # Handle client -> server event
-            if event:
+            if event is not None:
+                if not isinstance(event, dict):
+                    await _chat_err(ws, "`event` must be json object")
+
                 ty = await _assert_string(event.get("type"), "`type` must be string", ws)
+
                 match ty:
+                    case "ping":
+                        await ws.send_json({"type": "pong"})
+
                     case "user.init":
                         if is_init:
                             await _chat_err(ws, "already initialized")
 
-                        is_init = True
                         prev_events = event.get("chat")
                         if not isinstance(prev_events, list):
                             await _chat_err(ws, "`chat` must be list")
@@ -208,70 +355,99 @@ async def chat(ws: WebSocket):
                             if not isinstance(ev, dict):
                                 await _chat_err(ws, "`event` must be json object")
 
-                            ty = ev.get("type")
-                            if not isinstance(ty, str):
+                            ev_ty = ev.get("type")
+                            if not isinstance(ev_ty, str):
                                 await _chat_err(ws, "`type` must be string")
 
                             parsed_ev: "tokenizer_mod.ChatFragment"
-                            match ty:
+                            match ev_ty:
                                 case "user.prompt":
                                     content = await _assert_string(ev.get("content"), "`content` must be string", ws)
                                     parsed_ev = tokenizer_mod.PromptFragment(content)
+
                                 case "tool.output":
                                     output = await _assert_string(ev.get("output"), "`output` must be string", ws)
                                     parsed_ev = tokenizer_mod.ToolOutput(output)
+
                                 case "tool.call":
                                     call = await _assert_dict(ev.get("call"), "`call` must be json object", ws)
-                                    parsed_ev = tokenizer_mod.ToolCall(call)  # TODO validate according to some schema?
+                                    parsed_ev = tokenizer_mod.ToolCall(call)  # TODO validate schema
+
                                 case "assistant.response.chunk":
                                     content = await _assert_string(ev.get("content"), "`content` must be string", ws)
                                     parsed_ev = tokenizer_mod.ResponseFragment(content)
+
+                                case "assistant.response.done":
+                                    # Terminal marker is harmless in persisted logs but carries no content.
+                                    continue
+
                                 case _:
-                                    await _chat_err(ws, f"event type `{ty}` disallowed in `events` for init")
+                                    await _chat_err(ws, f"event type `{ev_ty}` disallowed in `events` for init")
+                                    raise AssertionError("unreachable")
+
                             parsed_events.append(parsed_ev)
 
                         state.init(parsed_events)
+                        is_init = True
 
                     case "user.prompt":
                         if not is_init:
                             await _chat_err(ws, "not initialized")
+
                         content = await _assert_string(event.get("content"), "`content` must be string", ws)
                         parsed = tokenizer_mod.PromptFragment(content)
-                        state.submit(parsed)
+
+                        if not state.submit(parsed):
+                            await ws.send_json(
+                                {
+                                    "type": "error",
+                                    "code": GENERIC_ERROR,
+                                    "detail": "request already active; send user.abort before submitting a new prompt",
+                                }
+                            )
 
                     case "tool.output":
                         if not is_init:
                             await _chat_err(ws, "not initialized")
+
                         output = await _assert_string(event.get("output"), "`output` must be string", ws)
                         parsed = tokenizer_mod.ToolOutput(output)
-                        state.submit(parsed)
+
+                        if not state.submit(parsed):
+                            await ws.send_json(
+                                {
+                                    "type": "error",
+                                    "code": GENERIC_ERROR,
+                                    "detail": "request already active; send user.abort before submitting tool output",
+                                }
+                            )
 
                     case "user.abort":
                         if not is_init:
                             await _chat_err(ws, "not initialized")
                         state.abort()
-
-                    case "ping":
-                        await ws.send_json({"type": "pong"})
+                        await ws.send_json(_add_obfuscation({"type": "assistant.response.done"}))
 
                     case _:
                         await _chat_err(ws, "unrecognized event type")
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _ChatClosed):
         pass
     finally:
-        if not recv_task.done():
-            recv_task.cancel()
-            try:
-                await recv_task
-            except asyncio.CancelledError:
-                pass
-        if not continue_task.done():
-            continue_task.cancel()
-            try:
-                await continue_task
-            except asyncio.CancelledError:
-                pass
+        state.abort()
+        await _cancel_task(recv_task)
+        await _cancel_task(continue_task)
+
+
+async def _cancel_task(task: asyncio.Task):
+    if task.done():
+        with contextlib.suppress(Exception):
+            task.result()
+        return
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 class Uvicorn:
@@ -297,9 +473,11 @@ class Uvicorn:
 
 
 async def _chat_err(ws: WebSocket, error: str, code: int = GENERIC_ERROR):
-    await ws.send_json({"type": "error", "code": code, "detail": error})
-    await ws.close(code=4000, reason=error)
-    raise RuntimeError(error)
+    with contextlib.suppress(Exception):
+        await ws.send_json({"type": "error", "code": code, "detail": error})
+    with contextlib.suppress(Exception):
+        await ws.close(code=4000, reason=error[:120])
+    raise _ChatClosed(error)
 
 
 async def _assert_string(x, err: str, ws) -> str:
@@ -315,7 +493,7 @@ async def _assert_dict(x, err: str, ws) -> dict:
 
 
 def _add_obfuscation(resp: dict) -> dict:
-    l = len(json.dumps(resp))
+    l = len(json.dumps(resp, ensure_ascii=False, separators=(",", ":")))
     n = round(random.uniform(l // 2, 3 * l // 2))
     obfuscation = base64.b64encode(secrets.token_bytes(n)).decode("ascii")
     resp["obfuscation"] = obfuscation
