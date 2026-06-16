@@ -1,10 +1,3 @@
-# TODO flash decode, i.e. tile across not only Q time dim but also with different tile size across KV time dim and have
-#  it write into temp buffers and have a second kernel reduce the partial results.
-# TODO maybe the way to go is to have a static launch grid based on the number of SMs and then assign virtual pid's to
-#  threadblocks so they choose their work at runtime with num split kv based on heuristics? would make launch graph
-#  static, which is required for cuda graphs, while allowing more flexible split kv behavior.
-# TODO autotune if the all-queries-in-group-at-once optimization is better than baseline (not always true for prefill).
-#  let autotuner control if enabled for a shape.
 # TODO since this kernel is probably the one which deals with the largest indices, I'll have to consider doing some
 #  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
 #  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
