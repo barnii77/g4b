@@ -27,12 +27,14 @@ def init(device_id: int = 0):
 
 def alloc(size: int) -> Buffer:
     buf = device.allocate(size, stream=_alloc_stream)
+    _alloc_stream.sync()
     _buffers.append(buf)
     return buf
 
 
 def alloc_pinned_host(size: int) -> Buffer:
     h_buf = _pinned_mr.allocate(size, stream=_alloc_stream)
+    _alloc_stream.sync()
     assert h_buf.is_host_accessible
     _buffers.append(h_buf)
     return h_buf
