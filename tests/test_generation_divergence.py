@@ -71,9 +71,6 @@ def g4b_topk(model, t_idx: int, topn: int):
     softcap = model.lm_head.logit_softcap
     vals = softcap * torch.tanh(vals / softcap)
 
-    # TODO rm should match closely (max abs diff < 5e-2) without this
-    vals -= vals.max()
-
     return ids, vals
 
 
