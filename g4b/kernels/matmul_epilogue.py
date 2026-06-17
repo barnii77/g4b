@@ -1,6 +1,6 @@
 import triton
 from triton import language as tl
-from g4b.kernels.matmul import matmul_a3d_b2d_partial_rmsnorm_storer_jfn
+from g4b.kernels import matmul
 from g4b.kernels.utils import tanh_jfn
 
 
@@ -109,12 +109,12 @@ def ple_gate_storer_jfn(
         extra_shape0, extra_shape1, extra_shape2,
         extra_stride0, extra_stride1, extra_stride2,
     )
-    matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
+    matmul.matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
         name, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
         rsos_shape0, rsos_shape1,
         rsos_stride0, rsos_stride1,
         NUM_K_SPLITS, C_DTYPE,
-        input_rsos_ptr,
+        None,
         input_rsos_shape0, input_rsos_shape1,
         input_rsos_stride0, input_rsos_stride1,
         rmsnorm_dim, rmsnorm_eps,
@@ -153,12 +153,12 @@ def qkv_input_rmsnorm_per_head_rsos_storer_jfn(
         input_rsos_stride0, input_rsos_stride1,
         rmsnorm_dim, rmsnorm_eps,
     )
-    matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
+    matmul.matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
         name, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
         rsos_shape0, rsos_shape1,
         rsos_stride0, rsos_stride1,
         NUM_K_SPLITS, C_DTYPE,
-        input_rsos_ptr,
+        None,
         input_rsos_shape0, input_rsos_shape1,
         input_rsos_stride0, input_rsos_stride1,
         rmsnorm_dim, rmsnorm_eps,

@@ -6,6 +6,7 @@ from g4b.tensor import Tensor, DType
 from g4b.kernels.utils import launch, default_bencher, jfn_cache_key, gated_configs
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.kernels.rsos import compute_rsos
+from g4b.kernels import matmul_epilogue
 from g4b.utils import contiguous_strides_for_shape
 
 # TODO it appears that torch's matmul (without sum of squares fusion) using fp16 + fp32 accum is ~10% faster than mine.
@@ -386,7 +387,7 @@ def _matmul_a3d_b2d_kernel(
         c_shape0, c_shape1,
         c_rmsnorm_sum_of_squares_stride0, c_rmsnorm_sum_of_squares_stride1,
         NUM_K_SPLITS, C_DTYPE,
-        input_rmsnorm_sum_of_squares_ptr,
+        input_rmsnorm_sum_of_squares_ptr if c_c2_merge_tiles_fn is None else None,  # otherwise it's responsible
         input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
         input_rmsnorm_sum_of_squares_stride0, input_rmsnorm_sum_of_squares_stride1,
         a_shape2, rmsnorm_eps,
@@ -715,6 +716,20 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     rsos_stride2: tl.constexpr = 0, RSOS_HEAD_DIM: tl.constexpr = 0,
     # fmt: on
 ):
+    if input_rsos_ptr is not None:
+        tile, _ = matmul_epilogue.apply_input_rsos_in_epilogue_mixin_jfn(
+            tile,
+            None,
+            off0,
+            off1,
+            input_rsos_ptr,
+            input_rsos_shape0,
+            input_rsos_shape1,
+            input_rsos_stride0,
+            input_rsos_stride1,
+            rmsnorm_dim,
+            rmsnorm_eps,
+        )
     if rsos_ptr is not None and NUM_K_SPLITS == 1:
         rsos = (tile * tile).sum(-1)
         rsos_offsets0 = (off0 + tl.arange(0, tile.shape[0]))[:, None]
