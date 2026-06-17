@@ -51,21 +51,28 @@ FA_MAX_KV_SPLITS = 16
 #   - P: per-layer embedding size (e.g. 256 for gemma 4 e4b)
 #   - V: vocab size
 #   - L: number of layers
+# Additional notes on shapes:
+#   - A shape like hkD may mean either h x k x D or (h * k) x D, this is not notationally differentiated.
+#   - A lot of (all?) weights have the transpose of the valid shape you would expect for the matmul they are used in.
+#     This is because gguf stores weights column-major by actually storing their transpose in normal row major format.
+#     Transposing ahead of time would force dequantization or at the very least code duplication to handle on-the-fly
+#     dequant along the other axis of B. Therefore, I pass transpose_b_before_mma=True to the matmul kernel in these
+#     cases, causing the matmul kernel to transpose on the fly inside the kernel.
 ################
 
 
 @dataclass(frozen=True)
 class Attention:
     # parameters
-    q_proj_Dhk_q4: Tensor
-    k_proj_Dgk_q6: Tensor
-    v_proj_Dgv_q6: Tensor
-    o_proj_hvD_q4: Tensor
+    q_proj_hkD_q4: Tensor
+    k_proj_gkD_q6: Tensor
+    v_proj_gvD_q6: Tensor
+    o_proj_Dhv_q4: Tensor
     q_rmsnorm_w_k_fp32: Tensor
     k_rmsnorm_w_k_fp32: Tensor
     o_rmsnorm_w_D_fp32: Tensor
     input_rmsnorm_w_D_fp32: Tensor
-    rope_freqs_k_fp32: Tensor  # TODO I must compute the default rope frequencies and `if not is_swa` I must multiply in the rope_freqs from the gguf file. See ref impl -> class RoPE.
+    rope_freqs_k_fp32: Tensor
     context_window_size: int  # small for SWA
     owns_kv_cache: bool  # model's late layers share KV cache with earlier ones. If false, must not write to KV cache.
     head_count_q: int
@@ -93,9 +100,9 @@ class Attention:
 @dataclass(frozen=True)
 class MLP:
     # parameters
-    up_proj_DU_q4: Tensor
-    gate_proj_DU_q4: Tensor
-    down_proj_UD_q6: Tensor
+    up_proj_UD_q4: Tensor
+    gate_proj_UD_q4: Tensor
+    down_proj_DU_q6: Tensor
     input_rmsnorm_w_D_fp32: Tensor
     output_rmsnorm_w_D_fp32: Tensor
 
@@ -108,8 +115,8 @@ class MLP:
 @dataclass(frozen=True)
 class PerLayerEmbeddings:
     # parameters
-    gate_proj_DP_fp32: Tensor
-    out_proj_PD_fp32: Tensor
+    gate_proj_PD_fp32: Tensor
+    out_proj_DP_fp32: Tensor
     output_rmsnorm_w_D_fp32: Tensor
 
     # runtime state
@@ -132,7 +139,7 @@ class Embeddings:
     # parameters
     embeddings_VD_q5: Tensor
     ple_table_VLP_q5: Tensor
-    ple_proj_DLP_bf16: Tensor
+    ple_proj_LPD_bf16: Tensor
     ple_rmsnorm_w_P_fp32: Tensor
 
     # runtime state
@@ -425,7 +432,7 @@ class Gemma4E(Model):
         ple_proj = _slice_t(self.embeddings.ple_proj_BtLP_dtple, t_now)
         ple_table = self.embeddings.ple_table_VLP_q5.reshape((self.embeddings.ple_table_VLP_q5.shape[0], L * P))
         # ple_proj_DLP_bf16 is stored conventionally as [L*P, D]; matmul computes residual @ W^T.
-        ple_proj_w = self.embeddings.ple_proj_DLP_bf16
+        ple_proj_w = self.embeddings.ple_proj_LPD_bf16
         # reference: ple_lookup = per_layer_embeddings[ids] * sqrt(ple_dim)
         kernels.embeddings.gather_token_embeddings(ple_lookup_flat, None, ple_table, token_ids, math.sqrt(P))
         matmul_a3d_b2d(
@@ -471,7 +478,7 @@ class Gemma4E(Model):
             q_flat,
             q_rsos_phys,
             act,
-            attn.q_proj_Dhk_q4,
+            attn.q_proj_hkD_q4,
             storer_fn=kernels.matmul_epilogue.qkv_input_rmsnorm_per_head_rsos_storer_jfn,
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
@@ -482,7 +489,7 @@ class Gemma4E(Model):
             k_flat,
             k_rsos_phys,
             act,
-            attn.k_proj_Dgk_q6,
+            attn.k_proj_gkD_q6,
             storer_fn=kernels.matmul_epilogue.qkv_input_rmsnorm_per_head_rsos_storer_jfn,
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
@@ -493,7 +500,7 @@ class Gemma4E(Model):
             v_flat,
             v_rsos_phys,
             act,
-            attn.v_proj_Dgv_q6,
+            attn.v_proj_gvD_q6,
             storer_fn=kernels.matmul_epilogue.qkv_input_rmsnorm_per_head_rsos_storer_jfn,
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
@@ -541,7 +548,7 @@ class Gemma4E(Model):
             use_fp32_dot=bool(os.environ.get("G4B_FA_FP32_DOT")),
         )
         matmul_a3d_b2d(
-            out, out_rsos, o_flat, attn.o_proj_hvD_q4, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            out, out_rsos, o_flat, attn.o_proj_Dhv_q4, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
         )
 
     def _mlp(self, mlp: MLP, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int):
@@ -552,15 +559,15 @@ class Gemma4E(Model):
             h,
             None,
             act,
-            mlp.up_proj_DU_q4,
-            mlp.gate_proj_DU_q4,
+            mlp.up_proj_UD_q4,
+            mlp.gate_proj_UD_q4,
             c_c2_merge_tiles_fn=kernels.matmul_epilogue.geglu_fusion_matmul_merge_tiles_mixin_jfn,
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
-            out, out_rsos, h, mlp.down_proj_UD_q6, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            out, out_rsos, h, mlp.down_proj_DU_q6, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
         )
 
     def _ple(self, ple: PerLayerEmbeddings, residual: Tensor, act_rsos: Tensor, layer_idx: int, t_now: int):
@@ -573,14 +580,14 @@ class Gemma4E(Model):
             h,
             None,
             residual,
-            ple.gate_proj_DP_fp32,
+            ple.gate_proj_PD_fp32,
             storer_extra=ple_vals,
             storer_fn=kernels.matmul_epilogue.ple_gate_storer_jfn,
             transpose_b_before_mma=True,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
-            out, out_rsos, h, ple.out_proj_PD_fp32, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            out, out_rsos, h, ple.out_proj_DP_fp32, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
         )
 
     @classmethod
@@ -649,7 +656,7 @@ class Gemma4E(Model):
         embeddings = Embeddings(
             embeddings_VD_q5=token_embeddings,
             ple_table_VLP_q5=ple_table,
-            ple_proj_DLP_bf16=ple_proj,
+            ple_proj_LPD_bf16=ple_proj,
             ple_rmsnorm_w_P_fp32=ple_norm,
             ple_LBtP_dtple=ple_buf,
             ple_proj_BtLP_dtple=ple_proj_buf,
@@ -768,10 +775,10 @@ class Gemma4E(Model):
 
             if is_swa:
                 attn = Attention(
-                    q_proj_Dhk_q4=q_proj,
-                    k_proj_Dgk_q6=k_proj,
-                    v_proj_Dgv_q6=v_proj,
-                    o_proj_hvD_q4=o_proj,
+                    q_proj_hkD_q4=q_proj,
+                    k_proj_gkD_q6=k_proj,
+                    v_proj_gvD_q6=v_proj,
+                    o_proj_Dhv_q4=o_proj,
                     q_rmsnorm_w_k_fp32=q_rmsnorm_w,
                     k_rmsnorm_w_k_fp32=k_rmsnorm_w,
                     o_rmsnorm_w_D_fp32=o_rmsnorm_w,
@@ -800,10 +807,10 @@ class Gemma4E(Model):
                 )
             else:
                 attn = Attention(
-                    q_proj_Dhk_q4=q_proj,
-                    k_proj_Dgk_q6=k_proj,
-                    v_proj_Dgv_q6=v_proj,
-                    o_proj_hvD_q4=o_proj,
+                    q_proj_hkD_q4=q_proj,
+                    k_proj_gkD_q6=k_proj,
+                    v_proj_gvD_q6=v_proj,
+                    o_proj_Dhv_q4=o_proj,
                     q_rmsnorm_w_k_fp32=q_rmsnorm_w,
                     k_rmsnorm_w_k_fp32=k_rmsnorm_w,
                     o_rmsnorm_w_D_fp32=o_rmsnorm_w,
@@ -838,9 +845,9 @@ class Gemma4E(Model):
             mlp_input_norm = by_name("ffn_norm")
             mlp_output_norm = by_name("post_ffw_norm")
             mlp = MLP(
-                up_proj_DU_q4=up_proj,
-                gate_proj_DU_q4=gate_proj,
-                down_proj_UD_q6=down_proj,
+                up_proj_UD_q4=up_proj,
+                gate_proj_UD_q4=gate_proj,
+                down_proj_DU_q6=down_proj,
                 input_rmsnorm_w_D_fp32=mlp_input_norm,
                 output_rmsnorm_w_D_fp32=mlp_output_norm,
                 shared_down_proj_input_scratchpad_BtU_dth=mlp_down_proj_input_scratchpad,
@@ -853,8 +860,8 @@ class Gemma4E(Model):
             ple_out_proj = by_name("proj")
             ple_out_norm = by_name("post_norm")
             ple = PerLayerEmbeddings(
-                gate_proj_DP_fp32=ple_gate_proj,
-                out_proj_PD_fp32=ple_out_proj,
+                gate_proj_PD_fp32=ple_gate_proj,
+                out_proj_DP_fp32=ple_out_proj,
                 output_rmsnorm_w_D_fp32=ple_out_norm,
                 shared_out_proj_input_scratchpad_BtP_dtple=ple_out_proj_input_scratchpad,
                 shared_last_and_this_layer_output_scratchpad_BtD_dtr=layer_output_scratchpad,
