@@ -44,8 +44,10 @@ class Scheduler:
         self._print_stats = bool(os.environ.get("G4B_PRINT_STATS"))
         self._total_prefill_tokens = 0
         self._total_decode_tokens = 0
+        self._window_prefill_tokens = 0
+        self._window_decode_tokens = 0
         self._tokens_since_log = 0
-        self._start_time = time.perf_counter()
+        self._last_log_time = time.perf_counter()
 
     def step(self):
         self._fill_free_slots()
@@ -181,6 +183,8 @@ class Scheduler:
     def _update_stats(self, prefill_tokens: int, decode_tokens: int):
         self._total_prefill_tokens += prefill_tokens
         self._total_decode_tokens += decode_tokens
+        self._window_prefill_tokens += prefill_tokens
+        self._window_decode_tokens += decode_tokens
         self._tokens_since_log += prefill_tokens + decode_tokens
         if self._tokens_since_log >= self._STATS_INTERVAL:
             self._log_stats()
@@ -188,9 +192,12 @@ class Scheduler:
 
     def _log_stats(self):
         now = time.perf_counter()
-        elapsed = now - self._start_time
-        prefill_tps = self._total_prefill_tokens / elapsed if elapsed > 0 else 0.0
-        decode_tps = self._total_decode_tokens / elapsed if elapsed > 0 else 0.0
+        elapsed = now - self._last_log_time
+        prefill_tps = self._window_prefill_tokens / elapsed if elapsed > 0 else 0.0
+        decode_tps = self._window_decode_tokens / elapsed if elapsed > 0 else 0.0
+        self._window_prefill_tokens = 0
+        self._window_decode_tokens = 0
+        self._last_log_time = now
         active = sum(1 for rq in self._active if rq is not None and not rq._done)
         context_len = max(rq._context_len for rq in self._active if rq is not None)
         print(
