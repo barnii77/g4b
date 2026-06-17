@@ -341,6 +341,13 @@ def _matmul_a3d_b2d_kernel(
         else:
             UPCAST_TY = tl.float32
 
+        # Never run the mma in higher precision than the accumulator: with a narrow (e.g. fp16) accum and an
+        # fp32 activation against fp16 weights, downcast the operands to the accum dtype so the mma actually
+        # runs on fp16 tensor cores instead of tripping the assert below. Widening the accum (DTACCUM_FP32)
+        # restores the full-precision fp32 mma.
+        if ACCUM_DTYPE.itemsize < UPCAST_TY.itemsize:
+            UPCAST_TY = ACCUM_DTYPE
+
         a_upcast = a.to(UPCAST_TY)
 
         c = tl.dot(a_upcast, b.to(UPCAST_TY), c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
@@ -763,7 +770,7 @@ def matmul_a3d_b2d(
     b_loader_fn: tl.constexpr = matmul_a3d_b2d_b_loader_jfn,
     storer_fn: tl.constexpr = matmul_a3d_b2d_partial_rmsnorm_storer_jfn,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
-    accum_dtype: DType | None = None,
+    accum_dtype: DType | tl.dtype | None = None,
     keep_c: bool = False,
     transpose_b_before_mma: bool = False,
     *,
@@ -776,6 +783,9 @@ def matmul_a3d_b2d(
     # K-splits, so disable split-K when it's active (matches forward.txt note).
     k_split_allowed = b2 is None and rsos_head_dim == 0
     selected_num_k_splits = 1
+
+    if isinstance(accum_dtype, DType):
+        accum_dtype = accum_dtype.tl_dtype
 
     # TODO this grid_fn is hacky and I'm not sure launching the pre-hook in the grid_fn is ideal because it is part of
     #  the measurement of the autotuner, but I guess zeroing is a real downside and so it being measured by the
