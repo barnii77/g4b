@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--seed", type=int, default=12345)
     args = parser.parse_args()
     return Config(
         args.batch_size,
@@ -28,6 +29,7 @@ def parse_args():
         args.prefill_chunk_size,
         args.host,
         args.port,
+        args.seed,
     )
 
 

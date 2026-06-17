@@ -11,3 +11,4 @@ class Config:
     prefill_chunk_size: int
     host: str
     port: int
+    seed: int
