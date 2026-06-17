@@ -272,20 +272,22 @@ SHAPE_CASES = [
 N_REPS = 100
 
 
-def run_case(quant_name: str, input_name: str, B: int, M: int, K: int, N: int):
+def run_case(quant_name: str, input_name: str, transpose: bool, B: int, M: int, K: int, N: int):
     quant = QUANT_CASES[quant_name]
     torch.manual_seed(0)
     a = torch.randn((B, M, K), dtype=torch.float32, device="cuda") / K**0.5
     c = torch.empty((B, M, N), dtype=torch.float32, device="cuda")
 
-    gguf_tensor = quant[input_name](K, N)
+    b_shape = (N, K) if transpose else (K, N)
+    gguf_tensor = quant[input_name](*b_shape)
     b = Tensor.from_gguf_tensor(gguf_tensor)
-    b_ref = quant["dequant"](gguf_tensor).reshape((K, N)).to("cuda")
+    b_ref = quant["dequant"](gguf_tensor).reshape(b_shape).to("cuda")
+    b_ref = b_ref.T if transpose else b_ref
 
     torch.set_float32_matmul_precision("medium")
 
     # Warmup also pays compilation/autotune cost before measuring correctness.
-    matmul_a3d_b2d(c, None, a, b, rmsnorm_eps=0.0)
+    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
     cuda_sync()
     torch.cuda.synchronize()
     _ = a @ b_ref
@@ -293,7 +295,7 @@ def run_case(quant_name: str, input_name: str, B: int, M: int, K: int, N: int):
 
     start = time.time()
     for _ in range(N_REPS):
-        matmul_a3d_b2d(c, None, a, b, rmsnorm_eps=0.0)
+        matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
     cuda_sync()
     custom_seconds = time.time() - start
 
@@ -304,7 +306,7 @@ def run_case(quant_name: str, input_name: str, B: int, M: int, K: int, N: int):
     torch_medium_seconds = time.time() - start
 
     # Capture one post-warmup output for correctness.
-    matmul_a3d_b2d(c, None, a, b, rmsnorm_eps=0.0)
+    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
     cuda_sync()
     torch.cuda.synchronize()
 
@@ -316,6 +318,7 @@ def run_case(quant_name: str, input_name: str, B: int, M: int, K: int, N: int):
     return {
         "quant": quant_name,
         "input": input_name,
+        "transpose": transpose,
         "shape": (B, M, K, N),
         "max_diff": diff.max().item(),
         "mean_diff": diff.mean().item(),
@@ -331,71 +334,20 @@ def run_case(quant_name: str, input_name: str, B: int, M: int, K: int, N: int):
     }
 
 
-def run_transpose_b_case():
-    torch.manual_seed(0)
-    B, M, K, N = 2, 32, 256, 512
-    quant = QUANT_CASES["q5_k"]
-    a = torch.randn((B, M, K), dtype=torch.float32, device="cuda") / K**0.5
-    c = torch.empty((B, M, N), dtype=torch.float32, device="cuda")
-
-    gguf_tensor = quant["patterned"](N, K)
-    b = Tensor.from_gguf_tensor(gguf_tensor)
-    b_ref = quant["dequant"](gguf_tensor).reshape((N, K)).to("cuda")
-
-    torch.set_float32_matmul_precision("medium")
-
-    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=True, rmsnorm_eps=0.0)
-    cuda_sync()
-    torch.cuda.synchronize()
-    _ = a @ b_ref.T
-    torch.cuda.synchronize()
-
-    start = time.time()
-    for _ in range(N_REPS):
-        matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=True, rmsnorm_eps=0.0)
-    cuda_sync()
-    custom_seconds = time.time() - start
-
-    start = time.time()
-    for _ in range(N_REPS):
-        ref = a @ b_ref.T
-    torch.cuda.synchronize()
-    torch_medium_seconds = time.time() - start
-
-    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=True, rmsnorm_eps=0.0)
-    cuda_sync()
-    torch.cuda.synchronize()
-
-    diff = (c - ref).abs()
-    return {
-        "quant": "q5_k",
-        "input": "patterned_transpose_b",
-        "shape": (B, M, K, N),
-        "max_diff": diff.max().item(),
-        "mean_diff": diff.mean().item(),
-        "expected_abs_max": ref.abs().max().item(),
-        "real_abs_max": c.abs().max().item(),
-        "expected_std": ref.float().std(unbiased=False).item(),
-        "real_std": c.float().std(unbiased=False).item(),
-        "custom_seconds": custom_seconds,
-        "torch_medium_seconds": torch_medium_seconds,
-        "diff": diff,
-    }
-
-
 results = []
 for quant_name in QUANT_CASES:
     for input_name in ("patterned", "random"):
         for shape in SHAPE_CASES:
-            results.append(run_case(quant_name, input_name, *shape))
-results.append(run_transpose_b_case())
+            for transpose in (False, True):
+                results.append(run_case(quant_name, input_name, transpose, *shape))
 
 print()
 print("quantized matmul test report")
 for result in results:
     B, M, K, N = result["shape"]
     print(
-        f"- quant={result['quant']} input={result['input']} B={B} M={M} K={K} N={N} "
+        f"- quant={result['quant']} input={result['input']} transpose_b_before_mma={result['transpose']} "
+        f"B={B} M={M} K={K} N={N} "
         f"max_diff={result['max_diff']:.8g} mean_diff={result['mean_diff']:.8g} "
         f"max_diff_vs_fp16_b_ref={result.get('max_diff_vs_fp16_b_ref', float('nan')):.8g} "
         f"mean_diff_vs_fp16_b_ref={result.get('mean_diff_vs_fp16_b_ref', float('nan')):.8g} "
