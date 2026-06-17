@@ -333,6 +333,7 @@ def _sample_logits_finalize_kernel(
     if logit_softcap is not None:
         top_k_logits = logit_softcap * tanh_jfn(top_k_logits / logit_softcap)
 
+    top_k_logits -= top_k_logits.max(axis=-1, keep_dims=True)
     probs = tl.softmax(top_k_logits / temperature, dim=-1, keep_dims=True)
 
     # apply top-p sampling
