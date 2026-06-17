@@ -192,7 +192,7 @@ class Scheduler:
         prefill_tps = self._total_prefill_tokens / elapsed if elapsed > 0 else 0.0
         decode_tps = self._total_decode_tokens / elapsed if elapsed > 0 else 0.0
         active = sum(1 for rq in self._active if rq is not None and not rq._done)
-        context_len = sum(rq._context_len for rq in self._active if rq is not None)
+        context_len = max(rq._context_len for rq in self._active if rq is not None)
         print(
             f"stats tokens={self._total_prefill_tokens + self._total_decode_tokens} "
             f"tps_prefill={prefill_tps:.2f} tps_decode={decode_tps:.2f} "
