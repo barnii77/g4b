@@ -32,6 +32,8 @@ def _contiguous_ignoring_unit_dims(shape, strides):
 
 
 def _pre_hook(args):
+    # TODO with the way I'm zeroing, quantized output tensor dtypes would lead to illegal memory accesses
+    #  (though those are unsupported atm anyway and there's no use-case).
     split_k = args["NUM_K_SPLITS"]
     shape = [args["c_shape0"], args["c_shape1"], args["c_shape2"]]
     strides = [args["c_stride0"], args["c_stride1"], args["c_stride2"]]
@@ -50,6 +52,7 @@ def _pre_hook(args):
             shape_norm = shape[:-1]
             strides_norm = [args["c_rmsnorm_sum_of_squares_stride0"], args["c_rmsnorm_sum_of_squares_stride1"]]
         assert _contiguous_ignoring_unit_dims(shape_norm, strides_norm), "sum of squares buffer must be contiguous"
+        # c_rmsnorm_sum_of_squares_ptr is still an int32 or fp32 or whatever at this point. no casting happens.
         memset_contiguous_by_ptr(args["c_rmsnorm_sum_of_squares_ptr"], math.prod(shape_norm), 0)
     if split_k > 1:
         # TODO not inherently, but I don't want to write more memcpy kernels
