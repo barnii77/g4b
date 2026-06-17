@@ -146,7 +146,6 @@ class Embeddings:
 class LmHead:
     # parameters
     rmsnorm_w_D_fp32: Tensor
-    embeddings_DV_q5: Tensor
 
     # runtime state
     input_B1D_dtr: Tensor
@@ -565,7 +564,6 @@ class Gemma4E(Model):
         )
 
     def _ple(self, ple: PerLayerEmbeddings, residual: Tensor, act_rsos: Tensor, layer_idx: int, t_now: int):
-        P = ple.shared_out_proj_input_scratchpad_BtP_dtple.shape[-1]
         ple_vals = _slice_t(self.embeddings.ple_LBtP_dtple.slice_at(0, layer_idx), t_now)
         h = _slice_t(ple.shared_out_proj_input_scratchpad_BtP_dtple, t_now)
         out = _slice_t(ple.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
@@ -661,7 +659,6 @@ class Gemma4E(Model):
 
         # lm head
         head_rmsnorm_w = Tensor.from_gguf_tensor(ts["output_norm.weight"])
-        embeddings_DV = token_embeddings.transpose(0, 1)
         lm_head_input = Tensor.alloc_empty(DTR, [B, 1, D])
         lm_head_input_rsos = Tensor.alloc_empty(DTSS, [B, 1])
         logits_buf = Tensor.alloc_empty(DTSAMP, [B, 1, V])
@@ -669,7 +666,6 @@ class Gemma4E(Model):
         assert isinstance(logit_softcap, float)
         lm_head = LmHead(
             rmsnorm_w_D_fp32=head_rmsnorm_w,
-            embeddings_DV_q5=embeddings_DV,
             input_B1D_dtr=lm_head_input,
             input_rsos_B1_dtss=lm_head_input_rsos,
             logits_B1V_dtsamp=logits_buf,
