@@ -29,6 +29,9 @@ DTR = float32  # DType for Residual stream
 DTA = float32  # DType for Attention
 DTH = float32 if os.environ.get("G4B_DTH_FP32") else float16  # DType for (pre-)activations inside mlp
 DTKV = float32 if os.environ.get("G4B_DTKV_FP32") else float16  # DType for KV cache
+DTMM_ACCUM_NORMAL = float32 if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
+DTFA_ACCUM_NORMAL = float32 if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
+DTMM_ACCUM_SENSITIVE = float32
 DTMM = int8  # DType for MatMul tensor core ops
 DTSS = float32  # DType for Sum-of-Squares accumulation for rmsnorm
 DTPLE = float32  # DType for computations in the per-layer-embeddings low-rank space
@@ -398,6 +401,7 @@ class Gemma4E(Model):
             self.embeddings.embeddings_VD_q5,
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=self.lm_head.input_rsos_B1_dtss,
+            accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
             rmsnorm_eps=eps,
         )
         self._dbg("logits", self.lm_head.logits_B1V_dtsamp)
@@ -436,7 +440,13 @@ class Gemma4E(Model):
         # reference: ple_lookup = per_layer_embeddings[ids] * sqrt(ple_dim)
         kernels.embeddings.gather_token_embeddings(ple_lookup_flat, None, ple_table, token_ids, math.sqrt(P))
         matmul_a3d_b2d(
-            ple_proj, None, residual, ple_proj_w, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            ple_proj,
+            None,
+            residual,
+            ple_proj_w,
+            transpose_b_before_mma=True,
+            accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
+            rmsnorm_eps=self.rmsnorm_epsilon,
         )
         ple_proj_4d = ple_proj.reshape((B, t_now, L, P))
         ple_lookup_4d = ple_lookup_flat.reshape((B, t_now, L, P))
@@ -483,6 +493,7 @@ class Gemma4E(Model):
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_qk,
+            accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
@@ -494,6 +505,7 @@ class Gemma4E(Model):
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_qk,
+            accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
@@ -505,6 +517,7 @@ class Gemma4E(Model):
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_v,
+            accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         q = _attn_view(attn.shared_q_scratchpad_Bhtk_dta, t_now)
@@ -545,10 +558,16 @@ class Gemma4E(Model):
             partial_l,
             partial_m,
             use_grouped_query_tile=True,
-            use_fp32_dot=bool(os.environ.get("G4B_FA_FP32_DOT")),
+            use_fp32_dot=DTFA_ACCUM_NORMAL == float32 or bool(os.environ.get("G4B_FA_FP32_DOT")),
         )
         matmul_a3d_b2d(
-            out, out_rsos, o_flat, attn.o_proj_Dhv_q4, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            out,
+            out_rsos,
+            o_flat,
+            attn.o_proj_Dhv_q4,
+            transpose_b_before_mma=True,
+            accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            rmsnorm_eps=self.rmsnorm_epsilon,
         )
 
     def _mlp(self, mlp: MLP, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int):
@@ -564,10 +583,17 @@ class Gemma4E(Model):
             c_c2_merge_tiles_fn=kernels.matmul_epilogue.geglu_fusion_matmul_merge_tiles_mixin_jfn,
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
+            accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
-            out, out_rsos, h, mlp.down_proj_DU_q6, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            out,
+            out_rsos,
+            h,
+            mlp.down_proj_DU_q6,
+            transpose_b_before_mma=True,
+            accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            rmsnorm_eps=self.rmsnorm_epsilon,
         )
 
     def _ple(self, ple: PerLayerEmbeddings, residual: Tensor, act_rsos: Tensor, layer_idx: int, t_now: int):
@@ -584,10 +610,17 @@ class Gemma4E(Model):
             storer_extra=ple_vals,
             storer_fn=kernels.matmul_epilogue.ple_gate_storer_jfn,
             transpose_b_before_mma=True,
+            accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
-            out, out_rsos, h, ple.out_proj_DP_fp32, transpose_b_before_mma=True, rmsnorm_eps=self.rmsnorm_epsilon
+            out,
+            out_rsos,
+            h,
+            ple.out_proj_DP_fp32,
+            transpose_b_before_mma=True,
+            accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
+            rmsnorm_eps=self.rmsnorm_epsilon,
         )
 
     @classmethod
