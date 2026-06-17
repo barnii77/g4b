@@ -52,9 +52,13 @@ def make_config(args, meta):
 
 
 def tensor_to_torch(t, dtype):
+    # Read using the tensor's actual storage dtype (it may be fp16, e.g. the residual/attn stream), then cast
+    # to the requested dtype. Interpreting the raw bytes as `dtype` directly breaks when they disagree in width.
     raw = t.to_bytes_sync()
     n = math.prod(t.shape)
-    return torch.frombuffer(bytearray(raw[: n * dtype.itemsize]), dtype=dtype).reshape(tuple(t.shape))
+    storage_dtype = getattr(torch, t.dtype.storage)
+    arr = torch.frombuffer(bytearray(raw[: n * storage_dtype.itemsize]), dtype=storage_dtype).reshape(tuple(t.shape))
+    return arr.to(dtype)
 
 
 def g4b_topk(model, t_idx: int, topn: int):
