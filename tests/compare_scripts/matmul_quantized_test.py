@@ -447,12 +447,12 @@ def run_phase_skip_case(quant_name: str, B: int, M: int, K: int, N: int, transpo
     quant = QUANT_CASES[quant_name]
     torch.manual_seed(0)
     a = torch.randn((B, M, K), dtype=torch.float32, device="cuda") / K**0.5
-    c = torch.empty((B, M, N), dtype=torch.float32, device="cuda")
+    c = torch.empty((B, M, N), dtype=a.dtype, device="cuda")
 
     b_shape = (N, K) if transpose else (K, N)
     gguf_tensor = quant["random"](*b_shape)
     b = Tensor.from_gguf_tensor(gguf_tensor)
-    b_ref = quant["dequant"](gguf_tensor).reshape(b_shape).to("cuda")
+    b_ref = quant["dequant"](gguf_tensor).reshape(b_shape).to("cuda").to(a.dtype)
     b_ref = b_ref.T if transpose else b_ref
 
     # random per-slot phase: ~PHASE_SKIP_FRAC_UNALLOCATED of slots are unallocated (0), the rest are active (prefill).
@@ -464,7 +464,15 @@ def run_phase_skip_case(quant_name: str, B: int, M: int, K: int, N: int, transpo
 
     # pre-gathered compact activation (gather cost measured separately, below).
     a_compact = a.index_select(0, active_idx.long()).contiguous()
-    c_compact = torch.empty((n_active, M, N), dtype=torch.float32, device="cuda")
+    c_compact = torch.empty((n_active, M, N), dtype=a.dtype, device="cuda")
+
+    # "rows" variants: fold the batch (and token) dim into the row/M axis so the kernel reuses the dequantized
+    # weight across all slots' rows (one [1, rows, K] @ [K, N] matmul, like cuBLAS) instead of re-streaming +
+    # re-dequantizing the weight once per batch slot. reshape is a free view (both inputs are contiguous).
+    a_rows = a.reshape(1, B * M, K)
+    c_rows = torch.empty((1, B * M, N), dtype=a.dtype, device="cuda")
+    a_compact_rows = a_compact.reshape(1, n_active * M, K)
+    c_compact_rows = torch.empty((1, n_active * M, N), dtype=a.dtype, device="cuda")
 
     torch.set_float32_matmul_precision("medium")
 
@@ -475,6 +483,10 @@ def run_phase_skip_case(quant_name: str, B: int, M: int, K: int, N: int, transpo
     mine_compact = lambda: matmul_a3d_b2d(
         c_compact, None, a_compact, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0
     )
+    mine_rows_full = lambda: matmul_a3d_b2d(c_rows, None, a_rows, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
+    mine_rows_compact = lambda: matmul_a3d_b2d(
+        c_compact_rows, None, a_compact_rows, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0
+    )
     torch_full = lambda: a @ b_ref
     torch_compact = lambda: a_compact @ b_ref
     gather = lambda: a.index_select(0, active_idx.long()).contiguous()
@@ -483,6 +495,8 @@ def run_phase_skip_case(quant_name: str, B: int, M: int, K: int, N: int, transpo
         "mine_full": _bench_g4b(mine_full),
         "mine_phase": _bench_g4b(mine_phase),
         "mine_compact": _bench_g4b(mine_compact),
+        "mine_rows_full": _bench_g4b(mine_rows_full),
+        "mine_rows_compact": _bench_g4b(mine_rows_compact),
         "torch_full": _bench_torch(torch_full),
         "torch_compact": _bench_torch(torch_compact),
         "gather": _bench_torch(gather),
@@ -504,10 +518,13 @@ for shape in PHASE_SKIP_SHAPE_CASES:
         f"- B={B} M={M} K={K} N={N} active={r['n_active']}/{B}\n"
         f"    mine:  full={ms['mine_full']:.4f}ms  phase_skip={ms['mine_phase']:.4f}ms  "
         f"compact={ms['mine_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['mine_compact']+ms['gather']:.4f}ms)\n"
+        f"    mine rows (B folded into M, weight read once): full={ms['mine_rows_full']:.4f}ms  "
+        f"compact={ms['mine_rows_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['mine_rows_compact']+ms['gather']:.4f}ms)\n"
         f"    torch: full={ms['torch_full']:.4f}ms  "
         f"compact={ms['torch_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['torch_compact']+ms['gather']:.4f}ms)\n"
         f"    speedups vs mine_full: phase_skip={ms['mine_full']/ms['mine_phase']:.2f}x  "
-        f"compact+gather={ms['mine_full']/(ms['mine_compact']+ms['gather']):.2f}x"
+        f"compact+gather={ms['mine_full']/(ms['mine_compact']+ms['gather']):.2f}x  "
+        f"rows_full={ms['mine_full']/ms['mine_rows_full']:.2f}x"
     )
 
 g4b.device.teardown()

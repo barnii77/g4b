@@ -84,6 +84,7 @@ def _cfg(
 def _matmul_3d_autotune_configs():
     return gated_configs(
         default=[
+            _cfg(1, 1, 256, 256, 8, warps=4, stages=3),
             _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
         ],
         tuned=[
@@ -100,6 +101,16 @@ def _matmul_3d_autotune_configs():
             _cfg(1, 64, 128, 256, 8, warps=4, stages=3),
             _cfg(2, 64, 64, 128, 8, warps=4, stages=3),
             _cfg(2, 64, 128, 128, 8, warps=4, stages=3),
+            _cfg(4, 1, 64, 128, 8, warps=4, stages=3),
+            _cfg(4, 2, 64, 128, 8, warps=4, stages=3),
+            _cfg(4, 4, 64, 128, 8, warps=4, stages=3),
+            _cfg(8, 1, 64, 128, 8, warps=4, stages=3),
+            _cfg(8, 4, 64, 128, 8, warps=4, stages=3),
+            _cfg(16, 4, 64, 128, 8, warps=4, stages=3),
+            _cfg(16, 1, 64, 128, 8, warps=4, stages=3),
+            _cfg(16, 4, 64, 128, 8, warps=4, stages=3),
+            _cfg(32, 4, 64, 128, 8, warps=4, stages=3),
+            _cfg(64, 1, 64, 128, 8, warps=4, stages=3),
             # ---- small / skinny-N / decode-ish ----
             # Effective MxN: 16x16, 16x32, 32x16, 32x32
             # _cfg(1, 16, 64, 16, 1, warps=4, stages=3),
