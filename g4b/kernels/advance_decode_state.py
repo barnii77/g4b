@@ -19,10 +19,10 @@ from g4b.kernels.utils import launch, default_bencher, gated_configs
         # fmt: off
         "input_token_ids_shape0", "input_token_ids_shape1",
         "out_token_ids_shape0", "out_token_ids_shape1",
-        "cache_offsets_shape0", "time_dim_sizes_shape0", "user_in_prefill_or_decode_shape0",
+        "cache_offsets_shape0", "time_dim_sizes_shape0", "user_phase_shape0",
         "input_token_ids_stride0", "input_token_ids_stride1",
         "out_token_ids_stride0", "out_token_ids_stride1",
-        "cache_offsets_stride0", "time_dim_sizes_stride0", "user_in_prefill_or_decode_stride0",
+        "cache_offsets_stride0", "time_dim_sizes_stride0", "user_phase_stride0",
         # fmt: on
     ],
     do_bench=default_bencher,
@@ -32,13 +32,13 @@ from g4b.kernels.utils import launch, default_bencher, gated_configs
 def _advance_decode_state_kernel(
     # fmt: off
     input_token_ids_ptr, out_token_ids_ptr, cache_offsets_ptr,
-    time_dim_sizes_ptr, user_in_prefill_or_decode_ptr,
+    time_dim_sizes_ptr, user_phase_ptr,
     input_token_ids_shape0: tl.constexpr, input_token_ids_shape1: tl.constexpr,
     out_token_ids_shape0: tl.constexpr, out_token_ids_shape1: tl.constexpr,
-    cache_offsets_shape0: tl.constexpr, time_dim_sizes_shape0: tl.constexpr, user_in_prefill_or_decode_shape0: tl.constexpr,
+    cache_offsets_shape0: tl.constexpr, time_dim_sizes_shape0: tl.constexpr, user_phase_shape0: tl.constexpr,
     input_token_ids_stride0: tl.constexpr, input_token_ids_stride1: tl.constexpr,
     out_token_ids_stride0: tl.constexpr, out_token_ids_stride1: tl.constexpr,
-    cache_offsets_stride0: tl.constexpr, time_dim_sizes_stride0: tl.constexpr, user_in_prefill_or_decode_stride0: tl.constexpr,
+    cache_offsets_stride0: tl.constexpr, time_dim_sizes_stride0: tl.constexpr, user_phase_stride0: tl.constexpr,
     BLOCKSIZE0: tl.constexpr,
     # fmt: on
 ):
@@ -47,11 +47,11 @@ def _advance_decode_state_kernel(
     tl.static_assert(out_token_ids_shape1 >= 1)
     tl.static_assert(input_token_ids_shape1 == cache_offsets_shape0)
     tl.static_assert(input_token_ids_shape1 == time_dim_sizes_shape0)
-    tl.static_assert(input_token_ids_shape1 == user_in_prefill_or_decode_shape0)
+    tl.static_assert(input_token_ids_shape1 == user_phase_shape0)
 
     offs_b = tl.program_id(0) * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)
     mask = offs_b < input_token_ids_shape1
-    phase = tl.load(user_in_prefill_or_decode_ptr + offs_b * user_in_prefill_or_decode_stride0, mask=mask)
+    phase = tl.load(user_phase_ptr + offs_b * user_phase_stride0, mask=mask)
     mask = mask & (phase == PHASE_DECODE_CONSTEXPR)
 
     tok = tl.load(out_token_ids_ptr + offs_b * out_token_ids_stride0, mask=mask)
@@ -68,7 +68,7 @@ def advance_decode_state(
     out_token_ids: Tensor,
     cache_offsets: Tensor,
     time_dim_sizes: Tensor,
-    user_in_prefill_or_decode: Tensor,
+    user_phase: Tensor,
 ):
     grid_fn = lambda META: (triton.cdiv(input_token_ids.shape[1], META["BLOCKSIZE0"]),)
     return launch[_advance_decode_state_kernel, grid_fn](
@@ -76,5 +76,5 @@ def advance_decode_state(
         out_token_ids=out_token_ids,
         cache_offsets=cache_offsets,
         time_dim_sizes=time_dim_sizes,
-        user_in_prefill_or_decode=user_in_prefill_or_decode,
+        user_phase=user_phase,
     )

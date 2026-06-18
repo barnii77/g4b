@@ -233,7 +233,7 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "k_cache_shape0", "k_cache_shape1", "k_cache_shape2", "k_cache_shape3",
         "v_cache_shape0", "v_cache_shape1", "v_cache_shape2", "v_cache_shape3",
         "o_shape0", "o_shape1", "o_shape2", "o_shape3",
-        "time_dim_sizes_shape0", "user_in_prefill_or_decode_shape0",
+        "time_dim_sizes_shape0", "user_phase_shape0",
         "partial_o_shape0", "partial_o_shape1", "partial_o_shape2", "partial_o_shape3", "partial_o_shape4",
         "partial_l_shape0", "partial_l_shape1", "partial_l_shape2", "partial_l_shape3",
         "partial_m_shape0", "partial_m_shape1", "partial_m_shape2", "partial_m_shape3",
@@ -241,7 +241,7 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "k_cache_stride0", "k_cache_stride1", "k_cache_stride2", "k_cache_stride3",
         "v_cache_stride0", "v_cache_stride1", "v_cache_stride2", "v_cache_stride3",
         "o_stride0", "o_stride1", "o_stride2", "o_stride3",
-        "time_dim_sizes_stride0", "user_in_prefill_or_decode_stride0",
+        "time_dim_sizes_stride0", "user_phase_stride0",
         "partial_o_stride0", "partial_o_stride1", "partial_o_stride2", "partial_o_stride3", "partial_o_stride4",
         "partial_l_stride0", "partial_l_stride1", "partial_l_stride2", "partial_l_stride3",
         "partial_m_stride0", "partial_m_stride1", "partial_m_stride2", "partial_m_stride3",
@@ -256,17 +256,17 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
 @triton.jit
 def _attn_kernel(
     # fmt: off
-    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, time_dim_sizes_ptr, user_in_prefill_or_decode_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, time_dim_sizes_ptr, user_phase_ptr,
     q_shape0: tl.constexpr, q_shape1: tl.constexpr, q_shape2: tl.constexpr, q_shape3: tl.constexpr,
     k_cache_shape0: tl.constexpr, k_cache_shape1: tl.constexpr, k_cache_shape2: tl.constexpr, k_cache_shape3: tl.constexpr,
     v_cache_shape0: tl.constexpr, v_cache_shape1: tl.constexpr, v_cache_shape2: tl.constexpr, v_cache_shape3: tl.constexpr,
     o_shape0: tl.constexpr, o_shape1: tl.constexpr, o_shape2: tl.constexpr, o_shape3: tl.constexpr,
-    time_dim_sizes_shape0: tl.constexpr, user_in_prefill_or_decode_shape0: tl.constexpr,
+    time_dim_sizes_shape0: tl.constexpr, user_phase_shape0: tl.constexpr,
     q_stride0: tl.constexpr, q_stride1: tl.constexpr, q_stride2: tl.constexpr, q_stride3: tl.constexpr,
     k_cache_stride0: tl.constexpr, k_cache_stride1: tl.constexpr, k_cache_stride2: tl.constexpr, k_cache_stride3: tl.constexpr,
     v_cache_stride0: tl.constexpr, v_cache_stride1: tl.constexpr, v_cache_stride2: tl.constexpr, v_cache_stride3: tl.constexpr,
     o_stride0: tl.constexpr, o_stride1: tl.constexpr, o_stride2: tl.constexpr, o_stride3: tl.constexpr,
-    time_dim_sizes_stride0: tl.constexpr, user_in_prefill_or_decode_stride0: tl.constexpr,
+    time_dim_sizes_stride0: tl.constexpr, user_phase_stride0: tl.constexpr,
     ctx_window_size: tl.constexpr, Q_BLOCKSIZE_H: tl.constexpr, MAX_KV_SPLITS: tl.constexpr,
     PHASE: tl.constexpr, STAGE: tl.constexpr, WARP_SPECIALIZE: tl.constexpr, IS_HOPPER: tl.constexpr,
     USE_FP32_DOT: tl.constexpr,
@@ -289,7 +289,7 @@ def _attn_kernel(
     tl.static_assert(KV_BLOCKSIZE_T <= HEAD_DIM)
     tl.static_assert(q_shape0 == k_cache_shape0 and q_shape0 == v_cache_shape0 and q_shape0 == o_shape0)
     tl.static_assert(q_shape0 == time_dim_sizes_shape0)
-    tl.static_assert(q_shape0 == user_in_prefill_or_decode_shape0)
+    tl.static_assert(q_shape0 == user_phase_shape0)
     tl.static_assert(q_shape1 == o_shape1 and q_shape2 == o_shape2 and q_shape3 == o_shape3)
     tl.static_assert(k_cache_shape1 == v_cache_shape1 and k_cache_shape2 == v_cache_shape2)
     tl.static_assert(q_shape3 == k_cache_shape3 and q_shape3 == v_cache_shape3)
@@ -330,7 +330,7 @@ def _attn_kernel(
     off_q_h_tile = off_gqh % Q_HEAD_TILES_PER_KV
 
     # if this kernel is doing decode, skip users in prefill, and vice versa
-    user_phase = tl.load(user_in_prefill_or_decode_ptr + off_b * user_in_prefill_or_decode_stride0)
+    user_phase = tl.load(user_phase_ptr + off_b * user_phase_stride0)
     if user_phase != PHASE:
         return
 
@@ -637,7 +637,7 @@ def flash_attention(
     v_cache: Tensor,
     o: Tensor,
     time_dim_sizes: Tensor,
-    user_in_prefill_or_decode: Tensor,
+    user_phase: Tensor,
     ctx_window_size: int,
     phase: int,
     partial_o: Tensor | None = None,
@@ -675,7 +675,7 @@ def flash_attention(
         v_cache=v_cache,
         o=o,
         time_dim_sizes=time_dim_sizes,
-        user_in_prefill_or_decode=user_in_prefill_or_decode,
+        user_phase=user_phase,
         partial_o=partial_o,
         partial_l=partial_l,
         partial_m=partial_m,
