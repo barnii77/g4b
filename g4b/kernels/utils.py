@@ -41,10 +41,11 @@ def all_slots_off_phase_jfn(user_phase_ptr, off_b, b_bound, user_phase_stride, P
     """
     if user_phase_ptr is None:
         return False
-    in_b = off_b < b_bound
-    phase = tl.load(user_phase_ptr + off_b * user_phase_stride, mask=in_b, other=0)
-    active = in_b & (phase == PHASE)
-    return tl.sum(active.to(tl.int32)) == 0
+    else:
+        in_b = off_b < b_bound
+        phase = tl.load(user_phase_ptr + off_b * user_phase_stride, mask=in_b, other=0)
+        active = in_b & (phase == PHASE)
+        return tl.sum(active.to(tl.int32)) == 0
 
 
 def _is_tensor_like(t):
