@@ -83,9 +83,12 @@ def _cfg(
 
 def _matmul_3d_autotune_configs():
     return gated_configs(
-        default=[_cfg(1, 32, 32, 32, 8, warps=4, stages=3)],
+        default=[
+            _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
+        ],
         tuned=[
             # ---- aggressive ----
+            _cfg(1, 32, 32, 32, 8, warps=4, stages=3),
             _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
             _cfg(1, 64, 32, 32, 8, warps=4, stages=3),
             _cfg(1, 64, 32, 128, 8, warps=4, stages=3),
