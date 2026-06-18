@@ -19,6 +19,7 @@ source .venv/bin/activate
 export PYTHONPATH=.
 export PYTHONUNBUFFERED=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
+export G4B_PROFILE=1
 
 case "$mode" in
   nsys)
