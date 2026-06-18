@@ -3,15 +3,12 @@ import triton
 from triton import language as tl
 from g4b import tensor
 from g4b.tensor import Tensor, DType
-from g4b.kernels.utils import launch, default_bencher, jfn_cache_key, gated_configs
+from g4b.kernels.utils import launch, default_bencher, jfn_cache_key, gated_configs, all_slots_off_phase_jfn
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.kernels.rsos import compute_rsos
 from g4b.kernels import matmul_epilogue
 from g4b.utils import contiguous_strides_for_shape
 
-# TODO it appears that torch's matmul (without sum of squares fusion) using fp16 + fp32 accum is ~10% faster than mine.
-#  With fp16 + fp16 accum, mine is significantly faster though. Maybe torch with set_float32_matmul_precision("high") is
-#  not quite doing the same computation as my kernel? The docs do say something about it using either tf32 or 2x bf16...
 # TODO INT8 on SM89 gives you ~4.5x the tensor core throughput of FP16, so I absolutely need to add support for INT8,
 #  like llama.cpp does it:
 #  Q4_K packed nibbles -> widened integer codes arranged as int8 MMA operands
@@ -20,9 +17,6 @@ from g4b.utils import contiguous_strides_for_shape
 #  then apply Q4_K scales/mins and Q8_1 scales/sums in FP32
 #  ... sadly, I think for now I don't have the time to get this right, let's hope mem bandwidth bottlenecks enough for
 #  bf16 mma to do the trick during decode.
-
-# TODO It turns out K-quants are a retarded format for GPUs. There's room for optimization by repacking into a
-#  custom format with better block layout at load time... However I fear such a repack would be lossy.
 
 
 def _contiguous_ignoring_unit_dims(shape, strides):
@@ -156,6 +150,8 @@ def _matmul_3d_autotune_configs():
         "storer_extra_stride0", "storer_extra_stride1", "storer_extra_stride2",
         "rmsnorm_eps",
         "TRANSPOSE_B_BEFORE_MMA",
+        # per-slot phase skip
+        "user_phase_shape0", "user_phase_stride0", "PHASE",
         # codegen-affecting constexpr callables
         # "a_loader_fn", "b_loader_fn", "storer_fn", "c_c2_merge_tiles_fn",
         # hack so autotune results are cacheable to disk
@@ -209,9 +205,14 @@ def _matmul_a3d_b2d_kernel(
     # the default full-output-row [B, t] reduction. 0 = default full-row behavior.
     RSOS_HEAD_DIM: tl.constexpr = 0,
     c_c2_merge_tiles_fn: tl.constexpr | None = None,
+    # per-slot phase skip: if user_phase_ptr is given, a batch tile whose slots are all off-phase
+    # (unallocated, or in the other phase) early-returns. See all_slots_off_phase_jfn.
+    user_phase_ptr = None,
+    user_phase_shape0: tl.constexpr = 0, user_phase_stride0: tl.constexpr = 0,
+    PHASE: tl.constexpr = 0,
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
     b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None,
-    input_rmsnorm_sum_of_squares: None = None,
+    input_rmsnorm_sum_of_squares: None = None, user_phase: None = None,
     # fmt: on
 ):
     if TRANSPOSE_B_BEFORE_MMA:
@@ -223,6 +224,7 @@ def _matmul_a3d_b2d_kernel(
             a_shape2 == b_shape0 and a_shape0 == c_shape0 and a_shape1 == c_shape1 and b_shape1 == c_shape2
         )
     tl.static_assert(a_shape2 % NUM_K_SPLITS == 0)
+    tl.static_assert(user_phase_ptr is None or user_phase_shape0 == a_shape0)
 
     if b2_ptr is not None or RSOS_HEAD_DIM > 0:
         # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2).
@@ -248,6 +250,12 @@ def _matmul_a3d_b2d_kernel(
     off_row = tile_row * A_BLOCKSIZE1
     off_col = tile_col * B_BLOCKSIZE1
     k_split_start = k_split_step * tile_k_split
+
+    # skip batch tiles whose slots are all off-phase (unallocated / wrong phase)
+    if all_slots_off_phase_jfn(
+        user_phase_ptr, off_b + tl.arange(0, A_BLOCKSIZE0), a_shape0, user_phase_stride0, PHASE
+    ):
+        return
 
     a_desc = tl.make_tensor_descriptor(
         a_ptr,
@@ -776,9 +784,12 @@ def matmul_a3d_b2d(
     *,
     input_rmsnorm_sum_of_squares: Tensor | None = None,
     rsos_head_dim: int = 0,
+    user_phase: Tensor | None = None,
+    phase: int = 0,
     rmsnorm_eps: float,
 ):
     assert (b2 is None) == (c_c2_merge_tiles_fn is None)
+    assert isinstance(phase, int)
     # per-head segmented output rsos (q/k/v) accumulates across N-tiles via atomic_add and isn't sound across
     # K-splits, so disable split-K when it's active (matches forward.txt note).
     k_split_allowed = b2 is None and rsos_head_dim == 0
@@ -813,6 +824,8 @@ def matmul_a3d_b2d(
         b2=b2,
         storer_extra=storer_extra,
         input_rmsnorm_sum_of_squares=input_rmsnorm_sum_of_squares,
+        user_phase=user_phase,
+        PHASE=phase,
         a_loader_fn=a_loader_fn,
         b_loader_fn=b_loader_fn,
         storer_fn=storer_fn,

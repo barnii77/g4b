@@ -29,6 +29,24 @@ def tanh_jfn(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+@triton.jit
+def all_slots_off_phase_jfn(user_phase_ptr, off_b, b_bound, user_phase_stride, PHASE: tl.constexpr):
+    """Per-slot skip predicate for batched kernels.
+
+    `off_b` is the 1-D vector of batch-slot indices this program would touch. Returns True iff NONE of the
+    in-bounds slots are in `PHASE` (the launch's phase), i.e. the whole program can early-return. With one slot
+    per program (BLOCKSIZE0==1) this is exact; for wider blocks it is conservative (only skips a block whose
+    slots are all off-phase, which is always correct since the per-slot stores stay masked to their own slot).
+    Slots out of bounds and unallocated slots (phase 0) never match PHASE (which is 1 or 2), so both are skipped.
+    """
+    if user_phase_ptr is None:
+        return False
+    in_b = off_b < b_bound
+    phase = tl.load(user_phase_ptr + off_b * user_phase_stride, mask=in_b, other=0)
+    active = in_b & (phase == PHASE)
+    return tl.sum(active.to(tl.int32)) == 0
+
+
 def _is_tensor_like(t):
     return hasattr(t, "shape") and hasattr(t, "stride") and hasattr(t, "dtype") and hasattr(t, "data_ptr")
 

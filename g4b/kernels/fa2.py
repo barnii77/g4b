@@ -2,13 +2,11 @@
 #  indexing computations in int64 explicitly instead of the implicit int32 default that you get with naive triton.
 #  This does however come with a performance penalty, so maybe gate it conditionally based on input sizes. A O(GB) KV
 #  cache is pretty common after all.
-# TODO accept dtype arg so gemma4e.py -> DTA or what it's called controls precision
 # TODO can I, for chunked prefill, within a qk tile, split them into sub-tiles and skip some fully masked sub-tiles?
 #  tradeoff: smaller tile sizes for less wasted compute
 
 import triton
 import os
-from typing import Literal
 from triton import language as tl
 from g4b.tensor import Tensor
 from g4b.kernels.utils import launch, default_bencher, gated_configs
@@ -25,10 +23,15 @@ STAGE_CAUSAL_CONSTEXPR = tl.constexpr(STAGE_FULL | STAGE_ON_BAND)
 INNER_STAGE_OFF_BAND_CONSTEXPR = tl.constexpr(1)
 INNER_STAGE_ON_BAND_CONSTEXPR = tl.constexpr(2)
 INNER_STAGE_FULL_CONSTEXPR = tl.constexpr(3)
-PHASE_PREFILL = 0
-PHASE_DECODE = 1
-PHASE_PREFILL_CONSTEXPR = tl.constexpr(0)
-PHASE_DECODE_CONSTEXPR = tl.constexpr(1)
+# Per-slot phase encoding: 0 -> slot unallocated (skipped by every phase), 1 -> prefill, 2 -> decode.
+# A kernel launched for a given phase compares each slot's value against its PHASE constant and skips
+# mismatches; reserving 0 for "unallocated" means an empty slot is skipped in both prefill and decode.
+PHASE_UNALLOCATED = 0
+PHASE_PREFILL = 1
+PHASE_DECODE = 2
+PHASE_UNALLOCATED_CONSTEXPR = tl.constexpr(0)
+PHASE_PREFILL_CONSTEXPR = tl.constexpr(1)
+PHASE_DECODE_CONSTEXPR = tl.constexpr(2)
 
 
 @triton.jit
@@ -636,7 +639,7 @@ def flash_attention(
     time_dim_sizes: Tensor,
     user_in_prefill_or_decode: Tensor,
     ctx_window_size: int,
-    phase: Literal["prefill", "decode"],
+    phase: int,
     partial_o: Tensor | None = None,
     partial_l: Tensor | None = None,
     partial_m: Tensor | None = None,
@@ -647,14 +650,9 @@ def flash_attention(
     use_fp32_dot: bool = False,
     stage: int = STAGE_CAUSAL,
 ):
+    assert isinstance(phase, int)
     q_heads_per_kv = q.shape[1] // k_cache.shape[1]
     q_blocksize_h = q_heads_per_kv if use_grouped_query_tile else 1
-    if phase == "prefill":
-        phase_id = PHASE_PREFILL
-    elif phase == "decode":
-        phase_id = PHASE_DECODE
-    else:
-        raise ValueError(f"phase must be 'prefill' or 'decode', got {phase!r}")
     if (partial_o is None) != (partial_l is None) or (partial_o is None) != (partial_m is None):
         raise ValueError("partial_o, partial_l, and partial_m must be provided together")
     max_kv_splits = min(partial_o.shape[0], partial_l.shape[0], partial_m.shape[0]) if partial_o is not None else 1
@@ -684,7 +682,7 @@ def flash_attention(
         ctx_window_size=int(ctx_window_size),
         Q_BLOCKSIZE_H=q_blocksize_h,
         MAX_KV_SPLITS=max_kv_splits,
-        PHASE=phase_id,
+        PHASE=phase,
         WARP_SPECIALIZE=warp_specialize,
         IS_HOPPER=is_hopper,
         USE_FP32_DOT=use_fp32_dot,

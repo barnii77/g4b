@@ -10,7 +10,7 @@ from torch.nn.attention.varlen import varlen_attn_out
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import g4b.device
-from g4b.kernels.fa2 import STAGE_CAUSAL, STAGE_FULL, flash_attention
+from g4b.kernels.fa2 import STAGE_CAUSAL, STAGE_FULL, flash_attention, PHASE_PREFILL, PHASE_DECODE
 
 g4b.device.init(0)
 
@@ -289,10 +289,10 @@ def bench_case(case: Case):
         device="cuda",
     )
 
-    user_phase = 1 if case.phase == "decode" else 0
-    user_in_prefill_or_decode = torch.full(
+    phase_id = PHASE_DECODE if case.phase == "decode" else PHASE_PREFILL
+    user_phase = torch.full(
         (case.B,),
-        user_phase,
+        phase_id,
         dtype=torch.uint8,
         device="cuda",
     )
@@ -304,9 +304,9 @@ def bench_case(case: Case):
             v_cache,
             y_baseline,
             time_dim_sizes,
-            user_in_prefill_or_decode,
+            user_phase,
             case.ctx_window_size,
-            case.phase,
+            phase_id,
             stage=case.stage,
             use_grouped_query_tile=False,
         )
@@ -318,9 +318,9 @@ def bench_case(case: Case):
             v_cache,
             y_grouped,
             time_dim_sizes,
-            user_in_prefill_or_decode,
+            user_phase,
             case.ctx_window_size,
-            case.phase,
+            phase_id,
             stage=case.stage,
             use_grouped_query_tile=True,
         )
@@ -332,9 +332,9 @@ def bench_case(case: Case):
             v_cache,
             y_grouped_split,
             time_dim_sizes,
-            user_in_prefill_or_decode,
+            user_phase,
             case.ctx_window_size,
-            case.phase,
+            phase_id,
             partial_o,
             partial_l,
             partial_m,

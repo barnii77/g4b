@@ -2,7 +2,7 @@ import math
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher, tanh_jfn, gated_configs
+from g4b.kernels.utils import launch, default_bencher, tanh_jfn, gated_configs, all_slots_off_phase_jfn
 from g4b.utils import to_int_exact
 
 
@@ -115,6 +115,8 @@ def _bitonic_scan_find_top_k_logits_jfn(
         "out_top_k_logits_stride0", "out_top_k_logits_stride1", "out_top_k_logits_stride2",
         "out_top_k_idx_stride0", "out_top_k_idx_stride1", "out_top_k_idx_stride2",
         "top_k", "NUM_V_SPLITS",
+        "user_phase_shape0", "user_phase_stride0",
+        "PHASE",
         # fmt: on
     ],
     do_bench=default_bencher,
@@ -132,6 +134,10 @@ def _sample_logits_parallel_reduce_kernel(
     out_top_k_idx_stride0: tl.constexpr, out_top_k_idx_stride1: tl.constexpr, out_top_k_idx_stride2: tl.constexpr, out_top_k_idx_stride3: tl.constexpr,
     top_k: tl.constexpr, NUM_V_SPLITS: tl.constexpr,
     BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
+    user_phase_ptr = None,
+    user_phase_shape0: tl.constexpr = 0, user_phase_stride0: tl.constexpr = 0,
+    PHASE: tl.constexpr = 0,
+    user_phase: None = None,
     # fmt: on
 ):
     tl.static_assert(logits_shape0 == out_top_k_logits_shape0)
@@ -144,6 +150,7 @@ def _sample_logits_parallel_reduce_kernel(
     tl.static_assert(out_top_k_idx_shape3 == top_k)
     tl.static_assert(top_k <= BLOCKSIZE2)  # if I didn't do this, the kernel would be highly non-trivial
     tl.static_assert(logits_shape2 % NUM_V_SPLITS == 0)
+    tl.static_assert(user_phase_ptr is None or user_phase_shape0 == logits_shape0)
 
     B: tl.constexpr = logits_shape0
     T: tl.constexpr = logits_shape1
@@ -154,6 +161,12 @@ def _sample_logits_parallel_reduce_kernel(
     pid_split_v = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_b = tl.program_id(2)
+
+    # skip slots not in this launch's phase (unallocated / wrong phase)
+    if all_slots_off_phase_jfn(
+        user_phase_ptr, pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0), B, user_phase_stride0, PHASE
+    ):
+        return
 
     off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
     off_t = pid_t * BLOCKSIZE1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
@@ -391,7 +404,10 @@ def sample_logits(
     top_p: float,
     NUM_V_SPLITS: int,
     logit_softcap: float | None = None,
+    user_phase: Tensor | None = None,
+    phase: int = 0,
 ):
+    assert isinstance(phase, int)
     assert list(seed.shape) == [2]
     grid_fn_parallel_reduce = lambda META: (
         NUM_V_SPLITS,
@@ -408,6 +424,8 @@ def sample_logits(
         out_top_k_idx=tmp_top_k_idx_scratchpad,
         top_k=to_int_exact(top_k),
         NUM_V_SPLITS=NUM_V_SPLITS,
+        user_phase=user_phase,
+        PHASE=phase,
     )
     k2 = launch[_sample_logits_finalize_kernel, grid_fn_finalize](
         top_k_logits=tmp_top_k_logits_scratchpad,

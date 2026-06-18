@@ -1,7 +1,7 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher, gated_configs
+from g4b.kernels.utils import launch, default_bencher, gated_configs, all_slots_off_phase_jfn
 from g4b.kernels.memset import memset_contiguous
 from g4b.kernels.matmul import matmul_a3d_b2d_b_loader_jfn
 
@@ -51,6 +51,8 @@ def _cfg(
         "z_rsos_stride0", "z_rsos_stride1", "z_rsos_stride2",
         "embed_stride0", "embed_stride1",
         "token_ids_rb_stride0", "token_ids_rb_stride1",
+        "user_phase_shape0", "user_phase_stride0",
+        "PHASE",
         # fmt: on
     ],
     do_bench=default_bencher,
@@ -73,6 +75,10 @@ def _gather_token_embeddings_kernel(
     z_rsos_shape0: tl.constexpr = 0, z_rsos_shape1: tl.constexpr = 0,
     z_rsos_stride0: tl.constexpr = 0, z_rsos_stride1: tl.constexpr = 0,
     z_rsos: None = None,
+    user_phase_ptr = None,
+    user_phase_shape0: tl.constexpr = 0, user_phase_stride0: tl.constexpr = 0,
+    PHASE: tl.constexpr = 0,
+    user_phase: None = None,
     # fmt: on
 ):
     tl.static_assert(z_shape2 == embed_shape1)  # residual size
@@ -80,10 +86,15 @@ def _gather_token_embeddings_kernel(
     tl.static_assert(z_rsos_shape0 == 0 or z_rsos_shape0 == z_shape0)
     tl.static_assert(z_rsos_shape1 == 0 or z_rsos_shape1 == z_shape1)
     tl.static_assert(BLOCKSIZE0 == 1 and BLOCKSIZE1 == 1)  # dequant loader handles one token row per program
+    tl.static_assert(user_phase_ptr is None or user_phase_shape0 == z_shape0)
 
     pid_d = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_b = tl.program_id(2)
+
+    # skip slots not in this launch's phase (e.g. unallocated slots, or the wrong phase)
+    if all_slots_off_phase_jfn(user_phase_ptr, pid_b + tl.arange(0, 1), user_phase_shape0, user_phase_stride0, PHASE):
+        return
 
     first_col = pid_d * BLOCKSIZE2
     pid_off_b = pid_b + tl.arange(0, 1)
@@ -95,11 +106,13 @@ def _gather_token_embeddings_kernel(
 
     # dequantize embed[token_id, first_col : first_col + BLOCKSIZE2] -> tile shape (1, 1, BLOCKSIZE2)
     embed_tile = matmul_a3d_b2d_b_loader_jfn(
+        # fmt: off
         "embed", None, 0, token_id, first_col, embed_ptr,
         1, embed_shape0, embed_shape1,
         0, embed_stride0, embed_stride1,
         1, 1, BLOCKSIZE2,
         EMBED_DTYPE,
+        # fmt: on
     )
     embeddings = scaling_factor * embed_tile.reshape((1, 1, BLOCKSIZE2)).to(z_ptr.dtype.element_ty)
 
@@ -120,7 +133,10 @@ def gather_token_embeddings(
     embed: Tensor,
     token_ids: Tensor,
     scaling_factor: int | float,
+    user_phase: Tensor | None = None,
+    phase: int = 0,
 ):
+    assert isinstance(phase, int)
     grid_fn = lambda META: (
         triton.cdiv(z.shape[2], META["BLOCKSIZE2"]),
         triton.cdiv(z.shape[1], META["BLOCKSIZE1"]),
@@ -134,5 +150,7 @@ def gather_token_embeddings(
         token_ids=token_ids,
         scaling_factor=scaling_factor,
         EMBED_DTYPE=embed.dtype.name,
+        user_phase=user_phase,
+        PHASE=phase,
     )
     return k1, k2

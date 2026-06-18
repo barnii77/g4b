@@ -1,7 +1,7 @@
 import triton
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher, gated_configs
+from g4b.kernels.utils import launch, default_bencher, gated_configs, all_slots_off_phase_jfn
 
 
 def _cfg(
@@ -73,6 +73,8 @@ def _cfg(
         "cache_stride0", "cache_stride1", "cache_stride2", "cache_stride3",
         "cache_offsets_stride0",
         "rmsnorm_eps",
+        "user_phase_shape0", "user_phase_stride0",
+        "PHASE",
         # fmt: on
     ],
     do_bench=default_bencher,
@@ -94,16 +96,20 @@ def _add_kv_to_cache_kernel(
     x_rsos_shape0: tl.constexpr = 0, x_rsos_shape1: tl.constexpr = 0, x_rsos_shape2: tl.constexpr = 0,
     x_rsos_stride0: tl.constexpr = 0, x_rsos_stride1: tl.constexpr = 0, x_rsos_stride2: tl.constexpr = 0,
     x_rsos: None = None,
+    user_phase_ptr = None,
+    user_phase_shape0: tl.constexpr = 0, user_phase_stride0: tl.constexpr = 0,
+    PHASE: tl.constexpr = 0,
+    user_phase: None = None,
     # fmt: on
 ):
     tl.static_assert(x_shape0 == cache_shape0)
     tl.static_assert(x_shape1 == cache_shape1)
     tl.static_assert(x_shape3 == cache_shape3)
     tl.static_assert(x_shape0 == cache_offsets_shape0)
-    if x_rsos_ptr is not None:
-        tl.static_assert(x_rsos_shape0 == x_shape0)
-        tl.static_assert(x_rsos_shape1 == x_shape1)
-        tl.static_assert(x_rsos_shape2 == x_shape2)
+    tl.static_assert(x_rsos_ptr is None or x_rsos_shape0 == x_shape0)
+    tl.static_assert(x_rsos_ptr is None or x_rsos_shape1 == x_shape1)
+    tl.static_assert(x_rsos_ptr is None or x_rsos_shape2 == x_shape2)
+    tl.static_assert(user_phase_ptr is None or user_phase_shape0 == x_shape0)
 
     B: tl.constexpr = x_shape0
     t: tl.constexpr = x_shape2
@@ -114,6 +120,11 @@ def _add_kv_to_cache_kernel(
 
     pid_b = tl.program_id(1)
     off_b = pid_b * BLOCKSIZE0 + tl.arange(0, BLOCKSIZE0)
+
+    # skip slots not in this launch's phase (unallocated / wrong phase)
+    if all_slots_off_phase_jfn(user_phase_ptr, off_b, B, user_phase_stride0, PHASE):
+        return
+
     cache_offsets = tl.load(cache_offsets_ptr + off_b * cache_offsets_stride0, mask=off_b < B)
 
     pid = tl.program_id(0)
@@ -148,7 +159,16 @@ def _add_kv_to_cache_kernel(
     tl.store(cache_ptr + cache_offs, x, mask=(off_b < B) & (off_g < G) & (off_t < t) & (off_d < d))
 
 
-def add_kv_to_cache(x: Tensor, cache: Tensor, cache_offsets: Tensor, rmsnorm_eps: float, x_rsos: Tensor | None = None):
+def add_kv_to_cache(
+    x: Tensor,
+    cache: Tensor,
+    cache_offsets: Tensor,
+    rmsnorm_eps: float,
+    x_rsos: Tensor | None = None,
+    user_phase: Tensor | None = None,
+    phase: int = 0,
+):
+    assert isinstance(phase, int)
     grid_fn = lambda META: (
         triton.cdiv(x.shape[1], META["BLOCKSIZE1"])
         * triton.cdiv(x.shape[2], META["BLOCKSIZE2"])
@@ -161,4 +181,6 @@ def add_kv_to_cache(x: Tensor, cache: Tensor, cache_offsets: Tensor, rmsnorm_eps
         cache_offsets=cache_offsets,
         x_rsos=x_rsos,
         rmsnorm_eps=rmsnorm_eps,
+        user_phase=user_phase,
+        PHASE=phase,
     )

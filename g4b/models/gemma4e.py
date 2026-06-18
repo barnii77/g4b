@@ -15,6 +15,7 @@ from g4b.utils import gguf_tensors_by_name
 from g4b import kernels, device
 from g4b.kernels.memset import memset_contiguous
 from g4b.kernels.matmul import matmul_a3d_b2d
+from g4b.kernels.fa2 import PHASE_PREFILL, PHASE_DECODE
 
 # TODO if I wanted to support MoE models:
 #  I could allocate a tensor for every expert host-side, then build a cuda graph where the router kernel produces
@@ -29,8 +30,8 @@ DTR = float32  # DType for Residual stream
 DTA = float32  # DType for Attention
 DTH = float32 if os.environ.get("G4B_DTH_FP32") else float16  # DType for (pre-)activations inside mlp
 DTKV = float32 if os.environ.get("G4B_DTKV_FP32") else float16  # DType for KV cache
-DTMM_ACCUM_NORMAL = float32  #if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
-DTFA_ACCUM_NORMAL = float32  #if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
+DTMM_ACCUM_NORMAL = float32  # if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
+DTFA_ACCUM_NORMAL = float32  # if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
 DTMM_ACCUM_SENSITIVE = float32
 DTMM = int8  # DType for MatMul tensor core ops
 DTSS = float32  # DType for Sum-of-Squares accumulation for rmsnorm
@@ -205,7 +206,7 @@ class Gemma4E(Model):
     sample_positions_B_int32: Tensor
     cache_offsets_B_int32: Tensor
     time_dim_sizes_B_int32: Tensor  # time dim is dynamically sized
-    user_in_prefill_or_decode_B_uint8: Tensor  # 0 -> prefill, 1 -> decode
+    user_phase_B_uint8: Tensor  # per slot: 0 -> unallocated, 1 -> prefill, 2 -> decode
     output_copy_ring: tuple[OutputCopySlot, ...]
     output_copy_ring_idx: list[int]
     batch_size: int
@@ -232,7 +233,9 @@ class Gemma4E(Model):
         self._copy_i32(self.sample_positions_B_int32, sample_positions)
         self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
         self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
-        self._copy_u8(self.user_in_prefill_or_decode_B_uint8, [0] * self.batch_size)
+        # TODO scheduler rewrite: set per-slot (unallocated slots -> PHASE_UNALLOCATED) instead of a uniform
+        #  vector, and drive transitions via transition_slot() or something.
+        self._copy_u8(self.user_phase_B_uint8, [PHASE_PREFILL] * self.batch_size)
 
     def prepare_decode_inputs(
         self,
@@ -245,7 +248,7 @@ class Gemma4E(Model):
         self._copy_i32(self.sample_positions_B_int32, sample_positions)
         self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
         self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
-        self._copy_u8(self.user_in_prefill_or_decode_B_uint8, [1] * self.batch_size)
+        self._copy_u8(self.user_phase_B_uint8, [PHASE_DECODE] * self.batch_size)
 
     def collect_output_token_ids(self) -> list[int]:
         n = self.batch_size
@@ -296,6 +299,7 @@ class Gemma4E(Model):
 
     def _forward(self, t_now: int, phase: str):
         eps = self.rmsnorm_epsilon
+        phase_id = PHASE_DECODE if phase == "decode" else PHASE_PREFILL
         residual = _slice_t(self.residual_BtD_dtr, t_now)
         act = _slice_t(self.layers[0].attn.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
         act_rsos = _slice_t(self.residual_rsos_Bt_dtss, t_now)
@@ -308,10 +312,12 @@ class Gemma4E(Model):
             self.embeddings.embeddings_VD_q5,
             token_ids,
             math.sqrt(residual.shape[-1]),
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
         )
         self._dbg("after gather embed (residual)", residual)
         self._dbg("after gather embed (rsos)", residual_rsos)
-        self._prepare_ple(token_ids, residual, t_now)
+        self._prepare_ple(token_ids, residual, t_now, phase_id)
         self._dbg("after prepare_ple (residual)", residual)
         # act = residual * input_weight (UNnormalized). The q/k/v matmul normalizes by rms(residual) via
         # input_rmsnorm_sum_of_squares=act_rsos, matching how later layers' act buffers are produced by
@@ -324,7 +330,7 @@ class Gemma4E(Model):
 
         self._dbg("after first rmsnorm (act)", act)
         for i, layer in enumerate(self.layers):
-            self._attention(layer.attn, act, residual, act_rsos, t_now, phase)
+            self._attention(layer.attn, act, residual, act_rsos, t_now, phase, phase_id)
             self._dbg(
                 f"L{i} after attention (attn out)",
                 _slice_t(layer.attn.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now),
@@ -341,7 +347,7 @@ class Gemma4E(Model):
             )
 
             self._dbg(f"L{i} after attn resid (residual)", residual)
-            self._mlp(layer.mlp, act, residual, act_rsos, t_now)
+            self._mlp(layer.mlp, act, residual, act_rsos, t_now, phase_id)
             self._dbg(
                 f"L{i} after mlp (mlp out)",
                 _slice_t(layer.mlp.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now),
@@ -357,7 +363,7 @@ class Gemma4E(Model):
             )
 
             self._dbg(f"L{i} after mlp resid (residual)", residual)
-            self._ple(layer.ple, residual, act_rsos, i, t_now)
+            self._ple(layer.ple, residual, act_rsos, i, t_now, phase_id)
             self._dbg(
                 f"L{i} after ple (ple out)",
                 _slice_t(layer.ple.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now),
@@ -380,11 +386,15 @@ class Gemma4E(Model):
             self._dbg(f"L{i} after ple resid (residual)", residual)
             self._dbg(f"L{i} act_rsos", act_rsos)
             if _dbg_capture_layer_residuals():
-                kernels.select_t.select_t(residual, self.sample_positions_B_int32, self.debug_layer_residuals_LB1D_dtr.slice_at(0, i))
+                kernels.select_t.select_t(
+                    residual, self.sample_positions_B_int32, self.debug_layer_residuals_LB1D_dtr.slice_at(0, i)
+                )
                 kernels.select_t.select_t(
                     act_rsos.reshape((act_rsos.shape[0], act_rsos.shape[1], 1)),
                     self.sample_positions_B_int32,
-                    self.debug_layer_rsos_LB1_dtss.slice_at(0, i).reshape((self.debug_layer_rsos_LB1_dtss.shape[1], 1, 1)),
+                    self.debug_layer_rsos_LB1_dtss.slice_at(0, i).reshape(
+                        (self.debug_layer_rsos_LB1_dtss.shape[1], 1, 1)
+                    ),
                 )
 
         self._dbg("final act_rsos (for logits)", act_rsos)
@@ -402,6 +412,8 @@ class Gemma4E(Model):
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=self.lm_head.input_rsos_B1_dtss,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=eps,
         )
         self._dbg("logits", self.lm_head.logits_B1V_dtsamp)
@@ -416,6 +428,8 @@ class Gemma4E(Model):
             self.sampling_state.top_p,
             self.sampling_state.top_k_logits_scratchpad_B1__num_splits__top_k__dtsamp.shape[2],
             logit_softcap=self.lm_head.logit_softcap,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
         )
         if phase == "decode":
             kernels.advance_decode_state.advance_decode_state(
@@ -423,10 +437,10 @@ class Gemma4E(Model):
                 self.sampling_state.out_token_ids_B1_int32,
                 self.cache_offsets_B_int32,
                 self.time_dim_sizes_B_int32,
-                self.user_in_prefill_or_decode_B_uint8,
+                self.user_phase_B_uint8,
             )
 
-    def _prepare_ple(self, token_ids: Tensor, residual: Tensor, t_now: int):
+    def _prepare_ple(self, token_ids: Tensor, residual: Tensor, t_now: int, phase_id: int):
         B, _, D = residual.shape
         L = len(self.layers)
         P = self.embeddings.ple_rmsnorm_w_P_fp32.shape[0]
@@ -438,7 +452,15 @@ class Gemma4E(Model):
         # ple_proj_DLP_bf16 is stored conventionally as [L*P, D]; matmul computes residual @ W^T.
         ple_proj_w = self.embeddings.ple_proj_LPD_bf16
         # reference: ple_lookup = per_layer_embeddings[ids] * sqrt(ple_dim)
-        kernels.embeddings.gather_token_embeddings(ple_lookup_flat, None, ple_table, token_ids, math.sqrt(P))
+        kernels.embeddings.gather_token_embeddings(
+            ple_lookup_flat,
+            None,
+            ple_table,
+            token_ids,
+            math.sqrt(P),
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
+        )
         matmul_a3d_b2d(
             ple_proj,
             None,
@@ -446,6 +468,8 @@ class Gemma4E(Model):
             ple_proj_w,
             transpose_b_before_mma=True,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         ple_proj_4d = ple_proj.reshape((B, t_now, L, P))
@@ -464,7 +488,9 @@ class Gemma4E(Model):
                 b_rmsnorm_w=self.embeddings.ple_rmsnorm_w_P_fp32,
             )
 
-    def _attention(self, attn: Attention, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int, phase: str):
+    def _attention(
+        self, attn: Attention, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int, phase: str, phase_id: int
+    ):
         q_flat = _flat_head_out(attn.shared_q_scratchpad_Bhtk_dta, t_now)
         k_flat = _flat_head_out(attn.shared_k_scratchpad_Bgtk_dta, t_now)
         v_flat = _flat_head_out(attn.shared_v_scratchpad_Bgtv_dta, t_now)
@@ -494,6 +520,8 @@ class Gemma4E(Model):
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_qk,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
@@ -506,6 +534,8 @@ class Gemma4E(Model):
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_qk,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
@@ -518,6 +548,8 @@ class Gemma4E(Model):
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_v,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         q = _attn_view(attn.shared_q_scratchpad_Bhtk_dta, t_now)
@@ -540,10 +572,21 @@ class Gemma4E(Model):
         )
         if attn.owns_kv_cache:
             kernels.add_kv_to_cache.add_kv_to_cache(
-                k, attn.k_cache_Bg__T_or_W__k__dtkv, self.cache_offsets_B_int32, self.rmsnorm_epsilon
+                k,
+                attn.k_cache_Bg__T_or_W__k__dtkv,
+                self.cache_offsets_B_int32,
+                self.rmsnorm_epsilon,
+                user_phase=self.user_phase_B_uint8,
+                phase=phase_id,
             )
             kernels.add_kv_to_cache.add_kv_to_cache(
-                v, attn.v_cache_Bg__T_or_W__v__dtkv, self.cache_offsets_B_int32, self.rmsnorm_epsilon, v_rsos
+                v,
+                attn.v_cache_Bg__T_or_W__v__dtkv,
+                self.cache_offsets_B_int32,
+                self.rmsnorm_epsilon,
+                v_rsos,
+                user_phase=self.user_phase_B_uint8,
+                phase=phase_id,
             )
         kernels.fa2.flash_attention(
             q,
@@ -551,9 +594,9 @@ class Gemma4E(Model):
             attn.v_cache_Bg__T_or_W__v__dtkv,
             o,
             self.time_dim_sizes_B_int32,
-            self.user_in_prefill_or_decode_B_uint8,
+            self.user_phase_B_uint8,
             attn.context_window_size,
-            phase,
+            phase_id,
             partial_o,
             partial_l,
             partial_m,
@@ -567,10 +610,12 @@ class Gemma4E(Model):
             attn.o_proj_Dhv_q4,
             transpose_b_before_mma=True,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
 
-    def _mlp(self, mlp: MLP, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int):
+    def _mlp(self, mlp: MLP, act: Tensor, residual: Tensor, act_rsos: Tensor, t_now: int, phase_id: int):
         h = _slice_t(mlp.shared_down_proj_input_scratchpad_BtU_dth, t_now)
         out = _slice_t(mlp.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
         out_rsos = _slice_t(mlp.shared_last_and_this_layer_output_sum_of_squares_accum_scratchpad_Bt_dtss, t_now)
@@ -584,6 +629,8 @@ class Gemma4E(Model):
             transpose_b_before_mma=True,
             input_rmsnorm_sum_of_squares=act_rsos,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
@@ -593,10 +640,20 @@ class Gemma4E(Model):
             mlp.down_proj_DU_q6,
             transpose_b_before_mma=True,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
 
-    def _ple(self, ple: PerLayerEmbeddings, residual: Tensor, act_rsos: Tensor, layer_idx: int, t_now: int):
+    def _ple(
+        self,
+        ple: PerLayerEmbeddings,
+        residual: Tensor,
+        act_rsos: Tensor,
+        layer_idx: int,
+        t_now: int,
+        phase_id: int,
+    ):
         ple_vals = _slice_t(self.embeddings.ple_LBtP_dtple.slice_at(0, layer_idx), t_now)
         h = _slice_t(ple.shared_out_proj_input_scratchpad_BtP_dtple, t_now)
         out = _slice_t(ple.shared_last_and_this_layer_output_scratchpad_BtD_dtr, t_now)
@@ -611,6 +668,8 @@ class Gemma4E(Model):
             storer_fn=kernels.matmul_epilogue.ple_gate_storer_jfn,
             transpose_b_before_mma=True,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
         matmul_a3d_b2d(
@@ -620,6 +679,8 @@ class Gemma4E(Model):
             ple.out_proj_DP_fp32,
             transpose_b_before_mma=True,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
+            user_phase=self.user_phase_B_uint8,
+            phase=phase_id,
             rmsnorm_eps=self.rmsnorm_epsilon,
         )
 
@@ -725,8 +786,8 @@ class Gemma4E(Model):
         memset_contiguous(sample_positions, 0)
         memset_contiguous(cache_offsets, 0)
         memset_contiguous(time_dim_sizes, 0)
-        user_in_prefill_or_decode = Tensor.alloc_empty(uint8, [B])
-        memset_contiguous(user_in_prefill_or_decode, 0)
+        user_phase = Tensor.alloc_empty(uint8, [B])
+        memset_contiguous(user_phase, 0)
         rmsnorm_epsilon = meta["gemma4.attention.layer_norm_rms_epsilon"]
         assert isinstance(rmsnorm_epsilon, float)
         identity_rmsnorm_w = Tensor.from_bytes_sync(struct.pack(f"<{D}f", *([1.0] * D)), float32, [D])
@@ -921,7 +982,7 @@ class Gemma4E(Model):
             sample_positions_B_int32=sample_positions,
             cache_offsets_B_int32=cache_offsets,
             time_dim_sizes_B_int32=time_dim_sizes,
-            user_in_prefill_or_decode_B_uint8=user_in_prefill_or_decode,
+            user_phase_B_uint8=user_phase,
             output_copy_ring=output_copy_ring,
             output_copy_ring_idx=[0],
             batch_size=B,
