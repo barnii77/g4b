@@ -26,13 +26,14 @@ def apply_input_rsos_in_epilogue_mixin_jfn(
     # fmt: on
 ):
     if input_rsos_ptr is not None:
-        rsos_desc = tl.make_tensor_descriptor(
-            input_rsos_ptr,
-            (input_rsos_shape0, input_rsos_shape1),
-            (input_rsos_stride0, input_rsos_stride1),
-            (tile0.shape[0], tile0.shape[1]),
-        )
-        rsos = rsos_desc.load((off0, off1))
+        # Plain masked load instead of a TMA descriptor: the rsos is a [B, t] scalar-per-row tensor, so the
+        # descriptor's contiguous block (tile0.shape[1] == A_BLOCKSIZE1, which can be 1) would be < 16 bytes and
+        # violate the TMA minimum. The load is tiny, so TMA buys nothing here.
+        o0 = off0 + tl.arange(0, tile0.shape[0])
+        o1 = off1 + tl.arange(0, tile0.shape[1])
+        rsos_offs = o0[:, None] * input_rsos_stride0 + o1[None, :] * input_rsos_stride1
+        rsos_mask = (o0[:, None] < input_rsos_shape0) & (o1[None, :] < input_rsos_shape1)
+        rsos = tl.load(input_rsos_ptr + rsos_offs, mask=rsos_mask, other=0.0)
         scale = tl.rsqrt(rsos[:, :, None] / rmsnorm_dim + rmsnorm_eps)
         tile0 *= scale
         if tile1 is not None:
