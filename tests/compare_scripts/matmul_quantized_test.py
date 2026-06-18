@@ -11,6 +11,7 @@ import g4b.device
 from g4b import tensor as g4b_tensor
 from g4b.gguf import GGUFType, GGUFTensor
 from g4b.kernels.matmul import matmul_a3d_b2d
+from g4b.kernels.fa2 import PHASE_PREFILL
 from g4b.tensor import Tensor
 from scripts.reference_impl import dequant_q4k_to_fp32, dequant_q5k_to_fp32, dequant_q6k_to_fp32
 
@@ -397,5 +398,116 @@ if failed:
         )
 else:
     print("all matmul cases had zero diff; no heatmaps generated")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase-skip benchmark: with ~3/4 of the batch slots "unallocated" (phase 0, skipped by the kernel), how does the
+# in-kernel per-slot skip compare to (a) the full matmul over all slots and (b) compacting the active rows into a fresh
+# contiguous tensor and doing a dense matmul on just those? Measured for both my kernel and torch.
+#
+# dim0 (B) is the batch/slot dim that the phase buffer indexes. The compacted variants are timed on a *pre-gathered*
+# tensor (so each timed loop is single-stream: g4b kernels never read a tensor torch is still writing) and the gather
+# cost is measured separately, so "compact total ~= gather + compact matmul".
+# ---------------------------------------------------------------------------------------------------------------------
+
+PHASE_SKIP_FRAC_UNALLOCATED = 0.75
+PHASE_SKIP_QUANT = "q4_k"
+PHASE_SKIP_SHAPE_CASES = [
+    # B (slots), M (tokens/slot), K, N. N a multiple of the superblock width.
+    (64, 1, 2048, 8192),  # decode-like: one token per slot
+    (64, 16, 2048, 8192),  # small-prefill-like: a few tokens per slot
+    (64, 512, 2048, 8192),  # big-prefill-like: many tokens per slot
+]
+PHASE_SKIP_REPS = 100
+
+
+def _bench_g4b(fn, reps=PHASE_SKIP_REPS):
+    for _ in range(5):
+        fn()
+    cuda_sync()
+    start = time.time()
+    for _ in range(reps):
+        fn()
+    cuda_sync()
+    return (time.time() - start) / reps * 1e3  # ms/iter
+
+
+def _bench_torch(fn, reps=PHASE_SKIP_REPS):
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    start = time.time()
+    for _ in range(reps):
+        fn()
+    torch.cuda.synchronize()
+    return (time.time() - start) / reps * 1e3  # ms/iter
+
+
+def run_phase_skip_case(quant_name: str, B: int, M: int, K: int, N: int, transpose: bool = True):
+    quant = QUANT_CASES[quant_name]
+    torch.manual_seed(0)
+    a = torch.randn((B, M, K), dtype=torch.float32, device="cuda") / K**0.5
+    c = torch.empty((B, M, N), dtype=torch.float32, device="cuda")
+
+    b_shape = (N, K) if transpose else (K, N)
+    gguf_tensor = quant["random"](*b_shape)
+    b = Tensor.from_gguf_tensor(gguf_tensor)
+    b_ref = quant["dequant"](gguf_tensor).reshape(b_shape).to("cuda")
+    b_ref = b_ref.T if transpose else b_ref
+
+    # random per-slot phase: ~PHASE_SKIP_FRAC_UNALLOCATED of slots are unallocated (0), the rest are active (prefill).
+    active_mask = torch.rand((B,), device="cuda") >= PHASE_SKIP_FRAC_UNALLOCATED
+    active_mask[0] = True  # guarantee at least one active slot
+    user_phase = torch.where(active_mask, PHASE_PREFILL, 0).to(torch.uint8)
+    active_idx = active_mask.nonzero(as_tuple=True)[0].to(torch.int32)
+    n_active = int(active_idx.numel())
+
+    # pre-gathered compact activation (gather cost measured separately, below).
+    a_compact = a.index_select(0, active_idx.long()).contiguous()
+    c_compact = torch.empty((n_active, M, N), dtype=torch.float32, device="cuda")
+
+    torch.set_float32_matmul_precision("medium")
+
+    mine_full = lambda: matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
+    mine_phase = lambda: matmul_a3d_b2d(
+        c, None, a, b, transpose_b_before_mma=transpose, user_phase=user_phase, phase=PHASE_PREFILL, rmsnorm_eps=0.0
+    )
+    mine_compact = lambda: matmul_a3d_b2d(
+        c_compact, None, a_compact, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0
+    )
+    torch_full = lambda: a @ b_ref
+    torch_compact = lambda: a_compact @ b_ref
+    gather = lambda: a.index_select(0, active_idx.long()).contiguous()
+
+    ms = {
+        "mine_full": _bench_g4b(mine_full),
+        "mine_phase": _bench_g4b(mine_phase),
+        "mine_compact": _bench_g4b(mine_compact),
+        "torch_full": _bench_torch(torch_full),
+        "torch_compact": _bench_torch(torch_compact),
+        "gather": _bench_torch(gather),
+    }
+    return {"quant": quant_name, "shape": (B, M, K, N), "n_active": n_active, "ms": ms}
+
+
+# warmup
+for shape in PHASE_SKIP_SHAPE_CASES:
+    run_phase_skip_case(PHASE_SKIP_QUANT, *shape)
+
+print()
+print(f"phase-skip benchmark (target {PHASE_SKIP_FRAC_UNALLOCATED:.0%} of slots unallocated, quant={PHASE_SKIP_QUANT})")
+for shape in PHASE_SKIP_SHAPE_CASES:
+    r = run_phase_skip_case(PHASE_SKIP_QUANT, *shape)
+    B, M, K, N = r["shape"]
+    ms = r["ms"]
+    print(
+        f"- B={B} M={M} K={K} N={N} active={r['n_active']}/{B}\n"
+        f"    mine:  full={ms['mine_full']:.4f}ms  phase_skip={ms['mine_phase']:.4f}ms  "
+        f"compact={ms['mine_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['mine_compact']+ms['gather']:.4f}ms)\n"
+        f"    torch: full={ms['torch_full']:.4f}ms  "
+        f"compact={ms['torch_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['torch_compact']+ms['gather']:.4f}ms)\n"
+        f"    speedups vs mine_full: phase_skip={ms['mine_full']/ms['mine_phase']:.2f}x  "
+        f"compact+gather={ms['mine_full']/(ms['mine_compact']+ms['gather']):.2f}x"
+    )
 
 g4b.device.teardown()
