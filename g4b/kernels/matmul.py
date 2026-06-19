@@ -91,25 +91,34 @@ def _matmul_3d_autotune_configs():
         return [_cfg(a0, a1, k, n, group1, split_k=split_k, warps=warps, stages=stages)]
     return gated_configs(
         default=[
+            # USE_MATVEC decode: single-row scalar reduction (no tl.dot) with split-K for occupancy. Placed first
+            # so G4B_SKIP_TUNING picks it when use_matvec=True; the pruner drops it in tl.dot mode. N=32/K=128 is
+            # not gated to the q6 N=16 hack so it serves q4/q5/q6. split_k=4 keeps K/split_k a multiple of K=128
+            # for every Gemma decode K (2560/4096/10240); split-K is auto-clamped to 1 where fused rsos/b2 forbid it.
+            _cfg(1, 1, 128, 32, 1, split_k=4, warps=4, stages=3),
             # K=64 avoids the q4/q5 K-quant loader's <=32-column path, which loads extra packed data and discards half.
-            # Keep the first config decode-friendly, then let G4B_SKIP_TUNING=1 still choose among a tiny shape-aware
-            # set so prefill-sized tests don't get stuck on the skinny decode tile.
+            # Keep the first tl.dot config decode-friendly, then let G4B_SKIP_TUNING=1 still choose among a tiny
+            # shape-aware set so prefill-sized tests don't get stuck on the skinny decode tile.
             # Single-token decode wants many skinny CTAs. K=64/N=16 with 4 warps was the best stable quick sweep
             # for q6 K/V and also beat the old 2-warp skinny tile for q4/q5 decode-shaped checks.
             _cfg(1, 1, 64, 16, 1, warps=4, stages=3),
-            # q6-only fallback: K=32 keeps the unpack simple but was slower in the decode K/V sweep.
-            _cfg(1, 1, 32, 16, 1, warps=1, stages=3),
             _cfg(1, 32, 64, 32, 8, warps=4, stages=3),
-            _cfg(1, 1, 64, 64, 1, warps=4, stages=3),
             _cfg(1, 1, 64, 128, 1, warps=4, stages=3),
             _cfg(1, 1, 128, 128, 1, warps=4, stages=3),
             _cfg(16, 1, 64, 64, 1, warps=4, stages=3),
             _cfg(16, 1, 64, 128, 1, warps=4, stages=3),
-            _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
             _cfg(1, 128, 64, 128, 8, warps=4, stages=3),
             _cfg(1, 64, 128, 128, 8, warps=4, stages=3),
         ],
         tuned=[
+            # ---- USE_MATVEC decode candidates (single-row scalar reduction; pruned out in tl.dot mode) ----
+            # split_k/block_k chosen so K/split_k stays a multiple of block_k for all decode K (2560/4096/10240).
+            _cfg(
+                1, 1, 128, 16, 1, split_k=4, warps=4, stages=3
+            ),  # q6 K/V N=16 fast path (split clamps to 1 under fused rsos)
+            _cfg(1, 1, 64, 32, 1, split_k=8, warps=4, stages=3),  # more splits for the splittable o/down/up projections
+            _cfg(1, 1, 128, 64, 1, split_k=4, warps=4, stages=3),  # wide-N (up/gate/lm_head)
+            _cfg(1, 1, 128, 32, 1, split_k=2, warps=4, stages=3),
             # ---- conservative K-quant-friendly defaults ----
             _cfg(1, 32, 64, 32, 8, warps=4, stages=3),
             _cfg(1, 32, 64, 64, 8, warps=4, stages=3),
@@ -181,13 +190,33 @@ def _matmul_3d_autotune_configs():
 def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
     a_shape0 = kwargs["a_shape0"]
     a_shape1 = kwargs["a_shape1"]
+    a_shape2 = kwargs["a_shape2"]
     b_dtype = kwargs.get("B_DTYPE") or named_args.get("B_DTYPE")
+    use_matvec = kwargs.get("USE_MATVEC")
+    if use_matvec is None:
+        use_matvec = named_args.get("USE_MATVEC")
+    use_matvec = bool(use_matvec)
     pruned = []
     for conf in configs:
         block_b = conf.kwargs.get("A_BLOCKSIZE0", 1)
         block_m = conf.kwargs.get("A_BLOCKSIZE1", 1)
         block_k = conf.kwargs.get("A_BLOCKSIZE2", 1)
         block_n = conf.kwargs.get("B_BLOCKSIZE1", 1)
+        split_k = conf.kwargs.get("NUM_K_SPLITS", 1)
+        # split-K validity: K must divide evenly by the split count (kernel static_asserts this), AND each
+        # split's K range (K/split_k) must tile evenly by block_k, else the K loop overruns into the next
+        # split's columns (the loaders only mask against the global K) and double-counts them.
+        if a_shape2 % split_k != 0 or (a_shape2 // split_k) % block_k != 0:
+            continue
+        # matvec configs are single-row (M==1) split-K tiles. Keep them only in matvec mode, and keep the wide
+        # tl.dot tiles only out of matvec mode: the broadcast+sum materialises a [M,K,N] tile that blows up
+        # register/shared usage on large tiles, while tl.dot wants M>=16 it does not have here.
+        is_matvec_cfg = block_b == 1 and block_m == 1 and split_k > 1
+        if use_matvec:
+            if block_b != 1 or block_m != 1:  # matvec computes a single output row
+                continue
+        elif is_matvec_cfg:
+            continue
         q6_decode_hack = block_b == 1 and block_m == 1 and block_n == 16 and block_k in (32, 128)
         if q6_decode_hack and b_dtype != tensor.q6_k.name:
             continue
@@ -221,6 +250,7 @@ def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
         "storer_extra_stride0", "storer_extra_stride1", "storer_extra_stride2",
         "rmsnorm_eps",
         "TRANSPOSE_B_BEFORE_MMA",
+        "USE_MATVEC",
         # per-slot phase skip
         "user_phase_shape0", "user_phase_stride0", "PHASE",
         # codegen-affecting constexpr callables
@@ -282,6 +312,7 @@ def _matmul_a3d_b2d_kernel(
     user_phase_ptr = None,
     user_phase_shape0: tl.constexpr = 0, user_phase_stride0: tl.constexpr = 0,
     PHASE: tl.constexpr = 0,
+    USE_MATVEC: tl.constexpr = False,  # if true, do not use tl.dot but instead use scalar expression
     # these args are here so when b2 = None and launch doesn't decompose tensor, it doesn't error
     b2: None = None, c_rmsnorm_sum_of_squares: None = None, storer_extra: None = None,
     input_rmsnorm_sum_of_squares: None = None, user_phase: None = None,
@@ -298,10 +329,17 @@ def _matmul_a3d_b2d_kernel(
     tl.static_assert(a_shape2 % NUM_K_SPLITS == 0)
     tl.static_assert(user_phase_ptr is None or user_phase_shape0 == a_shape0)
 
-    if b2_ptr is not None or RSOS_HEAD_DIM > 0:
+    a_ptr = tl.multiple_of(a_ptr, 16)  # guaranteed by allocator
+    b_ptr = tl.multiple_of(b_ptr, 16)
+    if b2_ptr is not None:
+        b2_ptr = tl.multiple_of(b2_ptr, 16)
+    c_ptr = tl.multiple_of(c_ptr, 16)
+
+    if b2_ptr is not None or RSOS_HEAD_DIM > 0 or KEEP_C:
         # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2).
         # RSOS_HEAD_DIM>0 (per-head fused rsos) must match the wrapper's k_split_allowed=False: a partial-K
-        # program can't compute a correct sum-of-squares of the full output row.
+        # program can't compute a correct sum-of-squares of the full output row. KEEP_C seeds the accumulator
+        # from c, which split-K's atomic-add would re-add once per split, so it also forces a single split.
         NUM_K_SPLITS = 1
 
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
@@ -324,62 +362,77 @@ def _matmul_a3d_b2d_kernel(
     k_split_start = k_split_step * tile_k_split
 
     # skip batch tiles whose slots are all off-phase (unallocated / wrong phase)
-    if all_slots_off_phase_jfn(
-        user_phase_ptr, off_b + tl.arange(0, A_BLOCKSIZE0), a_shape0, user_phase_stride0, PHASE
-    ):
+    if all_slots_off_phase_jfn(user_phase_ptr, off_b + tl.arange(0, A_BLOCKSIZE0), a_shape0, user_phase_stride0, PHASE):
         return
 
-    a_desc = tl.make_tensor_descriptor(
-        a_ptr,
-        (a_shape0, a_shape1, a_shape2),
-        (a_stride0, a_stride1, a_stride2),
-        (A_BLOCKSIZE0, A_BLOCKSIZE1, A_BLOCKSIZE2),
-    )
-    if TRANSPOSE_B_BEFORE_MMA:
-        b_desc = tl.make_tensor_descriptor(
-            b_ptr,
-            (1, b_shape0, b_shape1),
-            (0, b_stride0, b_stride1),
-            (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
-        )
-    else:
-        b_desc = tl.make_tensor_descriptor(
-            b_ptr,
-            (1, b_shape0, b_shape1),
-            (0, b_stride0, b_stride1),
-            (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
-        )
     has_b2: tl.constexpr = b2_ptr is not None
-    if has_b2:
+    if USE_MATVEC:
+        # direct tl.load/tl.store
+        a_desc = None
+        b_desc = None
+        b2_desc = None
+        c_desc = None
+        _co0 = off_b + tl.arange(0, A_BLOCKSIZE0)[:, None, None]
+        _co1 = off_row + tl.arange(0, A_BLOCKSIZE1)[None, :, None]
+        _co2 = off_col + tl.arange(0, B_BLOCKSIZE1)[None, None, :]
+        _c_ptrs = c_ptr + _co0 * c_stride0 + _co1 * c_stride1 + _co2 * c_stride2
+        c = (
+            tl.load(_c_ptrs, mask=(_co0 < c_shape0) & (_co1 < c_shape1) & (_co2 < c_shape2), other=0.0).to(ACCUM_DTYPE)
+            if KEEP_C
+            else tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
+        )
+        c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
+    else:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            (a_shape0, a_shape1, a_shape2),
+            (a_stride0, a_stride1, a_stride2),
+            (A_BLOCKSIZE0, A_BLOCKSIZE1, A_BLOCKSIZE2),
+        )
         if TRANSPOSE_B_BEFORE_MMA:
-            b2_desc = tl.make_tensor_descriptor(
-                b2_ptr,
+            b_desc = tl.make_tensor_descriptor(
+                b_ptr,
                 (1, b_shape0, b_shape1),
-                (0, b2_stride0, b2_stride1),
+                (0, b_stride0, b_stride1),
                 (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
             )
         else:
-            b2_desc = tl.make_tensor_descriptor(
-                b2_ptr,
+            b_desc = tl.make_tensor_descriptor(
+                b_ptr,
                 (1, b_shape0, b_shape1),
-                (0, b2_stride0, b2_stride1),
+                (0, b_stride0, b_stride1),
                 (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
             )
-    else:
-        b2_desc = None
-    c_desc = tl.make_tensor_descriptor(
-        c_ptr,
-        (c_shape0, c_shape1, c_shape2),
-        (c_stride0, c_stride1, c_stride2),
-        (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1),
-    )
+        if has_b2:
+            if TRANSPOSE_B_BEFORE_MMA:
+                b2_desc = tl.make_tensor_descriptor(
+                    b2_ptr,
+                    (1, b_shape0, b_shape1),
+                    (0, b2_stride0, b2_stride1),
+                    (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
+                )
+            else:
+                b2_desc = tl.make_tensor_descriptor(
+                    b2_ptr,
+                    (1, b_shape0, b_shape1),
+                    (0, b2_stride0, b2_stride1),
+                    (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
+                )
+        else:
+            b2_desc = None
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            (c_shape0, c_shape1, c_shape2),
+            (c_stride0, c_stride1, c_stride2),
+            (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1),
+        )
 
-    c = (
-        c_desc.load((off_b, off_row, off_col)).to(ACCUM_DTYPE)
-        if KEEP_C
-        else tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
-    )
-    c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
+        c = (
+            c_desc.load((off_b, off_row, off_col)).to(ACCUM_DTYPE)
+            if KEEP_C
+            else tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
+        )
+        c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
 
     for off_k in tl.range(k_split_start, k_split_start + k_split_step, A_BLOCKSIZE2):
         BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
@@ -429,10 +482,17 @@ def _matmul_a3d_b2d_kernel(
             UPCAST_TY = ACCUM_DTYPE
 
         a_upcast = a.to(UPCAST_TY)
-
-        c = tl.dot(a_upcast, b.to(UPCAST_TY), c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
-            (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1)
-        )
+        b_upcast = b.to(UPCAST_TY)
+        if USE_MATVEC:
+            c += (
+                (a_upcast.reshape((BLOCK_M, BLOCK_K, 1)) * b_upcast.reshape((1, BLOCK_K, BLOCK_N)))
+                .sum(axis=1)
+                .reshape((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1))
+            )
+        else:
+            c = tl.dot(a_upcast, b_upcast, c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
+                (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1)
+            )
         if has_b2:
             # TODO maybe t.join'ing the b and b2 tiles and doing one tl.dot call then splitting again is faster? try!
             # fmt: off
@@ -453,7 +513,14 @@ def _matmul_a3d_b2d_kernel(
                     B2_DTYPE,
                 ).reshape((BLOCK_K, BLOCK_N)).to(UPCAST_TY)
             # fmt: on
-            c2 = tl.dot(a_upcast, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
+            if USE_MATVEC:
+                c2 += (
+                    (a_upcast.reshape((BLOCK_M, BLOCK_K, 1)) * b2_tile.reshape((1, BLOCK_K, BLOCK_N)))
+                    .sum(axis=1)
+                    .reshape(c.shape)
+                )
+            else:
+                c2 = tl.dot(a_upcast, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
 
     if has_b2:
         # fmt: off
@@ -469,18 +536,20 @@ def _matmul_a3d_b2d_kernel(
 
     # fmt: off
     storer_fn(
-        "c", c_desc, c, off_b, off_row, off_col,
+        "c", c_desc, c_ptr, c, off_b, off_row, off_col,
         c_rmsnorm_sum_of_squares_ptr, storer_extra_ptr,
         c_shape0, c_shape1,
         c_rmsnorm_sum_of_squares_stride0, c_rmsnorm_sum_of_squares_stride1,
         NUM_K_SPLITS, C_DTYPE,
         input_rmsnorm_sum_of_squares_ptr if c_c2_merge_tiles_fn is None else None,  # otherwise it's responsible
+        c_stride0, c_stride1, c_stride2, c_shape2,
         input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
         input_rmsnorm_sum_of_squares_stride0, input_rmsnorm_sum_of_squares_stride1,
         a_shape2, rmsnorm_eps,
         storer_extra_shape0, storer_extra_shape1, storer_extra_shape2,
         storer_extra_stride0, storer_extra_stride1, storer_extra_stride2,
         c_rmsnorm_sum_of_squares_stride2, RSOS_HEAD_DIM,
+        USE_MATVEC,
     )
     # fmt: on
 
@@ -518,7 +587,13 @@ def matmul_a3d_b2d_b_loader_jfn(
         or conceptual_dtype == tensor.q6_k.name
     )
     if not is_quantized:
-        return desc.load((off0, off1, off2)).to(tl.float16)
+        if desc is not None:
+            return desc.load((off0, off1, off2)).to(tl.float16)
+        _offs0 = off0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
+        _offs1 = off1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
+        _offs2 = off2 + tl.arange(0, BLOCKSIZE2)[None, None, :]
+        _ptrs = ptr + _offs0 * stride0 + _offs1 * stride1 + _offs2 * stride2
+        return tl.load(_ptrs, mask=(_offs0 < shape0) & (_offs1 < shape1) & (_offs2 < shape2)).to(tl.float16)
 
     # desc not used, we manually tl.load
     ptr_u8 = ptr.to(tl.pointer_type(tl.uint8))
@@ -792,32 +867,21 @@ def matmul_a3d_b2d_b_loader_jfn(
         elif Q6_HALF_SUPERBLOCK_FAST:
             half = e0 // 128
             ql_packed = tl.load(
-                ptr_u8
-                + offs_row * stride_row
-                + sb_first_byte_col_off
-                + half * 64
-                + tl.arange(0, 64)[None, :],
+                ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + half * 64 + tl.arange(0, 64)[None, :],
                 mask=mask,
                 other=0.0,
             )
             qh_packed = tl.load(
-                ptr_u8
-                + offs_row * stride_row
-                + sb_first_byte_col_off
-                + 128
-                + half * 32
-                + tl.arange(0, 32)[None, :],
+                ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + 128 + half * 32 + tl.arange(0, 32)[None, :],
                 mask=mask,
                 other=0.0,
             )
-            ql_unpacked = (
-                ql_packed.reshape((BLOCKSIZE_ROW, 1, 1, 64))
-                >> (tl.arange(0, 2).to(tl.uint8) * 4).reshape((1, 1, 2, 1))
+            ql_unpacked = ql_packed.reshape((BLOCKSIZE_ROW, 1, 1, 64)) >> (tl.arange(0, 2).to(tl.uint8) * 4).reshape(
+                (1, 1, 2, 1)
             )
             ql_unpacked = (ql_unpacked & 0x0F).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
-            qh_unpacked = (
-                qh_packed.reshape((BLOCKSIZE_ROW, 1, 1, 32))
-                >> (tl.arange(0, 4).to(tl.uint8) * 2).reshape((1, 1, 4, 1))
+            qh_unpacked = qh_packed.reshape((BLOCKSIZE_ROW, 1, 1, 32)) >> (tl.arange(0, 4).to(tl.uint8) * 2).reshape(
+                (1, 1, 4, 1)
             )
             qh_unpacked = (qh_unpacked & 0x03).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
         else:
@@ -857,17 +921,21 @@ def matmul_a3d_b2d_b_loader_jfn(
 @triton.jit
 def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
     # fmt: off
-    name: tl.constexpr, desc, tile, off0, off1, off2, rsos_ptr, extra_ptr,
+    name: tl.constexpr, desc, ptr, tile, off0, off1, off2, rsos_ptr, extra_ptr,
     rsos_shape0: tl.constexpr, rsos_shape1: tl.constexpr,
     rsos_stride0: tl.constexpr, rsos_stride1: tl.constexpr,
     NUM_K_SPLITS: tl.constexpr, C_DTYPE: tl.constexpr,  # e.g. "q4_k", ignored here for convenience
     input_rsos_ptr=None,
+    out_stride0: tl.constexpr = 0, out_stride1: tl.constexpr = 0, out_stride2: tl.constexpr = 0,
+    out_shape2: tl.constexpr = 0,  # N (col) bound for the matvec ptr-store; dims 0/1 reuse rsos_shape0/1 == c_shape0/1
     input_rsos_shape0: tl.constexpr = 0, input_rsos_shape1: tl.constexpr = 0,
     input_rsos_stride0: tl.constexpr = 0, input_rsos_stride1: tl.constexpr = 0,
     rmsnorm_dim: tl.constexpr = 0, rmsnorm_eps: tl.constexpr = 0.0,
     extra_shape0: tl.constexpr = 0, extra_shape1: tl.constexpr = 0, extra_shape2: tl.constexpr = 0,
     extra_stride0: tl.constexpr = 0, extra_stride1: tl.constexpr = 0, extra_stride2: tl.constexpr = 0,
     rsos_stride2: tl.constexpr = 0, RSOS_HEAD_DIM: tl.constexpr = 0,
+    USE_MATVEC: tl.constexpr = False,
+    # matvec mode has no TMA descriptor (desc is None); store via direct ptr
     # fmt: on
 ):
     if input_rsos_ptr is not None:
@@ -900,10 +968,23 @@ def matmul_a3d_b2d_partial_rmsnorm_storer_jfn(
             rsos.to(rsos_ptr.dtype.element_ty),
             mask=(rsos_offsets0 < rsos_shape0) & (rsos_offsets1 < rsos_shape1),
         )
-    if NUM_K_SPLITS == 1:
-        desc.store((off0, off1, off2), tile.to(desc.dtype))
+    if USE_MATVEC:
+        _offs0 = off0 + tl.arange(0, tile.shape[0])[:, None, None]
+        _offs1 = off1 + tl.arange(0, tile.shape[1])[None, :, None]
+        _offs2 = off2 + tl.arange(0, tile.shape[2])[None, None, :]
+        ptrs = ptr + _offs0 * out_stride0 + _offs1 * out_stride1 + _offs2 * out_stride2
+        store_mask = (_offs0 < rsos_shape0) & (_offs1 < rsos_shape1) & (_offs2 < out_shape2)
+        tile = tile.to(ptr.dtype.element_ty)
+        if NUM_K_SPLITS == 1:
+            tl.store(ptrs, tile, mask=store_mask)
+        else:
+            tl.atomic_add(ptrs, tile, mask=store_mask)
     else:
-        desc.atomic_add((off0, off1, off2), tile.to(desc.dtype))
+        tile = tile.to(desc.dtype)
+        if NUM_K_SPLITS == 1:
+            desc.store((off0, off1, off2), tile)
+        else:
+            desc.atomic_add((off0, off1, off2), tile)
 
 
 def matmul_a3d_b2d(
@@ -920,6 +1001,7 @@ def matmul_a3d_b2d(
     accum_dtype: DType | tl.dtype | None = None,
     keep_c: bool = False,
     transpose_b_before_mma: bool = False,
+    use_matvec: bool = False,
     *,
     input_rmsnorm_sum_of_squares: Tensor | None = None,
     rsos_head_dim: int = 0,
@@ -930,8 +1012,9 @@ def matmul_a3d_b2d(
     assert (b2 is None) == (c_c2_merge_tiles_fn is None)
     assert isinstance(phase, int)
     # per-head segmented output rsos (q/k/v) accumulates across N-tiles via atomic_add and isn't sound across
-    # K-splits, so disable split-K when it's active (matches forward.txt note).
-    k_split_allowed = b2 is None and rsos_head_dim == 0
+    # K-splits, so disable split-K when it's active (matches forward.txt note). KEEP_C seeds the accumulator
+    # from c and is likewise incompatible with split-K's atomic-add (kernel forces NUM_K_SPLITS=1 to match).
+    k_split_allowed = b2 is None and rsos_head_dim == 0 and not keep_c
     selected_num_k_splits = 1
 
     if isinstance(accum_dtype, DType):
@@ -976,6 +1059,7 @@ def matmul_a3d_b2d(
         ACCUM_DTYPE=accum_dtype,
         KEEP_C=keep_c,
         TRANSPOSE_B_BEFORE_MMA=transpose_b_before_mma,
+        USE_MATVEC=use_matvec,
         RSOS_HEAD_DIM=int(rsos_head_dim),
         rmsnorm_eps=float(rmsnorm_eps),
         _a_loader_fn_key=jfn_cache_key(a_loader_fn),
