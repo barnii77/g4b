@@ -600,7 +600,7 @@ class Gemma4E(Model):
             partial_o,
             partial_l,
             partial_m,
-            use_grouped_query_tile=True,
+            use_grouped_query_tile=False,
             use_fp32_dot=DTFA_ACCUM_NORMAL == float32 or bool(os.environ.get("G4B_FA_FP32_DOT")),
         )
         matmul_a3d_b2d(

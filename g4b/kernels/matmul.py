@@ -1,4 +1,5 @@
 import math
+import os
 import triton
 from triton import language as tl
 from g4b import tensor
@@ -82,12 +83,43 @@ def _cfg(
 
 
 def _matmul_3d_autotune_configs():
+    if forced := os.environ.get("G4B_MM_FORCE_CONFIG"):
+        a0, a1, k, n, group1, split_k, warps, stages = map(int, forced.split(","))
+        return [_cfg(a0, a1, k, n, group1, split_k=split_k, warps=warps, stages=stages)]
     return gated_configs(
         default=[
-            _cfg(1, 32, 32, 32, 8, warps=4, stages=3),
+            # K=64 avoids the q4/q5 K-quant loader's <=32-column path, which loads extra packed data and discards half.
+            # Keep the first config decode-friendly, then let G4B_SKIP_TUNING=1 still choose among a tiny shape-aware
+            # set so prefill-sized tests don't get stuck on the skinny decode tile.
+            # Hack: for single-token skinny-N q6 decode, N=16 doubles the CTA count for K/V (1024 / 16 = 64 CTAs)
+            # and 1 warp follows NCU's occupancy/block-size hint. The pruner keeps this q6-only because K=32 is
+            # intentionally bad for q4/q5.
+            _cfg(1, 1, 32, 16, 1, warps=1, stages=3),
+            _cfg(1, 1, 64, 16, 1, warps=2, stages=3),
+            _cfg(1, 32, 64, 32, 8, warps=4, stages=3),
+            _cfg(1, 1, 64, 64, 1, warps=4, stages=3),
+            _cfg(1, 1, 64, 128, 1, warps=4, stages=3),
+            _cfg(1, 1, 128, 128, 1, warps=4, stages=3),
+            _cfg(16, 1, 64, 64, 1, warps=4, stages=3),
+            _cfg(16, 1, 64, 128, 1, warps=4, stages=3),
+            _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
+            _cfg(1, 128, 64, 128, 8, warps=4, stages=3),
+            _cfg(1, 64, 128, 128, 8, warps=4, stages=3),
         ],
         tuned=[
-            # ---- aggressive ----
+            # ---- conservative K-quant-friendly defaults ----
+            _cfg(1, 32, 64, 32, 8, warps=4, stages=3),
+            _cfg(1, 32, 64, 64, 8, warps=4, stages=3),
+            _cfg(1, 32, 128, 32, 8, warps=4, stages=3),
+            _cfg(1, 32, 128, 64, 8, warps=4, stages=3),
+            # ---- single-token decode candidates ----
+            _cfg(1, 1, 32, 16, 1, warps=1, stages=3),
+            _cfg(1, 1, 64, 16, 1, warps=2, stages=3),
+            _cfg(1, 1, 64, 32, 1, warps=4, stages=3),
+            _cfg(1, 1, 64, 64, 1, warps=4, stages=3),
+            _cfg(1, 1, 128, 32, 1, warps=4, stages=3),
+            _cfg(1, 2, 64, 64, 1, warps=4, stages=3),
+            # ---- old default / broader fallback ----
             _cfg(1, 32, 32, 32, 8, warps=4, stages=3),
             _cfg(1, 64, 64, 128, 8, warps=4, stages=3),
             _cfg(1, 64, 32, 32, 8, warps=4, stages=3),
@@ -143,6 +175,29 @@ def _matmul_3d_autotune_configs():
     )
 
 
+def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
+    a_shape0 = kwargs["a_shape0"]
+    a_shape1 = kwargs["a_shape1"]
+    b_dtype = kwargs.get("B_DTYPE") or named_args.get("B_DTYPE")
+    pruned = []
+    for conf in configs:
+        block_b = conf.kwargs.get("A_BLOCKSIZE0", 1)
+        block_m = conf.kwargs.get("A_BLOCKSIZE1", 1)
+        block_k = conf.kwargs.get("A_BLOCKSIZE2", 1)
+        block_n = conf.kwargs.get("B_BLOCKSIZE1", 1)
+        q6_decode_hack = block_b == 1 and block_m == 1 and block_n == 16 and block_k in (32, 128)
+        if q6_decode_hack and b_dtype != tensor.q6_k.name:
+            continue
+        if block_b > 1 and (a_shape0 <= 1 or a_shape1 > 1):
+            continue
+        if block_b == 1 and block_m == 1 and a_shape1 > 1:
+            continue
+        pruned.append(conf)
+    if os.environ.get("G4B_SKIP_TUNING"):
+        return (pruned or configs[:1])[:1]
+    return pruned or configs[:1]
+
+
 @triton.autotune(
     configs=_matmul_3d_autotune_configs(),
     key=[
@@ -173,8 +228,9 @@ def _matmul_3d_autotune_configs():
         "A_DTYPE", "B_DTYPE", "B2_DTYPE", "C_DTYPE", "_ACCUM_DTYPE_CACHE_KEY",
         # fmt: on
     ],
+    prune_configs_by={"early_config_prune": _prune_invalid_matmul_configs},
     do_bench=default_bencher,
-    cache_results=True,
+    cache_results=not bool(os.environ.get("G4B_SKIP_TUNING")),
 )
 @triton.jit
 def _matmul_a3d_b2d_kernel(
@@ -695,26 +751,89 @@ def matmul_a3d_b2d_b_loader_jfn(
         tl.static_assert(BLOCKSIZE_COL >= SUBBLOCK_SIZE_ELEMS)
         n_subblocks_to_load: tl.constexpr = tl.cdiv(BLOCKSIZE_COL, SUBBLOCK_SIZE_ELEMS)
         first_subblock_id = (first_col % SUPERBLOCK_SIZE_ELEMS) // SUBBLOCK_SIZE_ELEMS
-        col_offs = (first_col % SUPERBLOCK_SIZE_ELEMS) + tl.arange(0, BLOCKSIZE_COL)[None, :]
+        e0 = first_col % SUPERBLOCK_SIZE_ELEMS
+        col_run = tl.arange(0, BLOCKSIZE_COL)[None, :]
 
-        ql_byte_offs = (col_offs // 128) * 64 + (col_offs % 64)
-        ql_shift = (((col_offs // 64) % 2) * 4).to(tl.uint8)
-        ql_packed = tl.load(
-            ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + ql_byte_offs,
-            mask=mask,
-            other=0.0,
-        )
+        # Fast path for the single-group decode tile. A 32-wide, 32-aligned column range lands entirely
+        # inside one q6_k packing group (groups are 32 elements wide), so the ql/qh byte offsets are a single
+        # contiguous run and the unpack shifts are loop-invariant *scalars*. Spelling it this way lets Triton
+        # prove contiguity and emit coalesced/vectorized byte loads (like the q4/q5 paths) instead of a
+        # per-element gather, and drops the per-element divide/mod/shift tensors that inflate register
+        # pressure. The general path below stays as the correct fallback for wider K tiles.
+        Q6_SINGLE_GROUP_FAST: tl.constexpr = BLOCKSIZE_COL == 32
+        Q6_HALF_SUPERBLOCK_FAST: tl.constexpr = BLOCKSIZE_COL == 128
+        if Q6_SINGLE_GROUP_FAST:
+            half = e0 // 128
+            g = (e0 % 128) // 32  # packing group within the half: 0..3
+            l0 = e0 % 32
+            ql_base = half * 64 + (g % 2) * 32 + l0
+            qh_base = 128 + half * 32 + l0
+            ql_shift = ((g // 2) * 4).to(tl.uint8)
+            qh_shift = (g * 2).to(tl.uint8)
+            ql_packed = tl.load(
+                ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + ql_base + col_run,
+                mask=mask,
+                other=0.0,
+            )
+            qh_packed = tl.load(
+                ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + qh_base + col_run,
+                mask=mask,
+                other=0.0,
+            )
+            ql_unpacked = (ql_packed >> ql_shift) & 0x0F
+            qh_unpacked = (qh_packed >> qh_shift) & 0x03
+        elif Q6_HALF_SUPERBLOCK_FAST:
+            half = e0 // 128
+            ql_packed = tl.load(
+                ptr_u8
+                + offs_row * stride_row
+                + sb_first_byte_col_off
+                + half * 64
+                + tl.arange(0, 64)[None, :],
+                mask=mask,
+                other=0.0,
+            )
+            qh_packed = tl.load(
+                ptr_u8
+                + offs_row * stride_row
+                + sb_first_byte_col_off
+                + 128
+                + half * 32
+                + tl.arange(0, 32)[None, :],
+                mask=mask,
+                other=0.0,
+            )
+            ql_unpacked = (
+                ql_packed.reshape((BLOCKSIZE_ROW, 1, 1, 64))
+                >> (tl.arange(0, 2).to(tl.uint8) * 4).reshape((1, 1, 2, 1))
+            )
+            ql_unpacked = (ql_unpacked & 0x0F).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
+            qh_unpacked = (
+                qh_packed.reshape((BLOCKSIZE_ROW, 1, 1, 32))
+                >> (tl.arange(0, 4).to(tl.uint8) * 2).reshape((1, 1, 4, 1))
+            )
+            qh_unpacked = (qh_unpacked & 0x03).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        else:
+            col_offs = e0 + col_run
 
-        qh_byte_offs = 128 + (col_offs // 128) * 32 + (col_offs % 32)
-        qh_shift = (((col_offs % 128) // 32) * 2).to(tl.uint8)
-        qh_packed = tl.load(
-            ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + qh_byte_offs,
-            mask=mask,
-            other=0.0,
-        )
+            ql_byte_offs = (col_offs // 128) * 64 + (col_offs % 64)
+            ql_shift = (((col_offs // 64) % 2) * 4).to(tl.uint8)
+            ql_packed = tl.load(
+                ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + ql_byte_offs,
+                mask=mask,
+                other=0.0,
+            )
 
-        ql_unpacked = (ql_packed >> ql_shift) & 0x0F
-        qh_unpacked = (qh_packed >> qh_shift) & 0x03
+            qh_byte_offs = 128 + (col_offs // 128) * 32 + (col_offs % 32)
+            qh_shift = (((col_offs % 128) // 32) * 2).to(tl.uint8)
+            qh_packed = tl.load(
+                ptr_u8 + offs_row * stride_row + sb_first_byte_col_off + qh_byte_offs,
+                mask=mask,
+                other=0.0,
+            )
+
+            ql_unpacked = (ql_packed >> ql_shift) & 0x0F
+            qh_unpacked = (qh_packed >> qh_shift) & 0x03
         qs_selected = ((qh_unpacked << 4) | ql_unpacked).reshape(
             (BLOCKSIZE_ROW, n_subblocks_to_load, SUBBLOCK_SIZE_ELEMS)
         )

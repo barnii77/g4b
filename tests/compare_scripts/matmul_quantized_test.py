@@ -1,17 +1,15 @@
 import torch
 import triton.runtime.driver
-import time
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import g4b.device
 from g4b import tensor as g4b_tensor
 from g4b.gguf import GGUFType, GGUFTensor
 from g4b.kernels.matmul import matmul_a3d_b2d
-from g4b.kernels.fa2 import PHASE_PREFILL
 from g4b.tensor import Tensor
 from scripts.reference_impl import dequant_q4k_to_fp32, dequant_q5k_to_fp32, dequant_q6k_to_fp32
 
@@ -262,269 +260,133 @@ QUANT_CASES = {
     },
 }
 
+# Inference-shaped cases for Gemma-4-E4B-it-UD-Q4_K_XL:
+# D=2560, U=10240, h=8, g=2, qk/v=512, swa_qk/v=256, V=262144.
+# All production weight matmuls use GGUF-transposed weights, so these cases keep transpose_b_before_mma=True.
 SHAPE_CASES = [
-    # B, M, K, N. N must be a multiple of the quant superblock width.
-    (2, 32, 256, 256),
-    (4, 128, 256, 512),
-    (2, 32, 8192, 8192),
-    (4, 128, 8192, 8192),
+    # name, quant, B, M, K, N, reps
+    ("decode_q_proj", "q4_k", 1, 1, 2560, 4096, 40),
+    ("decode_kv_proj", "q6_k", 1, 1, 2560, 1024, 40),
+    ("decode_o_proj", "q4_k", 1, 1, 4096, 2560, 40),
+    ("decode_up_proj", "q4_k", 1, 1, 2560, 10240, 40),
+    ("decode_down_proj", "q6_k", 1, 1, 10240, 2560, 40),
+    ("decode_lm_head", "q5_k", 1, 1, 2560, 262144, 10),
+    ("prefill_q_proj", "q4_k", 1, 512, 2560, 4096, 10),
+    ("prefill_up_proj", "q4_k", 1, 512, 2560, 10240, 6),
+    ("prefill_down_proj", "q6_k", 1, 512, 10240, 2560, 6),
 ]
 
-N_REPS = 100
+def _bench_g4b_event_ms(fn, reps: int) -> float:
+    torch.cuda.synchronize()
+    cuda_sync()
+    start = g4b.device.event(timing_enabled=True)
+    end = g4b.device.event(timing_enabled=True)
+    g4b.device.stream.record(start)
+    for _ in range(reps):
+        fn()
+    g4b.device.stream.record(end)
+    end.sync()
+    return end - start
 
 
-def run_case(quant_name: str, input_name: str, transpose: bool, B: int, M: int, K: int, N: int):
+def _bench_torch_event_ms(fn, reps: int) -> float:
+    cuda_sync()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(reps):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end)
+
+
+def run_case(name: str, quant_name: str, B: int, M: int, K: int, N: int, reps: int):
     quant = QUANT_CASES[quant_name]
     torch.manual_seed(0)
     a = torch.randn((B, M, K), dtype=torch.float32, device="cuda") / K**0.5
     c = torch.empty((B, M, N), dtype=torch.float32, device="cuda")
 
-    b_shape = (N, K) if transpose else (K, N)
-    gguf_tensor = quant[input_name](*b_shape)
+    b_shape = (N, K)
+    gguf_tensor = quant["random"](*b_shape)
     b = Tensor.from_gguf_tensor(gguf_tensor)
     b_ref = quant["dequant"](gguf_tensor).reshape(b_shape).to("cuda")
-    b_ref = b_ref.T if transpose else b_ref
+    b_ref = b_ref.T
 
-    torch.set_float32_matmul_precision("medium")
+    torch.set_float32_matmul_precision("highest")
 
     # Warmup also pays compilation/autotune cost before measuring correctness.
-    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
+    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=True, rmsnorm_eps=0.0)
     cuda_sync()
     torch.cuda.synchronize()
     _ = a @ b_ref
     torch.cuda.synchronize()
 
-    start = time.time()
-    for _ in range(N_REPS):
-        matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
-    cuda_sync()
-    custom_seconds = time.time() - start
+    custom_ms = _bench_g4b_event_ms(
+        lambda: matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=True, rmsnorm_eps=0.0), reps
+    )
 
-    start = time.time()
-    for _ in range(N_REPS):
-        ref = a @ b_ref
+    ref = None
+    torch_highest_ms = _bench_torch_event_ms(lambda: a @ b_ref, reps)
+    ref = a @ b_ref
     torch.cuda.synchronize()
-    torch_medium_seconds = time.time() - start
 
     # Capture one post-warmup output for correctness.
-    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
+    matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=True, rmsnorm_eps=0.0)
     cuda_sync()
-    torch.cuda.synchronize()
-
-    ref_fp16_b = a @ b_ref.to(torch.float16).to(torch.float32)
     torch.cuda.synchronize()
 
     diff = (c - ref).abs()
-    diff_fp16_b = (c - ref_fp16_b).abs()
     return {
+        "name": name,
         "quant": quant_name,
-        "input": input_name,
-        "transpose": transpose,
         "shape": (B, M, K, N),
+        "reps": reps,
         "max_diff": diff.max().item(),
         "mean_diff": diff.mean().item(),
-        "max_diff_vs_fp16_b_ref": diff_fp16_b.max().item(),
-        "mean_diff_vs_fp16_b_ref": diff_fp16_b.mean().item(),
         "expected_abs_max": ref.abs().max().item(),
         "real_abs_max": c.abs().max().item(),
         "expected_std": ref.float().std(unbiased=False).item(),
         "real_std": c.float().std(unbiased=False).item(),
-        "custom_seconds": custom_seconds,
-        "torch_medium_seconds": torch_medium_seconds,
+        "custom_ms": custom_ms,
+        "torch_highest_ms": torch_highest_ms,
         "diff": diff,
     }
 
 
 results = []
-for quant_name in QUANT_CASES:
-    for input_name in ("patterned", "random"):
-        for shape in SHAPE_CASES:
-            for transpose in (False, True):
-                results.append(run_case(quant_name, input_name, transpose, *shape))
+for case in SHAPE_CASES:
+    results.append(run_case(*case))
 
 print()
-print("quantized matmul test report")
+print("inference-shaped quantized matmul report")
 for result in results:
     B, M, K, N = result["shape"]
+    custom_ms = result["custom_ms"] / result["reps"]
+    torch_ms = result["torch_highest_ms"] / result["reps"]
     print(
-        f"- quant={result['quant']} input={result['input']} transpose_b_before_mma={result['transpose']} "
-        f"B={B} M={M} K={K} N={N} "
+        f"- {result['name']} quant={result['quant']} B={B} M={M} K={K} N={N} reps={result['reps']} "
         f"max_diff={result['max_diff']:.8g} mean_diff={result['mean_diff']:.8g} "
-        f"max_diff_vs_fp16_b_ref={result.get('max_diff_vs_fp16_b_ref', float('nan')):.8g} "
-        f"mean_diff_vs_fp16_b_ref={result.get('mean_diff_vs_fp16_b_ref', float('nan')):.8g} "
         f"expected_abs_max={result['expected_abs_max']:.8g} real_abs_max={result['real_abs_max']:.8g} "
         f"expected_std={result['expected_std']:.8g} real_std={result['real_std']:.8g} "
-        f"custom={result['custom_seconds']:.6f}s torch_medium={result['torch_medium_seconds']:.6f}s"
+        f"custom_cuda_event={custom_ms:.4f}ms "
+        f"torch_highest_cuda_event={torch_ms:.4f}ms "
+        f"custom/torch={custom_ms / torch_ms:.2f}x"
     )
 
 failed = [result for result in results if result["max_diff"] != 0.0]
 if failed:
     worst = max(failed, key=lambda result: result["max_diff"])
     B, M, K, N = worst["shape"]
-    diff = worst["diff"]
     print()
     print(
-        f"plotting worst case quant={worst['quant']} input={worst['input']} "
+        f"worst diff case={worst['name']} quant={worst['quant']} "
         f"B={B} M={M} K={K} N={N} max_diff={worst['max_diff']:.8g}"
     )
-
-    flat_diff = diff.reshape((B * M, N))
-    plot_heatmap(
-        flat_diff,
-        title=f"{worst['quant']} {worst['input']} matmul abs diff",
-        xlabel="N",
-        ylabel="B*M",
-        cmap="viridis",
-    )
-
-    plot_heatmap(
-        diff.max(-1).values,
-        title=f"{worst['quant']} {worst['input']} max abs diff by batch/M row",
-        xlabel="M",
-        ylabel="B",
-        yticklabels=[str(i) for i in range(B)],
-        cmap="viridis",
-    )
-
-    n_group = 32
-    if N % n_group == 0:
-        n_group_diff = diff.reshape((B, M, N // n_group, n_group)).max(-1).values
-        plot_heatmap(
-            n_group_diff.reshape((B * M, N // n_group)),
-            title=f"{worst['quant']} {worst['input']} max abs diff by {n_group}-wide N group",
-            xlabel=f"N groups x{n_group}",
-            ylabel="B*M",
-            cmap="viridis",
-        )
 else:
-    print("all matmul cases had zero diff; no heatmaps generated")
+    print("all matmul cases had zero diff")
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Phase-skip benchmark: with ~3/4 of the batch slots "unallocated" (phase 0, skipped by the kernel), how does the
-# in-kernel per-slot skip compare to (a) the full matmul over all slots and (b) compacting the active rows into a fresh
-# contiguous tensor and doing a dense matmul on just those? Measured for both my kernel and torch.
-#
-# dim0 (B) is the batch/slot dim that the phase buffer indexes. The compacted variants are timed on a *pre-gathered*
-# tensor (so each timed loop is single-stream: g4b kernels never read a tensor torch is still writing) and the gather
-# cost is measured separately, so "compact total ~= gather + compact matmul".
-# ---------------------------------------------------------------------------------------------------------------------
-
-PHASE_SKIP_FRAC_UNALLOCATED = 0.75
-PHASE_SKIP_QUANT = "q4_k"
-PHASE_SKIP_SHAPE_CASES = [
-    # B (slots), M (tokens/slot), K, N. N a multiple of the superblock width.
-    (64, 1, 2048, 8192),  # decode-like: one token per slot
-    (64, 16, 2048, 8192),  # small-prefill-like: a few tokens per slot
-    (64, 512, 2048, 8192),  # big-prefill-like: many tokens per slot
-]
-PHASE_SKIP_REPS = 100
-
-
-def _bench_g4b(fn, reps=PHASE_SKIP_REPS):
-    for _ in range(5):
-        fn()
-    cuda_sync()
-    start = time.time()
-    for _ in range(reps):
-        fn()
-    cuda_sync()
-    return (time.time() - start) / reps * 1e3  # ms/iter
-
-
-def _bench_torch(fn, reps=PHASE_SKIP_REPS):
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(reps):
-        fn()
-    torch.cuda.synchronize()
-    return (time.time() - start) / reps * 1e3  # ms/iter
-
-
-def run_phase_skip_case(quant_name: str, B: int, M: int, K: int, N: int, transpose: bool = True):
-    quant = QUANT_CASES[quant_name]
-    torch.manual_seed(0)
-    a = torch.randn((B, M, K), dtype=torch.float32, device="cuda") / K**0.5
-    c = torch.empty((B, M, N), dtype=a.dtype, device="cuda")
-
-    b_shape = (N, K) if transpose else (K, N)
-    gguf_tensor = quant["random"](*b_shape)
-    b = Tensor.from_gguf_tensor(gguf_tensor)
-    b_ref = quant["dequant"](gguf_tensor).reshape(b_shape).to("cuda").to(a.dtype)
-    b_ref = b_ref.T if transpose else b_ref
-
-    # random per-slot phase: ~PHASE_SKIP_FRAC_UNALLOCATED of slots are unallocated (0), the rest are active (prefill).
-    active_mask = torch.rand((B,), device="cuda") >= PHASE_SKIP_FRAC_UNALLOCATED
-    active_mask[0] = True  # guarantee at least one active slot
-    user_phase = torch.where(active_mask, PHASE_PREFILL, 0).to(torch.uint8)
-    active_idx = active_mask.nonzero(as_tuple=True)[0].to(torch.int32)
-    n_active = int(active_idx.numel())
-
-    # pre-gathered compact activation (gather cost measured separately, below).
-    a_compact = a.index_select(0, active_idx.long()).contiguous()
-    c_compact = torch.empty((n_active, M, N), dtype=a.dtype, device="cuda")
-
-    # "rows" variants: fold the batch (and token) dim into the row/M axis so the kernel reuses the dequantized
-    # weight across all slots' rows (one [1, rows, K] @ [K, N] matmul, like cuBLAS) instead of re-streaming +
-    # re-dequantizing the weight once per batch slot. reshape is a free view (both inputs are contiguous).
-    a_rows = a.reshape(1, B * M, K)
-    c_rows = torch.empty((1, B * M, N), dtype=a.dtype, device="cuda")
-    a_compact_rows = a_compact.reshape(1, n_active * M, K)
-    c_compact_rows = torch.empty((1, n_active * M, N), dtype=a.dtype, device="cuda")
-
-    torch.set_float32_matmul_precision("medium")
-
-    mine_full = lambda: matmul_a3d_b2d(c, None, a, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
-    mine_phase = lambda: matmul_a3d_b2d(
-        c, None, a, b, transpose_b_before_mma=transpose, user_phase=user_phase, phase=PHASE_PREFILL, rmsnorm_eps=0.0
-    )
-    mine_compact = lambda: matmul_a3d_b2d(
-        c_compact, None, a_compact, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0
-    )
-    mine_rows_full = lambda: matmul_a3d_b2d(c_rows, None, a_rows, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0)
-    mine_rows_compact = lambda: matmul_a3d_b2d(
-        c_compact_rows, None, a_compact_rows, b, transpose_b_before_mma=transpose, rmsnorm_eps=0.0
-    )
-    torch_full = lambda: a @ b_ref
-    torch_compact = lambda: a_compact @ b_ref
-    gather = lambda: a.index_select(0, active_idx.long()).contiguous()
-
-    ms = {
-        "mine_full": _bench_g4b(mine_full),
-        "mine_phase": _bench_g4b(mine_phase),
-        "mine_compact": _bench_g4b(mine_compact),
-        "mine_rows_full": _bench_g4b(mine_rows_full),
-        "mine_rows_compact": _bench_g4b(mine_rows_compact),
-        "torch_full": _bench_torch(torch_full),
-        "torch_compact": _bench_torch(torch_compact),
-        "gather": _bench_torch(gather),
-    }
-    return {"quant": quant_name, "shape": (B, M, K, N), "n_active": n_active, "ms": ms}
-
-
-# warmup
-for shape in PHASE_SKIP_SHAPE_CASES:
-    run_phase_skip_case(PHASE_SKIP_QUANT, *shape)
-
-print()
-print(f"phase-skip benchmark (target {PHASE_SKIP_FRAC_UNALLOCATED:.0%} of slots unallocated, quant={PHASE_SKIP_QUANT})")
-for shape in PHASE_SKIP_SHAPE_CASES:
-    r = run_phase_skip_case(PHASE_SKIP_QUANT, *shape)
-    B, M, K, N = r["shape"]
-    ms = r["ms"]
-    print(
-        f"- B={B} M={M} K={K} N={N} active={r['n_active']}/{B}\n"
-        f"    mine:  full={ms['mine_full']:.4f}ms  phase_skip={ms['mine_phase']:.4f}ms  "
-        f"compact={ms['mine_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['mine_compact']+ms['gather']:.4f}ms)\n"
-        f"    mine rows (B folded into M, weight read once): full={ms['mine_rows_full']:.4f}ms  "
-        f"compact={ms['mine_rows_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['mine_rows_compact']+ms['gather']:.4f}ms)\n"
-        f"    torch: full={ms['torch_full']:.4f}ms  "
-        f"compact={ms['torch_compact']:.4f}ms (+gather={ms['gather']:.4f} = {ms['torch_compact']+ms['gather']:.4f}ms)\n"
-        f"    speedups vs mine_full: phase_skip={ms['mine_full']/ms['mine_phase']:.2f}x  "
-        f"compact+gather={ms['mine_full']/(ms['mine_compact']+ms['gather']):.2f}x  "
-        f"rows_full={ms['mine_full']/ms['mine_rows_full']:.2f}x"
-    )
 
 g4b.device.teardown()
