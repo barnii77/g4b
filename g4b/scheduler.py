@@ -32,7 +32,7 @@ class Request:
 
 
 class Scheduler:
-    _STATS_INTERVAL = 128
+    _STATS_INTERVAL = 1
 
     def __init__(self, model: "g4b.models.Model"):
         self._model = model
@@ -199,7 +199,8 @@ class Scheduler:
         self._window_decode_tokens = 0
         self._last_log_time = now
         active = sum(1 for rq in self._active if rq is not None and not rq._done)
-        context_len = max(rq._context_len for rq in self._active if rq is not None)
+        active_reqs = [rq._context_len for rq in self._active if rq is not None]
+        context_len = max(active_reqs) if active_reqs else -1
         print(
             f"stats tokens={self._total_prefill_tokens + self._total_decode_tokens} "
             f"tps_prefill={prefill_tps:.2f} tps_decode={decode_tps:.2f} "
