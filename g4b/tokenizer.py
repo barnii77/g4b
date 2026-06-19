@@ -9,6 +9,7 @@ class Tokenizer:
         self.bos: int = meta["tokenizer.ggml.bos_token_id"]
         tokens: list[str] = meta["tokenizer.ggml.tokens"]
         self._str_to_tok: dict[str, int] = {tok: i for i, tok in enumerate(tokens)}
+        self.end_of_turn = self._str_to_tok["<turn|>"]
         self._tok_to_str = tokens
         self._byte_toks = set(self._str_to_tok[Tokenizer._byte_token(b)] for b in range(256))
         self._special_toks = tuple(
@@ -119,14 +120,14 @@ class ChatTemplate:
         out = []
         for frag in chat_fragments:
             if isinstance(frag, PromptFragment):
-                out.append(f"<start_of_turn>user\n{frag.content}<end_of_turn>\n")
+                out.append(f"<|turn>user\n{frag.content}<turn|>\n")
             elif isinstance(frag, ToolOutput):
-                out.append(f"<start_of_turn>tool\n{frag.content}<end_of_turn>\n")
+                out.append(f"<|turn>tool\n{frag.content}<turn|>\n")
             elif isinstance(frag, ResponseFragment):
-                out.append(f"<start_of_turn>model\n{frag.content}<end_of_turn>\n")
+                out.append(f"<|turn>model\n{frag.content}<turn|>\n")
             elif isinstance(frag, ToolCall):
-                out.append(f"<start_of_turn>model\n{frag.call}<end_of_turn>\n")
-        out.append("<start_of_turn>model\n")
+                out.append(f"<|turn>model\n{frag.call}<turn|>\n")
+        out.append("<|turn>model\n")
         return "".join(out)
 
 

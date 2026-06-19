@@ -223,7 +223,7 @@ class _UserChatManager:
         toks = self.token_buf
         self.token_buf = []
 
-        if _tokenizer.eos in toks:
+        if _tokenizer.eos in toks or _tokenizer.end_of_turn in toks:
             toks = toks[: toks.index(_tokenizer.eos)]
 
         text = _tokenizer.detokenize(toks)  # TODO technically this may be incorrect unless I buffer a few tokens
