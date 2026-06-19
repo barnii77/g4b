@@ -236,8 +236,6 @@ class Gemma4E(Model):
         self._copy_i32(self.sample_positions_B_int32, sample_positions)
         self._copy_i32(self.cache_offsets_B_int32, cache_offsets)
         self._copy_i32(self.time_dim_sizes_B_int32, time_sizes_after)
-        # TODO scheduler rewrite: set per-slot (unallocated slots -> PHASE_UNALLOCATED) instead of a uniform
-        #  vector, and drive transitions via transition_slot() or something.
         self._copy_u8(self.user_phase_B_uint8, [PHASE_PREFILL] * self.batch_size)
 
     def prepare_decode_inputs(
