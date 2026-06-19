@@ -335,11 +335,13 @@ def _matmul_a3d_b2d_kernel(
         b2_ptr = tl.multiple_of(b2_ptr, 16)
     c_ptr = tl.multiple_of(c_ptr, 16)
 
-    if b2_ptr is not None or RSOS_HEAD_DIM > 0 or KEEP_C:
+    if b2_ptr is not None or RSOS_HEAD_DIM > 0 or KEEP_C or storer_extra_ptr is not None:
         # disables k splits (it will also disable it in the grid, forcing only 1 k split program id 2).
         # RSOS_HEAD_DIM>0 (per-head fused rsos) must match the wrapper's k_split_allowed=False: a partial-K
         # program can't compute a correct sum-of-squares of the full output row. KEEP_C seeds the accumulator
         # from c, which split-K's atomic-add would re-add once per split, so it also forces a single split.
+        # storer_extra drives a NONLINEAR epilogue (gelu(tile)*extra); summing gelu over partial-K tiles is
+        # wrong, so it forces a single split too.
         NUM_K_SPLITS = 1
 
     k_split_step = tl.cdiv(a_shape2, NUM_K_SPLITS)
@@ -1014,7 +1016,7 @@ def matmul_a3d_b2d(
     # per-head segmented output rsos (q/k/v) accumulates across N-tiles via atomic_add and isn't sound across
     # K-splits, so disable split-K when it's active (matches forward.txt note). KEEP_C seeds the accumulator
     # from c and is likewise incompatible with split-K's atomic-add (kernel forces NUM_K_SPLITS=1 to match).
-    k_split_allowed = b2 is None and rsos_head_dim == 0 and not keep_c
+    k_split_allowed = b2 is None and rsos_head_dim == 0 and not keep_c and storer_extra is None
     selected_num_k_splits = 1
 
     if isinstance(accum_dtype, DType):

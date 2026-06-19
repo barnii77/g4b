@@ -34,6 +34,9 @@ DTMM_ACCUM_NORMAL = float32  # if os.environ.get("G4B_DTACCUM_FP32") else float1
 DTFA_ACCUM_NORMAL = float32  # if os.environ.get("G4B_DTACCUM_FP32") else float16  # tl.dot accum dtype
 DTMM_ACCUM_SENSITIVE = float32
 DTMM = int8  # DType for MatMul tensor core ops
+# Decode (t_now==1) routes the projections through the no-tl.dot scalar matvec path. Set G4B_NO_MATVEC=1
+# to fall back to the tl.dot path for the whole decode (A/B isolation of the matvec path).
+_USE_MATVEC = not os.environ.get("G4B_NO_MATVEC")
 DTSS = float32  # DType for Sum-of-Squares accumulation for rmsnorm
 DTPLE = float32  # DType for computations in the per-layer-embeddings low-rank space
 DTSAMP = float32
@@ -410,7 +413,7 @@ class Gemma4E(Model):
             self.lm_head.input_B1D_dtr,
             self.embeddings.embeddings_VD_q5,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             input_rmsnorm_sum_of_squares=self.lm_head.input_rsos_B1_dtss,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
             user_phase=self.user_phase_B_uint8,
@@ -468,7 +471,7 @@ class Gemma4E(Model):
             residual,
             ple_proj_w,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
             user_phase=self.user_phase_B_uint8,
             phase=phase_id,
@@ -519,7 +522,7 @@ class Gemma4E(Model):
             attn.q_proj_hkD_q4,
             storer_fn=kernels.matmul_epilogue.qkv_input_rmsnorm_per_head_rsos_storer_jfn,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_qk,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
@@ -534,7 +537,7 @@ class Gemma4E(Model):
             attn.k_proj_gkD_q6,
             storer_fn=kernels.matmul_epilogue.qkv_input_rmsnorm_per_head_rsos_storer_jfn,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_qk,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
@@ -549,7 +552,7 @@ class Gemma4E(Model):
             attn.v_proj_gvD_q6,
             storer_fn=kernels.matmul_epilogue.qkv_input_rmsnorm_per_head_rsos_storer_jfn,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             input_rmsnorm_sum_of_squares=act_rsos,
             rsos_head_dim=attn.head_size_v,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
@@ -614,7 +617,7 @@ class Gemma4E(Model):
             o_flat,
             attn.o_proj_Dhv_q4,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             user_phase=self.user_phase_B_uint8,
             phase=phase_id,
@@ -633,7 +636,7 @@ class Gemma4E(Model):
             mlp.gate_proj_UD_q4,
             c_c2_merge_tiles_fn=kernels.matmul_epilogue.geglu_fusion_matmul_merge_tiles_mixin_jfn,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             input_rmsnorm_sum_of_squares=act_rsos,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             user_phase=self.user_phase_B_uint8,
@@ -646,7 +649,7 @@ class Gemma4E(Model):
             h,
             mlp.down_proj_DU_q6,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             accum_dtype=DTMM_ACCUM_NORMAL.tl_dtype,
             user_phase=self.user_phase_B_uint8,
             phase=phase_id,
@@ -675,7 +678,7 @@ class Gemma4E(Model):
             storer_extra=ple_vals,
             storer_fn=kernels.matmul_epilogue.ple_gate_storer_jfn,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
             user_phase=self.user_phase_B_uint8,
             phase=phase_id,
@@ -687,7 +690,7 @@ class Gemma4E(Model):
             h,
             ple.out_proj_DP_fp32,
             transpose_b_before_mma=True,
-            use_matvec=t_now == 1,
+            use_matvec=(t_now == 1) and _USE_MATVEC,
             accum_dtype=DTMM_ACCUM_SENSITIVE.tl_dtype,
             user_phase=self.user_phase_B_uint8,
             phase=phase_id,

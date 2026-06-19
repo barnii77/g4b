@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import g4b.device
 from g4b.gguf import GGUFType, GGUFTensor
 from g4b.kernels.matmul import matmul_a3d_b2d
+from g4b.kernels.matmul_epilogue import geglu_fusion_matmul_merge_tiles_mixin_jfn, ple_gate_storer_jfn
 from g4b.tensor import Tensor
 from scripts.reference_impl import dequant_q4k_to_fp32, dequant_q5k_to_fp32, dequant_q6k_to_fp32
 
@@ -93,6 +94,64 @@ def run_case(name, quant, K, N, *, keep_c=False, tol=2e-2):
     assert ok, f"{name}: max_diff {max_diff} exceeds tol {tol} * {scale}"
 
 
+def run_fused(name, *, fn, tol=5e-3):
+    # Compare the matvec path against the (known-good) tl.dot path for a fused epilogue. Catches the
+    # split-K vs nonlinear-epilogue hazard: gelu(partial_K) summed over splits != gelu(full).
+    out_dot = fn(use_matvec=False).float()
+    out_mv = fn(use_matvec=True).float()
+    md = (out_dot - out_mv).abs().max().item()
+    scale = out_dot.abs().max().item() + 1e-6
+    ok = md <= tol * scale
+    print(f"[{'PASS' if ok else 'FAIL'}] {name:<28} dot_vs_matvec max_diff={md:.5g} rel={md / scale:.2e}")
+    assert ok, f"{name}: matvec vs dot max_diff {md} exceeds tol {tol} * {scale}"
+
+
+def _geglu(use_matvec, *, with_input_rsos):
+    torch.manual_seed(1)
+    D, U = 512, 512
+    X = torch.randn(1, 1, D, dtype=torch.float16, device="cuda")
+    rsos = (X.float() ** 2).sum(-1).to(torch.float32) if with_input_rsos else None
+    Wup = torch.randn(D, U, dtype=torch.float16, device="cuda") * D**-0.5
+    Wg = torch.randn(D, U, dtype=torch.float16, device="cuda") * D**-0.5
+    H = torch.empty(1, 1, U, dtype=torch.float32, device="cuda")
+    matmul_a3d_b2d(
+        H,
+        None,
+        X,
+        Wup,
+        Wg,
+        c_c2_merge_tiles_fn=geglu_fusion_matmul_merge_tiles_mixin_jfn,
+        input_rmsnorm_sum_of_squares=rsos,
+        use_matvec=use_matvec,
+        rmsnorm_eps=1e-6,
+    )
+    g4b.device.stream.sync()
+    torch.cuda.synchronize()
+    return H
+
+
+def _ple_gate(use_matvec):
+    torch.manual_seed(2)
+    D, P = 512, 256
+    X = torch.randn(1, 1, D, dtype=torch.float16, device="cuda")
+    Wpg = torch.randn(D, P, dtype=torch.float16, device="cuda") * D**-0.5
+    PLE = torch.randn(1, 1, P, dtype=torch.float16, device="cuda")
+    H = torch.empty(1, 1, P, dtype=torch.float32, device="cuda")
+    matmul_a3d_b2d(
+        H,
+        None,
+        X,
+        Wpg,
+        storer_extra=PLE,
+        storer_fn=ple_gate_storer_jfn,
+        use_matvec=use_matvec,
+        rmsnorm_eps=1e-6,
+    )
+    g4b.device.stream.sync()
+    torch.cuda.synchronize()
+    return H
+
+
 def main():
     # The default use_matvec config (G4B_SKIP_TUNING) is a split-K matvec (split_k=4), so these exercise the
     # split-K atomic-add + pre-hook zeroing path across quant types.
@@ -103,6 +162,10 @@ def main():
     run_case("q6 ragged-N", "q6_k", 512, 200)
     # KEEP_C accumulate path (the masked _c_ptrs load); KEEP_C forces NUM_K_SPLITS=1 internally.
     run_case("q6 keep_c", "q6_k", 512, 256, keep_c=True)
+    # Fused epilogues vs the dot path (nonlinear gelu must not be split across K).
+    run_fused("geglu", fn=lambda use_matvec: _geglu(use_matvec, with_input_rsos=False))
+    run_fused("geglu+input_rsos", fn=lambda use_matvec: _geglu(use_matvec, with_input_rsos=True))
+    run_fused("ple_gate (storer_extra)", fn=_ple_gate)
     print("all matvec tests passed")
     g4b.device.teardown()
 
