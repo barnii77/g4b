@@ -91,11 +91,11 @@ def _matmul_3d_autotune_configs():
             # K=64 avoids the q4/q5 K-quant loader's <=32-column path, which loads extra packed data and discards half.
             # Keep the first config decode-friendly, then let G4B_SKIP_TUNING=1 still choose among a tiny shape-aware
             # set so prefill-sized tests don't get stuck on the skinny decode tile.
-            # Hack: for single-token skinny-N q6 decode, N=16 doubles the CTA count for K/V (1024 / 16 = 64 CTAs)
-            # and 1 warp follows NCU's occupancy/block-size hint. The pruner keeps this q6-only because K=32 is
-            # intentionally bad for q4/q5.
+            # Single-token decode wants many skinny CTAs. K=64/N=16 with 4 warps was the best stable quick sweep
+            # for q6 K/V and also beat the old 2-warp skinny tile for q4/q5 decode-shaped checks.
+            _cfg(1, 1, 64, 16, 1, warps=4, stages=3),
+            # q6-only fallback: K=32 keeps the unpack simple but was slower in the decode K/V sweep.
             _cfg(1, 1, 32, 16, 1, warps=1, stages=3),
-            _cfg(1, 1, 64, 16, 1, warps=2, stages=3),
             _cfg(1, 32, 64, 32, 8, warps=4, stages=3),
             _cfg(1, 1, 64, 64, 1, warps=4, stages=3),
             _cfg(1, 1, 64, 128, 1, warps=4, stages=3),
@@ -492,7 +492,11 @@ def matmul_a3d_b2d_a_loader_jfn(
     conceptual_dtype: tl.constexpr,
     # fmt: on
 ):
-    return desc.load((off0, off1, off2))
+    offs0 = off0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
+    offs1 = off1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
+    offs2 = off2 + tl.arange(0, BLOCKSIZE2)[None, None, :]
+    mask = (offs0 < shape0) & (offs1 < shape1) & (offs2 < shape2)
+    return tl.load(ptr + offs0 * stride0 + offs1 * stride1 + offs2 * stride2, mask=mask, other=0.0)
 
 
 @triton.jit

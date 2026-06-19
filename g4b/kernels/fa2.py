@@ -83,7 +83,7 @@ def _attn_inner(
             other=0.0,
         )
         if USE_FP32_DOT:
-            qk = tl.dot(q.to(tl.float32), k.to(tl.float32).T, input_precision="tf32x3")
+            qk = tl.dot(q.to(tl.float32), k.to(tl.float32).T)
         else:
             qk = tl.dot(q.to(tl.float16), k.to(tl.float16).T)
         qk *= 1.44269504  # 1 / log(2), because this kernel uses exp2.
@@ -124,7 +124,7 @@ def _attn_inner(
             other=0.0,
         )
         if USE_FP32_DOT:
-            acc = tl.dot(p.to(tl.float32), v.to(tl.float32), acc, input_precision="tf32x3")
+            acc = tl.dot(p.to(tl.float32), v.to(tl.float32), acc)
         else:
             acc = tl.dot(p.to(tl.float16), v.to(tl.float16), acc)
 
