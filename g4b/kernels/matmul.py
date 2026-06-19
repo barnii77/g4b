@@ -18,6 +18,9 @@ from g4b.utils import contiguous_strides_for_shape
 #  then apply Q4_K scales/mins and Q8_1 scales/sums in FP32
 #  ... sadly, I think for now I don't have the time to get this right, let's hope mem bandwidth bottlenecks enough for
 #  bf16 mma to do the trick during decode.
+# TODO llama.cpp and co actually do matvec without tensor cores. I incorrectly assumed that triton would skip
+#  tensor cores for tl.dot with one input being a vector. This assumption came back to epically bite me in my ass later.
+#  I must integrate a use_matvec param into the matmul kernel which skips tl.dot and uses a broadcast+sum expression.
 
 
 def _contiguous_ignoring_unit_dims(shape, strides):
