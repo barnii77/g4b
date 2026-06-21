@@ -43,7 +43,7 @@ def canonicalize_shape_for_size(shape: Sequence[int], size: int) -> list[int]:
         return list(shape)
     dim_idx = shape.index(-1)
     dim_size = to_int_exact(size / -math.prod(shape))
-    return [*shape[:dim_idx], dim_size, *shape[dim_idx + 1:]]
+    return [*shape[:dim_idx], dim_size, *shape[dim_idx + 1 :]]
 
 
 def to_int_exact(x: int | float) -> int:
@@ -68,24 +68,16 @@ def gguf_tensors_by_name(tensors: list[GGUFTensor]) -> dict[str, GGUFTensor]:
 
 
 def create_file_logger(path: str | Path, level: int = logging.INFO) -> logging.Logger:
-    path = Path(path)
+    path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("g4b")
     logger.setLevel(level)
 
     # Avoid duplicate handlers
-    if not any(
-            isinstance(h, logging.FileHandler)
-            and Path(h.baseFilename) == path.resolve()
-            for h in logger.handlers
-    ):
+    if not any(isinstance(h, logging.FileHandler) and Path(h.baseFilename) == path.resolve() for h in logger.handlers):
         handler = logging.FileHandler(path, encoding="utf-8")
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s [%(threadName)s] %(levelname)s: %(message)s"
-            )
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(threadName)s] %(levelname)s: %(message)s"))
         logger.addHandler(handler)
 
     return logger
