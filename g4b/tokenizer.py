@@ -1,6 +1,7 @@
 import re
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from g4b import lifecycle
 from g4b.config import Config
 from g4b.gguf import GGUFMeta
@@ -134,7 +135,7 @@ class ChatTemplate:
     def apply(self, chat_fragments: list[ChatFragment]) -> str:
         # Gemma chat templates use these literal control strings; the tokenizer
         # BPE pass merges them to the corresponding control tokens.
-        chat_fragments = chat_fragments  # TODO normalize
+        chat_fragments = _normalize_chat_fragments(chat_fragments)
         out = ["<|turn>system\n<|think|><turn|>\n"]
         for frag in chat_fragments:
             if isinstance(frag, PromptFragment):
@@ -152,34 +153,41 @@ class ChatTemplate:
         return inp
 
 
+@dataclass(frozen=True)
 class PromptFragment:
-    def __init__(self, content: str):
-        self.content = content
+    content: str
 
 
+@dataclass(frozen=True)
 class ToolOutput:
-    def __init__(self, content: str):
-        self.content = content
+    content: str
 
 
+@dataclass(frozen=True)
 class ResponseFragment:
-    def __init__(self, content: str):
-        self.content = content
+    content: str
 
 
 # TODO possibly this should store some predefined attributes that are definitely required like a name?
+@dataclass(frozen=True)
 class ToolCall:
-    def __init__(self, call: dict):
-        self.call = call
+    call: str
 
 
 def _normalize_chat_fragments(frags: list[ChatFragment]) -> list[ChatFragment]:
+    if not frags:
+        return []
+
+    frags = frags.copy()  # must not mutate the original list
+
     out = [frags.pop(0)]
     while frags:
-        frag = frags.pop()
+        frag = frags.pop(0)
         last_frag = out[-1]
-        if isinstance(last_frag, PromptFragment) and isinstance(frag, PromptFragment):
+        if isinstance(last_frag, PromptFragment) and isinstance(frag, PromptFragment):  # adjacent user prompts
             out[-1] = PromptFragment(last_frag.content + frag.content)
-        elif isinstance(last_frag, ResponseFragment) and isinstance(frag, ResponseFragment):
+        elif isinstance(last_frag, ResponseFragment) and isinstance(frag, ResponseFragment):  # adjacent response chunks
             out[-1] = ResponseFragment(last_frag.content + frag.content)
+        else:
+            out.append(frag)
     return out
