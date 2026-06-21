@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>g4b chat</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: #0f1115; color: #e6e6e6;
+  }
+  header {
+    padding: 12px 16px; border-bottom: 1px solid #23262e;
+    display: flex; align-items: center; gap: 10px; font-weight: 600;
+  }
+  #status { width: 9px; height: 9px; border-radius: 50%; background: #888; }
+  #status.on { background: #3fb950; }
+  #status.off { background: #f85149; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 75%; padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.45; }
+  .user { align-self: flex-end; background: #2f6feb; color: #fff; border-bottom-right-radius: 4px; }
+  .assistant { align-self: flex-start; background: #1c1f27; border: 1px solid #23262e; border-bottom-left-radius: 4px; }
+  .assistant.pending::after { content: "▌"; opacity: .6; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #23262e; }
+  #input {
+    flex: 1; resize: none; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid #2a2e38; background: #15171d; color: #e6e6e6; font: inherit; max-height: 160px;
+  }
+  button {
+    border: none; border-radius: 10px; padding: 0 18px; font: inherit; font-weight: 600;
+    background: #2f6feb; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #abort { background: #444b58; }
+  .tps { margin-left: auto; font-weight: 400; font-size: 12px; color: #8b949e; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <header><span id="status"></span> g4b chat <span id="tps" class="tps"></span></header>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="input" rows="1" placeholder="Message…" autocomplete="off"></textarea>
+    <button id="send" type="submit">Send</button>
+    <button id="abort" type="button" disabled>Stop</button>
+  </form>
+<script>
+const log = document.getElementById("log");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const abortBtn = document.getElementById("abort");
+const statusDot = document.getElementById("status");
+const tpsLabel = document.getElementById("tps");
+
+let ws, ready = false, busy = false, current = null;
+
+// ---- TPS-paced streaming -------------------------------------------------
+// The server delivers text in bursts. We split each burst into token-ish
+// pieces, continuously estimate how fast they arrive (tokens/sec), and reveal
+// them on an even cadence matching that estimate, so the UI "types" at the
+// model's pace instead of lurching with each burst.
+//
+// NOTE: the wire protocol carries text, not token boundaries, so we approximate
+// a token as a word plus its leading whitespace. The displayed tok/s is thus an
+// approximation of the model's true token rate.
+let queue = [];          // token pieces awaiting display
+let finished = false;    // server sent assistant.response.done
+let raf = null;
+let tps = 0;             // smoothed tokens/sec estimate
+let budget = 0;          // fractional tokens we're allowed to release this frame
+let lastFrame = 0;       // timestamp of previous animation frame
+let streamStart = 0, lastArrival = 0, tokensSeen = 0;
+
+const INITIAL_TPS = 15;  // assumed rate until we have a real measurement
+const MAX_LAG_S = 1.5;   // never let the display fall more than this behind live
+
+function tokenize(text) {
+  return text.match(/\s*\S+|\s+/g) || [];
+}
+
+function resetStream() {
+  queue = [];
+  finished = false;
+  tps = 0; budget = 0; lastFrame = 0;
+  tokensSeen = 0; streamStart = 0; lastArrival = 0;
+  updateTpsLabel();
+}
+
+function updateTpsLabel() {
+  tpsLabel.textContent = tps > 0 ? tps.toFixed(1) + " tok/s" : "";
+}
+
+function onTokensArrived(pieces) {
+  const now = performance.now();
+  if (tokensSeen === 0) { streamStart = now; lastArrival = now; }
+  tokensSeen += pieces.length;
+
+  // Blend the instantaneous burst rate with the running average so the estimate
+  // reacts quickly but settles over the response.
+  const dt = (now - lastArrival) / 1000;
+  if (dt > 0) {
+    const inst = pieces.length / dt;
+    tps = tps === 0 ? inst : 0.6 * tps + 0.4 * inst;
+  }
+  const elapsed = (now - streamStart) / 1000;
+  if (elapsed > 0) tps = 0.5 * tps + 0.5 * (tokensSeen / elapsed);
+
+  lastArrival = now;
+  updateTpsLabel();
+}
+
+function pump(ts) {
+  raf = null;
+  if (!lastFrame) lastFrame = ts;
+  const dt = (ts - lastFrame) / 1000;
+  lastFrame = ts;
+
+  // Accrue a release budget at the estimated rate. If the model outpaces us and
+  // a backlog builds, speed up just enough to stay within MAX_LAG_S of live.
+  let rate = tps > 0 ? tps : INITIAL_TPS;
+  rate = Math.max(rate, queue.length / MAX_LAG_S);
+  budget += rate * dt;
+
+  let out = "";
+  while (budget >= 1 && queue.length) { out += queue.shift(); budget -= 1; }
+  if (out && current) {
+    current.textContent += out;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  if (queue.length) {
+    raf = requestAnimationFrame(pump);
+  } else if (finished) {
+    finalize();
+  } else {
+    budget = 0; lastFrame = 0;  // caught up; idle until the next burst
+  }
+}
+
+function schedulePump() {
+  if (raf === null) { lastFrame = 0; raf = requestAnimationFrame(pump); }
+}
+
+function finalize() {
+  if (current) current.classList.remove("pending");
+  current = null;
+  queue = [];
+  finished = false;
+  budget = 0; lastFrame = 0;
+  tps = 0;
+  updateTpsLabel();
+  setBusy(false);
+}
+
+function flushNow() {
+  if (raf !== null) { cancelAnimationFrame(raf); raf = null; }
+  if (current && queue.length) current.textContent += queue.join("");
+  finalize();
+}
+
+// Mirrors the server's _add_obfuscation: append a crypto-random base64 blob
+// whose byte length is a uniform sample from [L/2, 3L/2], L being the length
+// of the payload (compact JSON) before obfuscation.
+function obfuscated(payload) {
+  const l = JSON.stringify(payload).length;
+  const n = Math.round(l / 2 + Math.random() * l);
+  const bytes = new Uint8Array(Math.max(n, 0));
+  crypto.getRandomValues(bytes);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return { ...payload, obfuscation: btoa(bin) };
+}
+
+function setBusy(b) {
+  busy = b;
+  sendBtn.disabled = b || !ready;
+  abortBtn.disabled = !b;
+}
+
+function addMsg(role, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.textContent = text || "";
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(proto + "://" + location.host + "/api/v1/chat");
+  ws.onopen = () => {
+    statusDot.className = "on";
+    ws.send(JSON.stringify({ type: "user.init", chat: [] }));
+    ready = true;
+    setBusy(false);
+  };
+  ws.onclose = () => {
+    statusDot.className = "off";
+    ready = false; setBusy(false);
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (e) => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    switch (m.type) {
+      case "assistant.response.chunk": {
+        if (!current) { current = addMsg("assistant pending", ""); resetStream(); }
+        const pieces = tokenize(m.content);
+        if (pieces.length) {
+          queue.push(...pieces);
+          onTokensArrived(pieces);
+          schedulePump();
+        }
+        break;
+      }
+      case "assistant.response.done":
+        // Let the queue drain, then finalize.
+        finished = true;
+        schedulePump();
+        break;
+      case "error":
+        flushNow();
+        addMsg("assistant", "[error " + m.code + "] " + (m.detail || ""));
+        break;
+    }
+  };
+}
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || !ready || busy) return;
+  addMsg("user", text);
+  ws.send(JSON.stringify(obfuscated({ type: "user.prompt", content: text })));
+  input.value = "";
+  input.style.height = "auto";
+  current = null;
+  setBusy(true);
+});
+
+abortBtn.addEventListener("click", () => {
+  if (ready && busy) {
+    ws.send(JSON.stringify(obfuscated({ type: "user.abort" })));
+    flushNow();
+  }
+});
+
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+});
+
+connect();
+</script>
+</body>
+</html>
