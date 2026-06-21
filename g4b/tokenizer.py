@@ -1,7 +1,13 @@
 import re
+import os
 from abc import ABC, abstractmethod
+from g4b import lifecycle
 from g4b.config import Config
 from g4b.gguf import GGUFMeta
+from g4b.utils import create_file_logger
+
+_log_all_prompts_path = os.environ.get("G4B_LOG_ALL_PROMPTS_PATH")
+_prompts_logger = create_file_logger(_log_all_prompts_path) if _log_all_prompts_path else None
 
 
 class GenEndingTokensProvider(ABC):
@@ -128,7 +134,7 @@ class ChatTemplate:
     def apply(self, chat_fragments: list[ChatFragment]) -> str:
         # Gemma chat templates use these literal control strings; the tokenizer
         # BPE pass merges them to the corresponding control tokens.
-        chat_fragments = _normalize_chat_fragments(chat_fragments)
+        chat_fragments = chat_fragments  # TODO normalize
         out = ["<|turn>system\n<|think|><turn|>\n"]
         for frag in chat_fragments:
             if isinstance(frag, PromptFragment):
@@ -140,7 +146,10 @@ class ChatTemplate:
             elif isinstance(frag, ToolCall):
                 out.append(f"<|turn>model\n{frag.call}<turn|>\n")
         out.append("<|turn>model\n")
-        return "".join(out)
+        inp = "".join(out)
+        if _prompts_logger and lifecycle.is_deployment():
+            _prompts_logger.info(inp)
+        return inp
 
 
 class PromptFragment:

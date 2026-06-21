@@ -1,4 +1,6 @@
 import math
+import logging
+from pathlib import Path
 from cuda.bindings import runtime as cudart
 from typing import Sequence
 from g4b.gguf import GGUFTensor
@@ -63,3 +65,27 @@ def gguf_tensors_by_name(tensors: list[GGUFTensor]) -> dict[str, GGUFTensor]:
     for tensor in tensors:
         out[tensor.name] = tensor
     return out
+
+
+def create_file_logger(path: str | Path, level: int = logging.INFO) -> logging.Logger:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("g4b")
+    logger.setLevel(level)
+
+    # Avoid duplicate handlers
+    if not any(
+            isinstance(h, logging.FileHandler)
+            and Path(h.baseFilename) == path.resolve()
+            for h in logger.handlers
+    ):
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(threadName)s] %(levelname)s: %(message)s"
+            )
+        )
+        logger.addHandler(handler)
+
+    return logger

@@ -53,6 +53,10 @@ def record_static_cuda_graph(step_fn):
     return wrapper
 
 
+def is_deployment() -> bool:
+    return _phase == "deployment"
+
+
 def _forbid_triton_compile(*_, **kwargs):
     raise RuntimeError(f"Triton compilation after warmup: {kwargs['repr']}")
 
