@@ -81,3 +81,14 @@ def create_file_logger(path: str | Path, level: int = logging.INFO) -> logging.L
         logger.addHandler(handler)
 
     return logger
+
+
+def shared_prefix_length(a: list, b: list) -> int:
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return min(len(a), len(b))
+
+
+def floor_to_multiple_of(x: int, m: int) -> int:
+    return x // m * m

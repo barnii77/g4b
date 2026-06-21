@@ -3,6 +3,7 @@ import os
 import time
 from queue import SimpleQueue
 from typing import TYPE_CHECKING
+from g4b.utils import shared_prefix_length, floor_to_multiple_of
 
 if TYPE_CHECKING:
     import g4b.models
@@ -40,6 +41,7 @@ class Scheduler:
         self._tokenizer = tokenizer
         self._queue: SimpleQueue[Request] = SimpleQueue()
         self._active: list[Request | None] = [None] * model.max_batch_size()
+        self._prev_processed_tokens_by_slot = [[] for _ in range(model.max_batch_size())]
         self._phase_active: list[bool] = [False] * model.max_batch_size()
         self._last_phase: str | None = None
 
@@ -78,6 +80,7 @@ class Scheduler:
         self._queue = SimpleQueue()
         self._active = [None] * self._model.max_batch_size()
         self._phase_active = [False] * self._model.max_batch_size()
+        self._prev_processed_tokens_by_slot = [[] for _ in range(self._model.max_batch_size())]
 
     def abort(self, request: Request):
         request._done = True
@@ -88,15 +91,36 @@ class Scheduler:
     def _fill_free_slots(self):
         if any(rq is not None and self._needs_decode(rq) for rq in self._active):
             return
-        for i, rq in enumerate(self._active):
-            if rq is not None and not rq._done:
-                continue
+
+        slot_is_free = lambda rq: rq is None or rq._done
+
+        n_free_slots = sum(1 for rq in self._active if slot_is_free(rq))
+        for _ in range(n_free_slots):
             if self._queue.empty():
-                continue
-            self._active[i] = self._queue.get()
+                break
+            new_rq = self._queue.get()
+            assert new_rq._prefill_pos == 0
+
+            # schedule new request in the slot which has the longest shared prefix with the new request
+            shared_prefix_len_by_slot = [
+                shared_prefix_length(prev_tokens, new_rq.input_tokens) if slot_is_free(rq) else -1
+                for prev_tokens, rq in zip(self._prev_processed_tokens_by_slot, self._active)
+            ]
+            ideal_slot = max(range(len(shared_prefix_len_by_slot)), key=lambda i: shared_prefix_len_by_slot[i])
+            shared_prefix_len = shared_prefix_len_by_slot[ideal_slot]
+            assert shared_prefix_len >= 0
+
+            # skip prefilling fully shared chunks except the last one because it samples a token and it must resample
+            # TODO that is inefficient though... I should still share the last chunk and just retrigger sampling
+            n = max(0, floor_to_multiple_of(shared_prefix_len - 1, self._model.max_prefill_chunk_size()))
+            new_rq._prefill_pos = n
+            new_rq._context_len += n
+
+            self._active[ideal_slot] = new_rq
+            self._prev_processed_tokens_by_slot[ideal_slot] = new_rq.input_tokens.copy()
 
     def _needs_prefill(self, rq: Request) -> bool:
-        return rq._prefill_pos < len(rq.input_tokens)
+        return not rq._done and rq._prefill_pos < len(rq.input_tokens)
 
     def _needs_decode(self, rq: Request) -> bool:
         return not rq._done and not self._needs_prefill(rq)
@@ -110,7 +134,7 @@ class Scheduler:
         phase_active: list[bool] = []
         total_real = 0
         for rq in self._active:
-            if rq is None or rq._done or not self._needs_prefill(rq):
+            if rq is None or not self._needs_prefill(rq):
                 token_cols.append([0] * t)
                 cache_offsets.append(0)
                 time_sizes_after.append(0)
@@ -156,7 +180,7 @@ class Scheduler:
         needs_upload = False
         total_decode = 0
         for rq in self._active:
-            if rq is None or rq._done or self._needs_prefill(rq):
+            if rq is None or not self._needs_decode(rq):
                 token_cols.append([0] * t)
                 cache_offsets.append(0)
                 time_sizes_after.append(0)
@@ -211,7 +235,6 @@ class Scheduler:
         )
 
     def _collect_outputs(self, phase: str):
-        self._model.max_prefill_chunk_size()
         vals = self._model.collect_output_token_ids()
         for b, rq in enumerate(self._active):
             if rq is None or rq._done or not self._phase_active[b]:
@@ -220,6 +243,7 @@ class Scheduler:
                 continue
             tok = vals[b]
             rq._output_tokens.append(tok)
+            self._prev_processed_tokens_by_slot[b].append(tok)
             if tok in self._tokenizer.gen_ending_tokens():
                 rq._done = True
             self._notify(rq)
@@ -228,6 +252,7 @@ class Scheduler:
         for i, rq in enumerate(self._active):
             if rq is not None and rq._done:
                 self._active[i] = None
+                # preserve list of tokens in this slot's KV caches so it can be (partially) reused
 
     @staticmethod
     def _notify(rq: Request):

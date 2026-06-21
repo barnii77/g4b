@@ -78,7 +78,7 @@ class GuaranteePrefillFirstGenTokenDoesNotPreventDecodeWarmupGenEndingTokensProv
     tokens, then all tokens terminate it.
     """
 
-    def __init__(self, tokenizer: Tokenizer, count: int = 10):
+    def __init__(self, tokenizer: Tokenizer, count: int = 32):
         self.tokenizer = tokenizer
         self.count_left = count
 
