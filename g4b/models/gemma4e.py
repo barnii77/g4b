@@ -214,16 +214,12 @@ class Gemma4E(Model):
     output_copy_ring_idx: list[int]
     batch_size: int
     prefill_chunk_size: int
-    eos_token_id: int
 
     def max_batch_size(self) -> int:
         return self.batch_size
 
     def max_prefill_chunk_size(self) -> int:
         return self.prefill_chunk_size
-
-    def stop_token_id(self) -> int:
-        return self.eos_token_id
 
     def prepare_prefill_inputs(
         self,
@@ -998,7 +994,6 @@ class Gemma4E(Model):
             output_copy_ring_idx=[0],
             batch_size=B,
             prefill_chunk_size=t,
-            eos_token_id=meta["tokenizer.ggml.eos_token_id"],
         )
         device.sync_all_streams()
         return model

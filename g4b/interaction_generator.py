@@ -1,6 +1,5 @@
 from g4b.scheduler import Request, Scheduler
-from g4b.tokenizer import Tokenizer, ChatTemplate, PromptFragment
-
+from g4b.tokenizer import Tokenizer, ChatTemplate, PromptFragment, GenEndingTokensProvider
 
 PROMPTS = (
     "Hello. Give a short answer.",
@@ -39,7 +38,7 @@ def submit_generated_interactions(
         toks = tokenizer.tokenize(text)
         if len(toks) < 2:
             toks = [tokenizer.bos, *toks, tokenizer.eos]
-        toks = toks[:max(2, max_prompt_tokens)]
+        toks = toks[: max(2, max_prompt_tokens)]
         initial_context_len = _seeded_context_len(i, batch_size, max_context_len)
         initial_context_len = max(0, min(initial_context_len, max_context_len - len(toks)))
         scheduler.submit(Request(toks, initial_context_len=initial_context_len))
@@ -69,3 +68,21 @@ def _seeded_context_len(batch_idx: int, batch_size: int, max_context_len: int) -
     base = round(frac * max_context_len)
     jitter = x % max(1, max_context_len // max(1, batch_size))
     return min(max_context_len, base + jitter)
+
+
+class GuaranteePrefillFirstGenTokenDoesNotPreventDecodeWarmupGenEndingTokensProvider(GenEndingTokensProvider):
+    """
+    During warmup and record, since the prefill phase already predicts one token when it completes, that token
+    must not end generation even if it is <eos> or <turn|> because that would prevent decode warmup and crash the
+    engine once it attempts to decode for real requests. This class ensures no tokens terminate generation for count
+    tokens, then all tokens terminate it.
+    """
+
+    def __init__(self, tokenizer: Tokenizer, count: int = 10):
+        self.tokenizer = tokenizer
+        self.count_left = count
+
+    def get(self) -> list[int]:
+        self.count_left -= 1
+        all_toks = list(range(len(self.tokenizer._tok_to_str)))
+        return [] if self.count_left > 0 else all_toks

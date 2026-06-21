@@ -30,16 +30,27 @@ import random
 import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 from g4b import scheduler as scheduler_mod
 from g4b import tokenizer as tokenizer_mod
 
 
 app = FastAPI()
+
+
+_CHAT_APP_HTML_PATH = Path(__file__).parent / "chat.html"
+
+
+@app.get("/")
+async def index() -> HTMLResponse:
+    return HTMLResponse(_CHAT_APP_HTML_PATH.read_text(encoding="utf-8"))
+
 
 _scheduler: "scheduler_mod.Scheduler"
 _tokenizer: "tokenizer_mod.Tokenizer"
@@ -223,15 +234,16 @@ class _UserChatManager:
         toks = self.token_buf
         self.token_buf = []
 
-        if _tokenizer.eos in toks or _tokenizer.end_of_turn in toks:
-            toks = toks[: toks.index(_tokenizer.eos)]
+        gen_ending_toks = _tokenizer.gen_ending_tokens()
+        if any(t in toks for t in gen_ending_toks):
+            toks = toks[: min(toks.index(t) for t in gen_ending_toks if t in toks)]
 
-        text = _tokenizer.detokenize(toks)  # TODO technically this may be incorrect unless I buffer a few tokens
+        text = _tokenizer.detokenize(toks)  # TODO technically this may lead to incorrect utf8 decoding
 
-        # <start_of_turn>/<end_of_turn> are chat-template structural tokens that
+        # <|turn>/<turn|> are chat-template structural tokens that
         # the tokenizer detokenizes back into literal text. They must not leak to
         # the client; they are added by the chat template at the next turn.
-        text = text.replace("<start_of_turn>", "").replace("<end_of_turn>", "")
+        text = text.replace("<|turn>", "").replace("<turn|>", "")
 
         if not text:
             return []

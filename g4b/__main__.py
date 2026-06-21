@@ -8,7 +8,10 @@ from g4b.scheduler import Scheduler
 from g4b.tokenizer import Tokenizer, ChatTemplate
 from g4b.models import models
 from g4b import gguf, device, serve, lifecycle
-from g4b.interaction_generator import submit_generated_interactions
+from g4b.interaction_generator import (
+    submit_generated_interactions,
+    GuaranteePrefillFirstGenTokenDoesNotPreventDecodeWarmupGenEndingTokensProvider,
+)
 
 
 def parse_args():
@@ -48,12 +51,15 @@ def main():
             f"The gguf says this model only supports {supported_ctx_len}, but you passed {config.context_len}"
         )
 
-    model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
-    scheduler = Scheduler(model)
     tokenizer = Tokenizer(config, gguf_meta)
+    model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
+    scheduler = Scheduler(model, tokenizer)
     chat_template = ChatTemplate(config, gguf_meta)
 
     lifecycle.complete_phase("init")
+    tokenizer._gen_ending_tokens_provider = (
+        GuaranteePrefillFirstGenTokenDoesNotPreventDecodeWarmupGenEndingTokensProvider(tokenizer)
+    )
     submit_generated_interactions(
         scheduler,
         tokenizer,
@@ -78,6 +84,7 @@ def main():
     scheduler.step()  # record prefill graph
     scheduler.step()  # record decode graph
     lifecycle.complete_phase("record")
+    tokenizer._gen_ending_tokens_provider = None
     scheduler.reset()
 
     serve.register_scheduler(scheduler)

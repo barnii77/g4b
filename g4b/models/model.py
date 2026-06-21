@@ -12,9 +12,6 @@ class Model(ABC):
     def max_prefill_chunk_size(self) -> int: ...
 
     @abstractmethod
-    def stop_token_id(self) -> int: ...
-
-    @abstractmethod
     def prepare_prefill_inputs(
         self,
         token_cols: list[list[int]],

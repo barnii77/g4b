@@ -243,9 +243,9 @@ def main():
         assert config.batch_size == 1, "comparison script currently expects B=1"
 
         print("loading g4b model")
-        model = models[config.model_arch].load(meta, tensors, config)
-        scheduler = Scheduler(model)
         tokenizer = Tokenizer(config, meta)
+        model = models[config.model_arch].load(meta, tensors, config)
+        scheduler = Scheduler(model, tokenizer)
         chat_template = ChatTemplate(config, meta)
         lifecycle.complete_phase("init")
 

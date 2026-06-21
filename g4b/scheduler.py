@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import g4b.models
+    import g4b.tokenizer
 
 
 class Request:
@@ -32,10 +33,11 @@ class Request:
 
 
 class Scheduler:
-    _STATS_INTERVAL = 1
+    _STATS_INTERVAL = 16
 
-    def __init__(self, model: "g4b.models.Model"):
+    def __init__(self, model: "g4b.models.Model", tokenizer: "g4b.tokenizer.Tokenizer"):
         self._model = model
+        self._tokenizer = tokenizer
         self._queue: SimpleQueue[Request] = SimpleQueue()
         self._active: list[Request | None] = [None] * model.max_batch_size()
         self._phase_active: list[bool] = [False] * model.max_batch_size()
@@ -218,7 +220,7 @@ class Scheduler:
                 continue
             tok = vals[b]
             rq._output_tokens.append(tok)
-            if tok == self._model.stop_token_id():
+            if tok in self._tokenizer.gen_ending_tokens():
                 rq._done = True
             self._notify(rq)
 

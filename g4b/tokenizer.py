@@ -1,6 +1,12 @@
+import re
+from abc import ABC, abstractmethod
 from g4b.config import Config
 from g4b.gguf import GGUFMeta
-import re
+
+
+class GenEndingTokensProvider(ABC):
+    @abstractmethod
+    def get(self) -> list[int]: ...
 
 
 class Tokenizer:
@@ -10,6 +16,8 @@ class Tokenizer:
         tokens: list[str] = meta["tokenizer.ggml.tokens"]
         self._str_to_tok: dict[str, int] = {tok: i for i, tok in enumerate(tokens)}
         self.end_of_turn = self._str_to_tok["<turn|>"]
+        self._gen_ending_tokens = [self.eos, self.end_of_turn]
+        self._gen_ending_tokens_provider: GenEndingTokensProvider | None = None
         self._tok_to_str = tokens
         self._byte_toks = set(self._str_to_tok[Tokenizer._byte_token(b)] for b in range(256))
         self._special_toks = tuple(
@@ -23,6 +31,11 @@ class Tokenizer:
                 reverse=True,
             )
         )
+
+    def gen_ending_tokens(self):
+        if self._gen_ending_tokens_provider:
+            return self._gen_ending_tokens_provider.get()
+        return self._gen_ending_tokens.copy()
 
     @staticmethod
     def _byte_token(b: int) -> str:
@@ -109,15 +122,14 @@ type ChatFragment = PromptFragment | ToolOutput | ResponseFragment | ToolCall
 
 
 class ChatTemplate:
-    # TODO normalize the chat fragments (cat runs of user.prompt and assistant.response.chunk)
-
     def __init__(self, config: Config, meta: GGUFMeta):
         self._template: str = meta["tokenizer.chat_template"]
 
     def apply(self, chat_fragments: list[ChatFragment]) -> str:
         # Gemma chat templates use these literal control strings; the tokenizer
         # BPE pass merges them to the corresponding control tokens.
-        out = []
+        chat_fragments = _normalize_chat_fragments(chat_fragments)
+        out = ["<|turn>system\n<|think|><turn|>\n"]
         for frag in chat_fragments:
             if isinstance(frag, PromptFragment):
                 out.append(f"<|turn>user\n{frag.content}<turn|>\n")
@@ -150,3 +162,15 @@ class ResponseFragment:
 class ToolCall:
     def __init__(self, call: dict):
         self.call = call
+
+
+def _normalize_chat_fragments(frags: list[ChatFragment]) -> list[ChatFragment]:
+    out = [frags.pop(0)]
+    while frags:
+        frag = frags.pop()
+        last_frag = out[-1]
+        if isinstance(last_frag, PromptFragment) and isinstance(frag, PromptFragment):
+            out[-1] = PromptFragment(last_frag.content + frag.content)
+        elif isinstance(last_frag, ResponseFragment) and isinstance(frag, ResponseFragment):
+            out[-1] = ResponseFragment(last_frag.content + frag.content)
+    return out
