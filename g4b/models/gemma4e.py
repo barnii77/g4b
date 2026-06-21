@@ -1009,11 +1009,17 @@ def _compute_rope_freqs(rope_freqs: GGUFTensor | None, freq_base: float, rope_di
 
 
 def _slice_t(x: Tensor, t_now: int) -> Tensor:
-    return x.slice_until(1, t_now)
-
-
-def _slice_heads_t(x: Tensor, t_now: int) -> Tensor:
-    return x.slice_until(2, t_now)
+    batch_size, t_capacity, *rem_shape = x.shape
+    required_slots = t_now * batch_size
+    if required_slots <= t_capacity:
+        # slice one batch out and then use contiguous slots of the T dim as the new batch dim, improving locality
+        #  and allowing me to avoid writing a non-contiguous memset kernel ;)
+        # TODO this will crash if the prefill chunk size is less than batch size, at which point I definitely need
+        #  a new memset kernel... but that'll never realistically happen with the current engine.
+        x = x.slice_at(0, 0).slice_until(0, required_slots)
+        return x.reshape((batch_size, t_now, *rem_shape))
+    else:
+        return x.slice_until(1, t_now)
 
 
 def _flat_head_out(x: Tensor, t_now: int) -> Tensor:
