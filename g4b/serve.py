@@ -58,7 +58,7 @@ RESPONSE_CHUNK_TIMEOUT = 5
 RESPONSE_CHUNK_BUFFER_SIZE = 48  # tokens
 
 GENERIC_ERROR = 1
-MAX_CONTEXT_WINDOW_EXCEEDED_ERROR = 2  # TODO emit this when it happens so the client can truncate conversation
+MAX_CONTEXT_WINDOW_EXCEEDED_ERROR = 2
 
 # Sub-states for the streaming token parser when it is reading the *name* that
 # follows a structural token, e.g. the "model" in `<|turn>model\n` or the
@@ -97,9 +97,10 @@ class _ChatClosed(Exception):
 
 
 class _UserChatManagerEvent:
-    def __init__(self, frags: list[_ModelOutput], is_terminal: bool):
+    def __init__(self, frags: list[_ModelOutput], is_terminal: bool, error_code: int | None = None):
         self.frags = frags
         self.is_terminal = is_terminal
+        self.error_code = error_code
 
 
 async def _notify_condition(cv: asyncio.Condition):
@@ -118,6 +119,7 @@ class _UserChatManager:
         self.token_buf: list[int] = []
 
         self._terminal_pending = False
+        self._terminal_error_code: int | None = None
         self._reset_stream_parser()
 
     def _reset_stream_parser(self):
@@ -143,6 +145,7 @@ class _UserChatManager:
         self.active_request = None
         self.token_buf.clear()
         self._terminal_pending = False
+        self._terminal_error_code = None
         self._reset_stream_parser()
         if self._tokenize_history_len() > _config.context_len:
             return MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
@@ -177,12 +180,14 @@ class _UserChatManager:
             self.chat_fragments.pop()
             return False, MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
 
-        rq = scheduler_mod.Request(toks, self.change_cv, self.loop)
+        max_context_len = None if _config.allow_sliding_global_context else _config.context_len
+        rq = scheduler_mod.Request(toks, self.change_cv, self.loop, max_context_len=max_context_len)
         _scheduler.submit(rq)
         self.active_request = rq
 
         self.token_buf.clear()
         self._terminal_pending = False
+        self._terminal_error_code = None
         self._reset_stream_parser()
         return True, None
 
@@ -204,6 +209,7 @@ class _UserChatManager:
         self.active_request = None
         self.token_buf.clear()
         self._terminal_pending = False
+        self._terminal_error_code = None
         self._reset_stream_parser()
 
         self._notify_from_any_thread()
@@ -230,9 +236,11 @@ class _UserChatManager:
         if new_toks:
             self.token_buf.extend(new_toks)
 
-        if rq._done or _tokenizer.eos in new_toks:
+        if rq._done:
             self.active_request = None
             self._terminal_pending = True
+            if rq._context_window_exceeded:
+                self._terminal_error_code = MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
 
     def _finish_name(self):
         name = "".join(self._name_chars).strip()
@@ -330,7 +338,9 @@ class _UserChatManager:
     def _make_terminal_event(self) -> _UserChatManagerEvent:
         frags = self._drain_token_buffer_as_far_as_possible(final=True)
         self._terminal_pending = False
-        return _UserChatManagerEvent(frags, True)
+        error_code = self._terminal_error_code
+        self._terminal_error_code = None
+        return _UserChatManagerEvent(frags, True, error_code)
 
     async def _wait_for_change(self):
         async with self.change_cv:
@@ -439,7 +449,19 @@ async def chat(ws: WebSocket):
                     )
 
             if advancements.is_terminal:
-                await ws.send_json(_add_obfuscation({"type": "assistant.response.done"}))
+                if advancements.error_code == MAX_CONTEXT_WINDOW_EXCEEDED_ERROR:
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "code": MAX_CONTEXT_WINDOW_EXCEEDED_ERROR,
+                            "detail": (
+                                f"generation reached max context length ({_config.context_len} tokens); "
+                                "truncate the conversation"
+                            ),
+                        }
+                    )
+                else:
+                    await ws.send_json(_add_obfuscation({"type": "assistant.response.done"}))
 
             # Handle client -> server event
             if event is not None:

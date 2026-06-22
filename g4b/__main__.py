@@ -24,6 +24,11 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--keep-thoughts-in-history", action="store_true")
+    parser.add_argument(
+        "--allow-sliding-global-context",
+        action="store_true",
+        help="continue generation by rolling the global KV window instead of returning error code 2",
+    )
     args = parser.parse_args()
     return Config(
         args.batch_size,
@@ -35,6 +40,7 @@ def parse_args():
         args.port,
         args.seed,
         args.keep_thoughts_in_history,
+        args.allow_sliding_global_context,
     )
 
 

@@ -17,6 +17,7 @@ class Request:
         change_cv: asyncio.Condition | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
         initial_context_len: int = 0,
+        max_context_len: int | None = None,
     ):
         self.input_tokens = input_tokens
         self._output_tokens: list[int] = []
@@ -25,6 +26,8 @@ class Request:
         self._loop = loop
         self._prefill_pos = 0
         self._context_len = initial_context_len
+        self._max_context_len = max_context_len
+        self._context_window_exceeded = False
         self._last_sample_t_idx = 0
         self._decode_state_prepared = False
         self._done = False
@@ -247,6 +250,12 @@ class Scheduler:
             rq._output_tokens.append(tok)
             self._prev_processed_tokens_by_slot[b].append(tok)
             if tok in self._tokenizer.gen_ending_tokens():
+                rq._done = True
+            elif rq._max_context_len is not None and rq._context_len >= rq._max_context_len:
+                # The sampled token is valid, but processing it on the next
+                # decode step would roll the global KV window and discard
+                # context. Terminate before that quality-degrading step.
+                rq._context_window_exceeded = True
                 rq._done = True
             self._notify(rq)
 

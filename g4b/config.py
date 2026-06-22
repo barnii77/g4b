@@ -13,3 +13,4 @@ class Config:
     port: int
     seed: int
     keep_thoughts_in_history: bool = False
+    allow_sliding_global_context: bool = False
