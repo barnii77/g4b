@@ -12,5 +12,5 @@ class Config:
     host: str
     port: int
     seed: int
-    keep_thoughts_in_history: bool = False
+    drop_thoughts_from_history: bool = False
     allow_sliding_global_context: bool = False

@@ -269,8 +269,8 @@ class _UserChatManager:
 
         Emitted fragments are streamed to the client and appended straight to
         chat history; same-channel/cross-channel coalescing is left to the chat
-        template's normalization. Thought channels are persisted to history only
-        when keep_thoughts_in_history is set (they are always streamed).
+        template's normalization. Thought channels are persisted by default and
+        omitted only when drop_thoughts_from_history is set (they are always streamed).
         """
         # TODO this parser only ever emits text ResponseFragments; it has no path to recognize a tool call in the
         #  model's output and emit a ToolCall. Until that exists, tool calls the model generates are silently dropped.
@@ -298,7 +298,7 @@ class _UserChatManager:
                 if text:
                     frag = tokenizer_mod.ResponseFragment(text, self._channel)
                     out.append(frag)
-                    if self._channel != "thought" or _config.keep_thoughts_in_history:
+                    if self._channel != "thought" or not _config.drop_thoughts_from_history:
                         self.chat_fragments.append(frag)
             run = []
 

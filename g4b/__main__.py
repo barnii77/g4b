@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--keep-thoughts-in-history", action="store_true")
+    parser.add_argument("--drop-thoughts-from-history", action="store_true")
     parser.add_argument(
         "--allow-sliding-global-context",
         action="store_true",
@@ -39,7 +39,7 @@ def parse_args():
         args.host,
         args.port,
         args.seed,
-        args.keep_thoughts_in_history,
+        args.drop_thoughts_from_history,
         args.allow_sliding_global_context,
     )
 
