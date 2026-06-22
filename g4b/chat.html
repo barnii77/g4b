@@ -25,6 +25,19 @@
   .assistant { align-self: flex-start; background: #1c1f27; border: 1px solid #23262e; border-bottom-left-radius: 4px; }
   .assistant.pending::after { content: "▌"; opacity: .6; animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
+  /* Reasoning ("thought" channel): a collapsible block shown above the answer, collapsed by default. */
+  .thought { margin: 0 0 8px; }
+  .thought > summary {
+    cursor: pointer; list-style: none; user-select: none;
+    font-size: 12px; font-weight: 600; color: #8b949e;
+  }
+  .thought > summary::-webkit-details-marker { display: none; }
+  .thought > summary::before { content: "▸ "; }
+  .thought[open] > summary::before { content: "▾ "; }
+  .thought-body {
+    margin-top: 6px; padding-left: 10px; border-left: 2px solid #2a2e38;
+    font-size: 13px; color: #9aa4b2;
+  }
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #23262e; }
   #input {
     flex: 1; resize: none; padding: 10px 12px; border-radius: 10px;
@@ -67,7 +80,7 @@ let ws, ready = false, busy = false, current = null;
 // NOTE: the wire protocol carries text, not token boundaries, so we approximate
 // a token as a word plus its leading whitespace. The displayed tok/s is thus an
 // approximation of the model's true token rate.
-let queue = [];          // token pieces awaiting display
+let queue = [];          // {text, el} pieces awaiting display (el = target DOM node)
 let finished = false;    // server sent assistant.response.done
 let raf = null;
 let tps = 0;             // smoothed tokens/sec estimate
@@ -125,12 +138,17 @@ function pump(ts) {
   rate = Math.max(rate, queue.length / MAX_LAG_S);
   budget += rate * dt;
 
-  let out = "";
-  while (budget >= 1 && queue.length) { out += queue.shift(); budget -= 1; }
-  if (out && current) {
-    current.textContent += out;
-    log.scrollTop = log.scrollHeight;
+  // Release whole pieces, batching consecutive ones with the same target
+  // element (channel) into a single textContent write to limit reflows.
+  let wrote = false, runEl = null, runText = "";
+  while (budget >= 1 && queue.length) {
+    const it = queue.shift(); budget -= 1;
+    if (it.el !== runEl) { if (runEl) runEl.textContent += runText; runEl = it.el; runText = ""; }
+    runText += it.text;
+    wrote = true;
   }
+  if (runEl) runEl.textContent += runText;
+  if (wrote) log.scrollTop = log.scrollHeight;
 
   if (queue.length) {
     raf = requestAnimationFrame(pump);
@@ -141,12 +159,26 @@ function pump(ts) {
   }
 }
 
+// Drain remaining queued pieces straight to their target elements.
+function drainQueueNow() {
+  let runEl = null, runText = "";
+  for (const it of queue) {
+    if (it.el !== runEl) { if (runEl) runEl.textContent += runText; runEl = it.el; runText = ""; }
+    runText += it.text;
+  }
+  if (runEl) runEl.textContent += runText;
+  queue = [];
+}
+
 function schedulePump() {
   if (raf === null) { lastFrame = 0; raf = requestAnimationFrame(pump); }
 }
 
 function finalize() {
-  if (current) current.classList.remove("pending");
+  if (current) {
+    current.classList.remove("pending");
+    if (current._thoughtSummary) current._thoughtSummary.textContent = "Thoughts";
+  }
   current = null;
   queue = [];
   finished = false;
@@ -158,7 +190,7 @@ function finalize() {
 
 function flushNow() {
   if (raf !== null) { cancelAnimationFrame(raf); raf = null; }
-  if (current && queue.length) current.textContent += queue.join("");
+  drainQueueNow();
   finalize();
 }
 
@@ -190,6 +222,41 @@ function addMsg(role, text) {
   return el;
 }
 
+// An assistant message is a bubble that may hold a collapsible thought block
+// (above) and the answer text (below); each streamed chunk is routed by channel.
+function startAssistant() {
+  const el = document.createElement("div");
+  el.className = "msg assistant pending";
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function ensureAnswer() {
+  if (!current._answer) {
+    current._answer = document.createElement("div");
+    current._answer.className = "answer";
+    current.appendChild(current._answer);
+  }
+  return current._answer;
+}
+
+function ensureThought() {
+  if (!current._thoughtBody) {
+    const d = document.createElement("details");
+    d.className = "thought";  // collapsed by default (no `open` attribute)
+    const summary = document.createElement("summary");
+    summary.textContent = "Thinking…";
+    const body = document.createElement("div");
+    body.className = "thought-body";
+    d.append(summary, body);
+    current.insertBefore(d, current._answer || null);  // keep thoughts above the answer
+    current._thoughtSummary = summary;
+    current._thoughtBody = body;
+  }
+  return current._thoughtBody;
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(proto + "://" + location.host + "/api/v1/chat");
@@ -210,10 +277,11 @@ function connect() {
     try { m = JSON.parse(e.data); } catch { return; }
     switch (m.type) {
       case "assistant.response.chunk": {
-        if (!current) { current = addMsg("assistant pending", ""); resetStream(); }
+        if (!current) { current = startAssistant(); resetStream(); }
         const pieces = tokenize(m.content);
         if (pieces.length) {
-          queue.push(...pieces);
+          const el = m.channel === "thought" ? ensureThought() : ensureAnswer();
+          for (const p of pieces) queue.push({ text: p, el });
           onTokensArrived(pieces);
           schedulePump();
         }
