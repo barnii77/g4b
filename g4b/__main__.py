@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--keep-thoughts-in-history", action="store_true")
     args = parser.parse_args()
     return Config(
         args.batch_size,
@@ -33,6 +34,7 @@ def parse_args():
         args.host,
         args.port,
         args.seed,
+        args.keep_thoughts_in_history,
     )
 
 
@@ -90,7 +92,7 @@ def main():
     serve.register_scheduler(scheduler)
     serve.register_tokenizer(tokenizer)
     serve.register_chat_template(chat_template)
-    serve.register_max_ctx_len(config.context_len)
+    serve.register_config(config)
     uvicorn = serve.Uvicorn.start(config.host, config.port)
 
     is_profiling = bool(os.environ.get("G4B_PROFILE"))

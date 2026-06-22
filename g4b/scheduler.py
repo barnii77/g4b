@@ -15,12 +15,14 @@ class Request:
         self,
         input_tokens: list[int],
         change_cv: asyncio.Condition | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
         initial_context_len: int = 0,
     ):
         self.input_tokens = input_tokens
         self._output_tokens: list[int] = []
         self._prev_retrieve_last_token_idx = 0
         self._change_cv = change_cv
+        self._loop = loop
         self._prefill_pos = 0
         self._context_len = initial_context_len
         self._last_sample_t_idx = 0
@@ -256,14 +258,13 @@ class Scheduler:
 
     @staticmethod
     def _notify(rq: Request):
-        # The websocket condition lives on the uvicorn loop. If notification fails,
-        # timeout-based draining still makes progress.
-        if rq._change_cv is None:
+        # The websocket condition lives on the uvicorn loop, on a different thread
+        # than the scheduler. If notification fails, timeout-based draining still
+        # makes progress.
+        if rq._change_cv is None or rq._loop is None:
             return
         try:
-            loop = rq._change_cv._loop
-            if loop is not None:
-                loop.call_soon_threadsafe(lambda: asyncio.create_task(_notify_cv(rq._change_cv)))
+            rq._loop.call_soon_threadsafe(lambda: asyncio.create_task(_notify_cv(rq._change_cv)))
         except Exception:
             pass
 

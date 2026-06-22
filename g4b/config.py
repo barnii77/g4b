@@ -12,3 +12,4 @@ class Config:
     host: str
     port: int
     seed: int
+    keep_thoughts_in_history: bool = False

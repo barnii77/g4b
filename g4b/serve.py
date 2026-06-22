@@ -10,7 +10,7 @@ API SPEC:
     - {"type": "ping"}
   - server -> client:
     - {"type": "tool.call", "call": {"name": "mytool", "args": {"arg1": <anything>, "arg2": <anything>}}, "obfuscation": <obfuscation>}
-    - {"type": "assistant.response.chunk", "content": "...", "obfuscation": <obfuscation>}
+    - {"type": "assistant.response.chunk", "channel": "thought" | null, "content": "...", "obfuscation": <obfuscation>}
     - {"type": "assistant.response.done", "obfuscation": <obfuscation>}
     - {"type": "pong"}
     - {"type": "error", "code": <uint32>, "detail": "..."}
@@ -21,7 +21,6 @@ API SPEC:
 """
 
 from __future__ import annotations
-
 import asyncio
 import base64
 import contextlib
@@ -30,16 +29,14 @@ import random
 import secrets
 import threading
 import time
+import uvicorn
 from pathlib import Path
 from typing import Any
-
-import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-
 from g4b import scheduler as scheduler_mod
 from g4b import tokenizer as tokenizer_mod
-
+from g4b.config import Config
 
 app = FastAPI()
 
@@ -55,13 +52,20 @@ async def index() -> HTMLResponse:
 _scheduler: "scheduler_mod.Scheduler"
 _tokenizer: "tokenizer_mod.Tokenizer"
 _chat_template: "tokenizer_mod.ChatTemplate"
-_max_ctx_len: int
+_config: Config
 
 RESPONSE_CHUNK_TIMEOUT = 5
 RESPONSE_CHUNK_BUFFER_SIZE = 48  # tokens
 
 GENERIC_ERROR = 1
 MAX_CONTEXT_WINDOW_EXCEEDED_ERROR = 2  # TODO emit this when it happens so the client can truncate conversation
+
+# Sub-states for the streaming token parser when it is reading the *name* that
+# follows a structural token, e.g. the "model" in `<|turn>model\n` or the
+# "thought" in `<|channel>thought\n`. The name runs until the next newline.
+_NAME_NONE = 0
+_NAME_TURN = 1
+_NAME_CHANNEL = 2
 
 
 def register_scheduler(sched: "scheduler_mod.Scheduler"):
@@ -79,9 +83,9 @@ def register_chat_template(ct: "tokenizer_mod.ChatTemplate"):
     _chat_template = ct
 
 
-def register_max_ctx_len(clen: int):
-    global _max_ctx_len
-    _max_ctx_len = clen
+def register_config(config: Config):
+    global _config
+    _config = config
 
 
 type _ModelOutput = tokenizer_mod.ResponseFragment | tokenizer_mod.ToolCall
@@ -104,25 +108,31 @@ async def _notify_condition(cv: asyncio.Condition):
 
 
 class _UserChatManager:
-    def __init__(self, max_context_len: int):
-        self.max_context_len = max_context_len
+    def __init__(self):
         self.chat_fragments: list["tokenizer_mod.ChatFragment"] = []
         self.active_request: "scheduler_mod.Request | None" = None
 
         self.loop = asyncio.get_running_loop()
         self.change_cv = asyncio.Condition()
 
-        # Compatibility with current scheduler._notify(), which reads cv._loop.
-        # The manager itself does not rely on this private field.
-        with contextlib.suppress(Exception):
-            self.change_cv._loop = self.loop  # type: ignore[attr-defined]
-
         self.token_buf: list[int] = []
 
-        # Streaming chunks are sent to the client as they arrive, but committed
-        # to chat history as one assistant turn when terminal.
-        self._current_response_parts: list[str] = []
         self._terminal_pending = False
+        self._reset_stream_parser()
+
+    def _reset_stream_parser(self):
+        """
+        State for the token-level streaming parser in
+        _drain_token_buffer_as_far_as_possible, carried across its calls.
+
+        Generation begins *inside* the model turn opened by the prompt's trailing
+        `<|turn>model\n`, so we start already in a model turn, outside any channel.
+        """
+        self._held_toks: list[int] = []  # trailing byte-tokens of a split UTF-8 char
+        self._turn_is_model = True  # False while inside a non-model turn (dropped)
+        self._channel: str | None = None  # active channel within the model turn
+        self._name_mode = _NAME_NONE  # reading a turn-role / channel-name run
+        self._name_chars: list[str] = []
 
     def init(self, chat_fragments: list["tokenizer_mod.ChatFragment"]) -> int:
         """
@@ -132,9 +142,9 @@ class _UserChatManager:
         self.chat_fragments = chat_fragments
         self.active_request = None
         self.token_buf.clear()
-        self._current_response_parts.clear()
         self._terminal_pending = False
-        if self._tokenize_history_len() > self.max_context_len:
+        self._reset_stream_parser()
+        if self._tokenize_history_len() > _config.context_len:
             return MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
         return 0
 
@@ -162,18 +172,18 @@ class _UserChatManager:
         inp = _chat_template.apply(self.chat_fragments)
         toks = _tokenizer.tokenize(inp)
 
-        if len(toks) > self.max_context_len:
+        if len(toks) > _config.context_len:
             # Roll back the history append because we cannot honor this request.
             self.chat_fragments.pop()
             return False, MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
 
-        rq = scheduler_mod.Request(toks, self.change_cv)
+        rq = scheduler_mod.Request(toks, self.change_cv, self.loop)
         _scheduler.submit(rq)
         self.active_request = rq
 
         self.token_buf.clear()
-        self._current_response_parts.clear()
         self._terminal_pending = False
+        self._reset_stream_parser()
         return True, None
 
     def abort(self) -> bool:
@@ -185,10 +195,7 @@ class _UserChatManager:
         spinner deterministically.
         """
         had_active = (
-            self.active_request is not None
-            or bool(self.token_buf)
-            or bool(self._current_response_parts)
-            or self._terminal_pending
+            self.active_request is not None or bool(self.token_buf) or bool(self._held_toks) or self._terminal_pending
         )
 
         if self.active_request is not None:
@@ -196,8 +203,8 @@ class _UserChatManager:
 
         self.active_request = None
         self.token_buf.clear()
-        self._current_response_parts.clear()
         self._terminal_pending = False
+        self._reset_stream_parser()
 
         self._notify_from_any_thread()
         return had_active
@@ -227,43 +234,101 @@ class _UserChatManager:
             self.active_request = None
             self._terminal_pending = True
 
-    def _drain_token_buffer_as_far_as_possible(self) -> list[_ModelOutput]:
-        if not self.token_buf:
-            return []
+    def _finish_name(self):
+        name = "".join(self._name_chars).strip()
+        if self._name_mode == _NAME_TURN:
+            # Only model turns are surfaced; user/tool/etc. turns are dropped.
+            self._turn_is_model = name == "model"
+            self._channel = None
+        else:  # _NAME_CHANNEL
+            self._channel = name or None
+        self._name_mode = _NAME_NONE
+        self._name_chars = []
 
-        toks = self.token_buf
+    def _drain_token_buffer_as_far_as_possible(self, final: bool = False) -> list[_ModelOutput]:
+        """
+        Streaming stateful parser over newly generated tokens.
+
+        Splits the token stream on the structural tokens `<|turn>`/`<turn|>` and
+        `<|channel>`/`<channel|>`, keeping only model-turn content, and further
+        splits model content into channel subsequences (None for the visible
+        answer, e.g. "thought" for reasoning). Each contiguous channel run is
+        detokenized and emitted as one ResponseFragment carrying its channel.
+
+        State (current turn/channel, partial channel-name, and any held-back
+        UTF-8 tail) persists across calls via the instance, so chunked drains
+        reconstruct the same result as a single pass.
+
+        Emitted fragments are streamed to the client and appended straight to
+        chat history; same-channel/cross-channel coalescing is left to the chat
+        template's normalization. Thought channels are persisted to history only
+        when keep_thoughts_in_history is set (they are always streamed).
+        """
+        # TODO this parser only ever emits text ResponseFragments; it has no path to recognize a tool call in the
+        #  model's output and emit a ToolCall. Until that exists, tool calls the model generates are silently dropped.
+        raw = self.token_buf
         self.token_buf = []
 
+        # Cut at the first generation-ending token; nothing after it is output.
         gen_ending_toks = _tokenizer.gen_ending_tokens()
-        if any(t in toks for t in gen_ending_toks):
-            toks = toks[: min(toks.index(t) for t in gen_ending_toks if t in toks)]
+        cut = min((raw.index(t) for t in gen_ending_toks if t in raw), default=len(raw))
+        toks = self._held_toks + raw[:cut]
+        self._held_toks = []
 
-        text = _tokenizer.detokenize(toks)  # TODO technically this may lead to incorrect utf8 decoding
-
-        # <|turn>/<turn|> are chat-template structural tokens that
-        # the tokenizer detokenizes back into literal text. They must not leak to
-        # the client; they are added by the chat template at the next turn.
-        text = text.replace("<|turn>", "").replace("<turn|>", "")
-
-        if not text:
+        if not toks:
             return []
 
-        self._current_response_parts.append(text)
-        return [tokenizer_mod.ResponseFragment(text)]
+        out: list[_ModelOutput] = []
+        run: list[int] = []
 
-    def _commit_current_response_to_history(self):
-        if not self._current_response_parts:
-            return
+        def flush(force: bool):
+            nonlocal run
+            if run and self._turn_is_model:
+                text, held = _tokenizer.detokenize_streaming(run, flush=force)
+                if held:
+                    self._held_toks = held
+                if text:
+                    frag = tokenizer_mod.ResponseFragment(text, self._channel)
+                    out.append(frag)
+                    if self._channel != "thought" or _config.keep_thoughts_in_history:
+                        self.chat_fragments.append(frag)
+            run = []
 
-        full_text = "".join(self._current_response_parts)
-        self._current_response_parts.clear()
+        for t in toks:
+            if self._name_mode != _NAME_NONE:
+                # Reading a turn-role / channel-name run, which ends at a newline.
+                piece = _tokenizer.detokenize([t])
+                if "\n" in piece:
+                    before, *_ = piece.partition("\n")
+                    self._name_chars.append(before)
+                    self._finish_name()
+                else:
+                    self._name_chars.append(piece)
+                continue
 
-        if full_text:
-            self.chat_fragments.append(tokenizer_mod.ResponseFragment(full_text))
+            if t == _tokenizer.start_of_turn:
+                flush(force=True)
+                self._name_mode = _NAME_TURN
+                self._name_chars = []
+            elif t == _tokenizer.end_of_turn:
+                flush(force=True)
+                self._turn_is_model = False
+                self._channel = None
+            elif t == _tokenizer.start_of_channel:
+                flush(force=True)  # implicit close of any open channel (no nesting)
+                self._name_mode = _NAME_CHANNEL
+                self._name_chars = []
+            elif t == _tokenizer.end_of_channel:
+                flush(force=True)
+                self._channel = None
+            elif self._turn_is_model:
+                run.append(t)
+
+        flush(force=final)
+        return out
 
     def _make_terminal_event(self) -> _UserChatManagerEvent:
-        frags = self._drain_token_buffer_as_far_as_possible()
-        self._commit_current_response_to_history()
+        frags = self._drain_token_buffer_as_far_as_possible(final=True)
         self._terminal_pending = False
         return _UserChatManagerEvent(frags, True)
 
@@ -327,7 +392,7 @@ async def chat(ws: WebSocket):
     await ws.accept()
 
     is_init = False
-    state = _UserChatManager(_max_ctx_len)
+    state = _UserChatManager()
 
     recv_task = asyncio.create_task(ws.receive_json())
     continue_task = asyncio.create_task(state.continue_processing())
@@ -357,6 +422,7 @@ async def chat(ws: WebSocket):
                         _add_obfuscation(
                             {
                                 "type": "assistant.response.chunk",
+                                "channel": frag.channel,
                                 "content": frag.content,
                             }
                         )
@@ -419,7 +485,10 @@ async def chat(ws: WebSocket):
 
                                 case "assistant.response.chunk":
                                     content = await _assert_string(ev.get("content"), "`content` must be string", ws)
-                                    parsed_ev = tokenizer_mod.ResponseFragment(content)
+                                    channel = ev.get("channel")
+                                    if not isinstance(channel, str) and channel is not None:
+                                        await _chat_err(ws, "`channel` must be string or null")
+                                    parsed_ev = tokenizer_mod.ResponseFragment(content, channel)
 
                                 case "assistant.response.done":
                                     # Terminal marker is harmless in persisted logs but carries no content.
@@ -435,7 +504,7 @@ async def chat(ws: WebSocket):
                         if err_code != 0:
                             await _chat_err(
                                 ws,
-                                f"provided chat history exceeds max context length ({state.max_context_len} tokens)",
+                                f"provided chat history exceeds max context length ({_config.context_len} tokens)",
                                 code=err_code,
                             )
                         is_init = True
@@ -452,7 +521,7 @@ async def chat(ws: WebSocket):
                             detail = (
                                 "request already active; send user.abort before submitting a new prompt"
                                 if err_code != MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
-                                else f"prompt exceeds max context length ({state.max_context_len} tokens); truncate the conversation"
+                                else f"prompt exceeds max context length ({_config.context_len} tokens); truncate the conversation"
                             )
                             await ws.send_json(
                                 {
@@ -474,7 +543,7 @@ async def chat(ws: WebSocket):
                             detail = (
                                 "request already active; send user.abort before submitting tool output"
                                 if err_code != MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
-                                else f"tool output exceeds max context length ({state.max_context_len} tokens); truncate the conversation"
+                                else f"tool output exceeds max context length ({_config.context_len} tokens); truncate the conversation"
                             )
                             await ws.send_json(
                                 {
