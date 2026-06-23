@@ -236,7 +236,7 @@ class _UserChatManager:
         if new_toks:
             self.token_buf.extend(new_toks)
 
-        if rq._done:
+        if rq.done:
             self.active_request = None
             self._terminal_pending = True
             if rq._context_window_exceeded:

@@ -20,6 +20,7 @@ class Request:
         max_context_len: int | None = None,
     ):
         self.input_tokens = input_tokens
+        self.done = False
         self._output_tokens: list[int] = []
         self._prev_retrieve_last_token_idx = 0
         self._change_cv = change_cv
@@ -30,7 +31,6 @@ class Request:
         self._context_window_exceeded = False
         self._last_sample_t_idx = 0
         self._decode_state_prepared = False
-        self._done = False
 
     def get_new_tokens(self) -> list[int]:
         out = self._output_tokens[self._prev_retrieve_last_token_idx :]
@@ -60,7 +60,7 @@ class Scheduler:
 
     def step(self):
         self._fill_free_slots()
-        if not any(rq is not None and not rq._done for rq in self._active):
+        if not any(rq is not None and not rq.done for rq in self._active):
             return
 
         phase = "decode" if any(self._needs_decode(rq) for rq in self._active if rq is not None) else "prefill"
@@ -88,7 +88,7 @@ class Scheduler:
         self._prev_processed_tokens_by_slot = [[] for _ in range(self._model.max_batch_size())]
 
     def abort(self, request: Request):
-        request._done = True
+        request.done = True
         for i, active in enumerate(self._active):
             if active is request:
                 self._active[i] = None
@@ -97,7 +97,7 @@ class Scheduler:
         if any(rq is not None and self._needs_decode(rq) for rq in self._active):
             return
 
-        slot_is_free = lambda rq: rq is None or rq._done
+        slot_is_free = lambda rq: rq is None or rq.done
 
         n_free_slots = sum(1 for rq in self._active if slot_is_free(rq))
         for _ in range(n_free_slots):
@@ -125,10 +125,10 @@ class Scheduler:
             self._prev_processed_tokens_by_slot[ideal_slot] = new_rq.input_tokens.copy()
 
     def _needs_prefill(self, rq: Request) -> bool:
-        return not rq._done and rq._prefill_pos < len(rq.input_tokens)
+        return not rq.done and rq._prefill_pos < len(rq.input_tokens)
 
     def _needs_decode(self, rq: Request) -> bool:
-        return not rq._done and not self._needs_prefill(rq)
+        return not rq.done and not self._needs_prefill(rq)
 
     def _prepare_prefill_inputs(self) -> int:
         t = self._model.max_prefill_chunk_size()
@@ -207,7 +207,7 @@ class Scheduler:
         if needs_upload:
             self._model.prepare_decode_inputs(token_cols, cache_offsets, time_sizes_after, sample_positions)
             for rq in self._active:
-                if rq is not None and not rq._done and not self._needs_prefill(rq):
+                if rq is not None and not rq.done and not self._needs_prefill(rq):
                     rq._decode_state_prepared = True
         return total_decode
 
@@ -229,7 +229,7 @@ class Scheduler:
         self._window_prefill_tokens = 0
         self._window_decode_tokens = 0
         self._last_log_time = now
-        active = sum(1 for rq in self._active if rq is not None and not rq._done)
+        active = sum(1 for rq in self._active if rq is not None and not rq.done)
         active_reqs = [rq._context_len for rq in self._active if rq is not None]
         context_len = max(active_reqs) if active_reqs else -1
         print(
@@ -242,7 +242,7 @@ class Scheduler:
     def _collect_outputs(self, phase: str):
         vals = self._model.collect_output_token_ids()
         for b, rq in enumerate(self._active):
-            if rq is None or rq._done or not self._phase_active[b]:
+            if rq is None or rq.done or not self._phase_active[b]:
                 continue
             if phase == "prefill" and self._needs_prefill(rq):
                 continue
@@ -250,18 +250,18 @@ class Scheduler:
             rq._output_tokens.append(tok)
             self._prev_processed_tokens_by_slot[b].append(tok)
             if tok in self._tokenizer.gen_ending_tokens():
-                rq._done = True
+                rq.done = True
             elif rq._max_context_len is not None and rq._context_len >= rq._max_context_len:
                 # The sampled token is valid, but processing it on the next
                 # decode step would roll the global KV window and discard
                 # context. Terminate before that quality-degrading step.
                 rq._context_window_exceeded = True
-                rq._done = True
+                rq.done = True
             self._notify(rq)
 
     def _drop_done_slots(self):
         for i, rq in enumerate(self._active):
-            if rq is not None and rq._done:
+            if rq is not None and rq.done:
                 self._active[i] = None
                 # preserve list of tokens in this slot's KV caches so it can be (partially) reused
 
