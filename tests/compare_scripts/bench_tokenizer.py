@@ -1,5 +1,10 @@
 import random
-from scripts.reference_impl import load_model
+from pathlib import Path
+from g4b import device, gguf
+from g4b.config import Config
+from g4b.tokenizer import Tokenizer
+
+random.seed(1)
 
 words = """
 the
@@ -1005,19 +1010,52 @@ neck
 """
 words = list(filter(lambda x: x, words.split("\n")))
 
-*_, tokenizer = load_model("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf")
+device.init(0)
+
+config = Config(
+    batch_size=1,
+    context_len=1024,
+    model_arch="gemma4",
+    gguf_path=Path("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf"),
+    prefill_chunk_size=512,
+    host="127.0.0.1",
+    port=8000,
+    seed=1,
+    drop_thoughts_from_history=False,
+    allow_sliding_global_context=False,
+)
+gguf_meta, gguf_tensors = gguf.load(config.gguf_path)
+config.model_arch = gguf_meta["general.architecture"]
+
+tokenizer = Tokenizer(config, gguf_meta)
+
+# to test the reference tokenizer instead:
+# *_, tokenizer = load_model("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf")
 
 inp = []
-for i in range(1_000):
+for i in range(10_000):
     word = random.choice(words)
     inp.append(word)
     punct = random.choice("         .,_")
     inp.append(punct)
 inp = "".join(inp)
 
-tokenize = lambda: tokenizer.detokenize([random.randint(0, 1000) for _ in range(10_000_000)])
+print("correctness assertion")
+tokenized = tokenizer.tokenize(inp, add_bos=False)
+detokenized = tokenizer.detokenize(tokenized)
+if detokenized != inp:
+    raise RuntimeError("tokenization or detokenization is broken")
+
+print("correctness assertion passed. example:")
+for tok in tokenizer.tokenize(inp)[:20]:
+    print("   ", tokenizer._tok_to_str[tok], "->", tok)
+
+tokenize = lambda: tokenizer.tokenize(inp)
+detokenize = lambda: tokenizer.detokenize([random.randint(0, 1000) for _ in range(10_000_000)])
 
 print("timing now")
 
 import timeit
-print(timeit.timeit("tokenize()", number=10, globals=globals()))
+
+print(f"tokenize ({len(inp):,} characters):", timeit.timeit("tokenize()", number=10, globals=globals()))
+print("detokenize (10,000,000 tokens):", timeit.timeit("detokenize()", number=10, globals=globals()))

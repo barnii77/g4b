@@ -57,30 +57,61 @@ class Tokenizer:
     def _byte_token(b: int) -> str:
         return f"<0x{b:02X}>"
 
-    def _bpe_merge(self, pieces: str) -> list[str]:
-        pieces = list(pieces)
-        while True:
-            counts = {}
-            for a, b in zip(pieces, pieces[1:]):
-                if a + b in self._str_to_tok:
-                    counts[(a, b)] = counts.get((a, b), 0) + 1
-            if not counts:
-                break
+    def _bpe_merge(self, pieces: Sequence[str]) -> list[str]:
+        pieces: list[str | None] = list(pieces)
+        merges, links = [], []
+        for i, (a, b) in enumerate(zip(pieces, pieces[1:])):
+            i_prev = (i - 1) if i != 0 else None
+            i_next = (i + 1) if i != len(pieces) - 1 else None
+            links.append((i_prev, i_next))
+            if (a, b) not in self._merges:
+                continue
+            rank = self._merges[a, b]
+            merges.append((rank, i, a, b))
+        links.append((len(pieces) - 2, None))
+        heapq.heapify(merges)
 
-            top_a, top_b = max(counts, key=lambda t: counts[t])
-            joined = top_a + top_b
-            new_pieces = [pieces[0]]
-            for b in pieces[1:]:
-                a = new_pieces[-1]
-                if a == top_a and b == top_b:
-                    new_pieces.pop()
-                    new_pieces.append(joined)
-                else:
-                    new_pieces.append(b)
-            if new_pieces == pieces:
-                break
-            pieces = new_pieces
-        return pieces
+        def ll_unlink(i: int):
+            i_prev, i_next = links[i]
+            _, i_next_next = links[i_next] if i_next is not None else (None, None)
+            i_prev_prev, _ = links[i_prev] if i_prev is not None else (None, None)
+            links[i] = None, None
+            if i_next is not None:
+                links[i_next] = i_prev, i_next_next
+            if i_prev is not None:
+                links[i_prev] = i_prev_prev, i_next
+
+        def try_add_merge(i: int):
+            _, i_next = links[i]
+            if i_next is None:
+                return
+
+            a, b = pieces[i], pieces[i_next]
+            assert a is not None and b is not None
+
+            if (a, b) not in self._merges:
+                return
+            heapq.heappush(merges, (self._merges[a, b], i, a, b))
+
+        while merges:
+            _, pos, a_exp, b_exp = heapq.heappop(merges)
+            assert a_exp is not None and b_exp is not None
+            pos_prev, pos_next = links[pos]
+            if pos_next is None:
+                continue
+
+            a, b = pieces[pos], pieces[pos_next]
+            if a != a_exp or b != b_exp:
+                continue  # stale merge
+
+            pieces[pos] = a + b
+            pieces[pos_next] = None
+            ll_unlink(pos_next)
+            if pos_prev is not None:
+                try_add_merge(pos_prev)
+            try_add_merge(pos)
+
+        return [x for x in pieces if x is not None]
 
     def tokenize(self, sequence: str, *, add_bos: bool = True) -> list[int]:
         sequence = sequence.replace(" ", "▁")
