@@ -190,7 +190,7 @@ class _UserChatManager:
         MAX_CONTEXT_WINDOW_EXCEEDED_ERROR if the serialized history already
         exceeds max_context_len, otherwise 0.
         """
-        self.history_tokens = _tokenizer.tokenize(_chat_template.apply(chat_fragments, include_open_turn_to_complete=False))
+        self.history_tokens = _chat_template.apply(chat_fragments, include_open_turn_to_complete=False)
         self.active_request = None
         self.token_buf.clear()
         self._gen_tokens.clear()
@@ -219,7 +219,7 @@ class _UserChatManager:
         # `<|turn>model\n` generation prompt; both become part of the running
         # prompt. The model then generates its response and its own closing
         # `<turn|>` onto it (see _commit_model_turn).
-        turn = _tokenizer.tokenize(_chat_template.apply([frag], include_conversation_init=False), add_bos=False)
+        turn = _chat_template.apply([frag], include_conversation_init=False, add_bos=False)
 
         if len(self.history_tokens) + len(turn) > _config.context_len:
             # Do not mutate history: the turn is never appended.

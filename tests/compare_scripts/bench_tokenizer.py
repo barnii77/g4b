@@ -1027,7 +1027,7 @@ config = Config(
 gguf_meta, gguf_tensors = gguf.load(config.gguf_path)
 config.model_arch = gguf_meta["general.architecture"]
 
-tokenizer = Tokenizer(config, gguf_meta)
+tokenizer = Tokenizer(gguf_meta)
 
 # to test the reference tokenizer instead:
 # *_, tokenizer = load_model("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf")

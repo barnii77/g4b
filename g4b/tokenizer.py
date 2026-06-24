@@ -2,9 +2,8 @@ import re
 import json
 import heapq
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Iterator, Sequence
 from dataclasses import dataclass
-from g4b.config import Config
 from g4b.gguf import GGUFMeta
 
 
@@ -14,39 +13,46 @@ class GenEndingTokensProvider(ABC):
 
 
 class Tokenizer:
-    def __init__(self, config: Config, meta: GGUFMeta):
+    _NEWLINE_CHUNKS_RE = re.compile(r"[^\n]+|\n+")
+
+    def __init__(self, meta: GGUFMeta):
         self.eos: int = meta["tokenizer.ggml.eos_token_id"]
-        self.bos: int = meta["tokenizer.ggml.bos_token_id"]
+
         tokens: list[str] = meta["tokenizer.ggml.tokens"]
         self._str_to_tok: dict[str, int] = {tok: i for i, tok in enumerate(tokens)}
+        self._tok_to_str = tokens
+        self._byte_to_tok = [self._str_to_tok[Tokenizer._byte_token(b)] for b in range(256)]
+        self._tok_to_byte = {tok: b for b, tok in enumerate(self._byte_to_tok)}
+
+        token_types: list[int] = meta["tokenizer.ggml.token_type"]
+        assert len(token_types) == len(tokens)
+        self._special_toks: dict[str, int] = {
+            tok: tok_id
+            for tok_id, (tok, tok_type) in enumerate(zip(tokens, token_types))
+            if tok_type in (2, 3, 4)  # UNKNOWN, CONTROL, USER_DEFINED. NORMAL = 1.
+        }
+        # llama.cpp promotes the configured EOG token to a control token even if
+        #  the GGUF happens to label it NORMAL (Gemma 4's <eos> does this).
+        self._special_toks[tokens[self.eos]] = self.eos
+        self._max_special_tok_len = max(map(len, self._special_toks), default=0)
+
+        merges: list[str] = meta["tokenizer.ggml.merges"]
+        self._merges: dict[tuple[str, str], int] = {}
+        for i, merge in enumerate(merges):
+            assert merge
+            parts = merge[1:].split(" ", maxsplit=1)
+            assert len(parts) == 2
+            a, b = parts
+            a = merge[0] + a
+            self._merges[a, b] = i
+
+        self.bos: int = meta["tokenizer.ggml.bos_token_id"]
         self.start_of_turn = self._str_to_tok["<|turn>"]
         self.end_of_turn = self._str_to_tok["<turn|>"]
         self.start_of_channel = self._str_to_tok["<|channel>"]
         self.end_of_channel = self._str_to_tok["<channel|>"]
         self._gen_ending_tokens = [self.eos, self.end_of_turn]
         self._gen_ending_tokens_provider: GenEndingTokensProvider | None = None
-        self._tok_to_str = tokens
-        self._byte_toks = set(self._str_to_tok[Tokenizer._byte_token(b)] for b in range(256))
-        self._special_toks = tuple(
-            sorted(
-                (
-                    tok
-                    for tok in tokens
-                    if (tok.startswith("<") and tok.endswith(">")) or (tok.startswith("[") and tok.endswith("]"))
-                ),
-                key=len,
-                reverse=True,
-            )
-        )
-        merges: list[str] = meta["tokenizer.ggml.merges"]
-        self._merges: dict[tuple[str, str], int] = {}
-        for i, merge in enumerate(merges):
-            assert merge
-            parts = merge[1:].split(' ', maxsplit=1)
-            assert len(parts) == 2
-            a, b = parts
-            a = merge[0] + a
-            self._merges[a, b] = i
 
     def gen_ending_tokens(self):
         if self._gen_ending_tokens_provider:
@@ -64,9 +70,9 @@ class Tokenizer:
             i_prev = (i - 1) if i != 0 else None
             i_next = (i + 1) if i != len(pieces) - 1 else None
             links.append((i_prev, i_next))
-            if (a, b) not in self._merges:
+            rank = self._merges.get((a, b))
+            if rank is None:
                 continue
-            rank = self._merges[a, b]
             merges.append((rank, i, a, b))
         links.append((len(pieces) - 2, None))
         heapq.heapify(merges)
@@ -89,9 +95,10 @@ class Tokenizer:
             a, b = pieces[i], pieces[i_next]
             assert a is not None and b is not None
 
-            if (a, b) not in self._merges:
+            rank = self._merges.get((a, b))
+            if rank is None:
                 return
-            heapq.heappush(merges, (self._merges[a, b], i, a, b))
+            heapq.heappush(merges, (rank, i, a, b))
 
         while merges:
             _, pos, a_exp, b_exp = heapq.heappop(merges)
@@ -113,54 +120,59 @@ class Tokenizer:
 
         return [x for x in pieces if x is not None]
 
-    def tokenize(self, sequence: str, *, add_bos: bool = True) -> list[int]:
+    def tokenize(self, sequence: str, *, add_bos: bool = True, allow_special: bool = False) -> list[int]:
         sequence = sequence.replace(" ", "▁")
         out: list[int] = [self.bos] if add_bos else []
-        for chunk in self._split_special_tokens(sequence):
-            if chunk and set(chunk) == {"\n"} and chunk in self._str_to_tok:
-                out.append(self._str_to_tok[chunk])
+        chunks = self._split_special_tokens(sequence) if allow_special else self._split_newline_chunks(sequence)
+        for chunk in chunks:
+            if isinstance(chunk, int):
+                out.append(chunk)
                 continue
-            if chunk in self._str_to_tok and chunk in self._special_toks:
-                out.append(self._str_to_tok[chunk])
+            chunk_tok = self._str_to_tok.get(chunk)
+            if chunk[0] == "\n" and chunk_tok is not None:
+                out.append(chunk_tok)
                 continue
             for piece in self._bpe_merge(chunk):
-                if piece in self._str_to_tok:
-                    out.append(self._str_to_tok[piece])
+                piece_tok = self._str_to_tok.get(piece)
+                if piece_tok is not None:
+                    out.append(piece_tok)
                 else:
-                    out.extend(self._str_to_tok[Tokenizer._byte_token(b)] for b in piece.encode())
+                    out.extend(self._byte_to_tok[b] for b in piece.encode())
         return out
 
-    def _split_special_tokens(self, sequence: str) -> list[str]:
-        # TODO unsafe: this lets user-provided text inject control-sequence tokens.
-        #  Chat-template control tokens should be inserted out-of-band, while user text
-        #  should be tokenized with special-token matching disabled or sanitized.
-        out: list[str] = []
-        buf: list[str] = []
+    @classmethod
+    def _split_newline_chunks(cls, sequence: str) -> Iterator[str]:
+        return iter(cls._NEWLINE_CHUNKS_RE.findall(sequence))
+
+    def _split_special_tokens(self, sequence: str) -> Iterator[str | int]:
+        text_start = 0
         i = 0
         while i < len(sequence):
-            special = None
-            for tok in self._special_toks:
-                if sequence.startswith(tok, i):
-                    special = tok
+            special_id = None
+            special_len = min(self._max_special_tok_len, len(sequence) - i)
+            while special_len:
+                special_id = self._special_toks.get(sequence[i : i + special_len])
+                if special_id is not None:
                     break
-            if special is not None:
-                if buf:
-                    out.extend(re.findall(r"[^\n]+|\n+", "".join(buf)))
-                    buf.clear()
-                out.append(special)
-                i += len(special)
+                special_len -= 1
+
+            if special_id is not None:
+                if text_start < i:
+                    yield from self._split_newline_chunks(sequence[text_start:i])
+                yield special_id
+                i += special_len
+                text_start = i
             else:
-                buf.append(sequence[i])
                 i += 1
-        if buf:
-            out.extend(re.findall(r"[^\n]+|\n+", "".join(buf)))
-        return out
+        if text_start < len(sequence):
+            yield from self._split_newline_chunks(sequence[text_start:])
 
     def _tokens_to_bytes(self, tokens: list[int]) -> bytearray:
         out = bytearray()
         for tok in tokens:
-            if tok in self._byte_toks:
-                out.append(int(self._tok_to_str[tok][1:-1], base=16))
+            byte = self._tok_to_byte.get(tok)
+            if byte is not None:
+                out.append(byte)
             else:
                 out.extend(self._tok_to_str[tok].encode())
         return out
@@ -184,45 +196,93 @@ class Tokenizer:
         if not hold:
             return buf.decode(errors="replace").replace("▁", " "), []
         text = buf[: len(buf) - hold].decode(errors="replace").replace("▁", " ")
-        return text, tokens[len(tokens) - hold:]
+        return text, tokens[len(tokens) - hold :]
 
 
 type ChatFragment = PromptFragment | ToolOutput | ResponseFragment | ToolCall
 
 
 class ChatTemplate:
-    _CONVERSATION_INIT = "<|turn>system\n<|think|><turn|>\n"
-    _MODEL_TURN_OPEN = "<|turn>model\n"
-    _TURN_CLOSE = "<turn|>\n"
-
-    def __init__(self, config: Config, meta: GGUFMeta):
+    def __init__(self, meta: GGUFMeta, tokenizer: Tokenizer):
+        # TODO render tokenizer.chat_template instead of hardcoding the Gemma 4 prompt format below
         self._template: str = meta["tokenizer.chat_template"]
+        self._tokenizer = tokenizer
+        tok_text = lambda text: tokenizer.tokenize(text, add_bos=False, allow_special=False)
+        special = tokenizer._special_toks
+        self._start_of_turn = special["<|turn>"]
+        self._end_of_turn = special["<turn|>"]
+        self._start_of_channel = special["<|channel>"]
+        self._end_of_channel = special["<channel|>"]
+        self._think = special["<|think|>"]
+        self._newline = tok_text("\n")
+        self._user_turn_open = [self._start_of_turn, *tok_text("user\n")]
+        self._thought_channel_open = [self._start_of_channel, *tok_text("thought\n")]
+        self._conversation_init = [
+            self._start_of_turn,
+            *tok_text("system\n"),
+            self._think,
+            self._end_of_turn,
+            *self._newline,
+        ]
+        self._model_turn_open = [self._start_of_turn, *tok_text("model\n")]
+        self._turn_close = [self._end_of_turn, *self._newline]
 
-    def apply(self, chat_fragments: list[ChatFragment], *, include_conversation_init: bool = True, include_open_turn_to_complete: bool = True) -> str:
-        chat_fragments = _normalize_chat_fragments(chat_fragments)
-
+    def apply(
+        self,
+        chat_fragments: list[ChatFragment],
+        *,
+        include_conversation_init: bool = True,
+        include_open_turn_to_complete: bool = True,
+        add_bos: bool = True,
+    ) -> list[int]:
         # TODO should be handled by prompt template
-        out = [self._CONVERSATION_INIT] if include_conversation_init else []
+        out = [self._tokenizer.bos] if add_bos else []
+        emit = out.extend
+        emit_text = lambda text: out.extend(self._tokenizer.tokenize(text, add_bos=False, allow_special=False))
+        if include_conversation_init:
+            emit(self._conversation_init)
 
-        for frag in chat_fragments:
+        i = 0
+        while i < len(chat_fragments):
+            frag = chat_fragments[i]
             if isinstance(frag, PromptFragment):
-                out.append(f"<|turn>user\n{frag.content}{self._TURN_CLOSE}")
+                emit(self._user_turn_open)
+                while i < len(chat_fragments) and isinstance(chat_fragments[i], PromptFragment):
+                    emit_text(chat_fragments[i].content)
+                    i += 1
+                emit(self._turn_close)
+                continue
             elif isinstance(frag, ResponseFragment):
-                # Bake here (idempotent for channel=None) so a model turn that is a
-                # single un-baked channel run, e.g. a lone thought, keeps its markers.
-                out.append(f"{self._MODEL_TURN_OPEN}{_bake_channel_into_content(frag).content}{self._TURN_CLOSE}")
+                # TODO maybe I shouldn't actually merge responses (thought or normal) that come from separate <|channel>'s
+                emit(self._model_turn_open)
+                last_channel = None
+                while i < len(chat_fragments) and isinstance(chat_fragments[i], ResponseFragment):
+                    response = chat_fragments[i]
+                    if response.channel == "thought":
+                        if last_channel != "thought":
+                            emit(self._thought_channel_open)
+                        emit_text(response.content)
+                    else:
+                        if last_channel == "thought":
+                            out.append(self._end_of_channel)
+                        emit_text(response.content)
+                    last_channel = response.channel
+                    i += 1
+                if last_channel == "thought":
+                    out.append(self._end_of_channel)
+                emit(self._turn_close)
+                continue
             # TODO the two below are probably completely wrong
             elif isinstance(frag, ToolOutput):
                 ...  # TODO
-                # out.append(f"<|turn>tool\n{frag.content}<turn|>\n")
             elif isinstance(frag, ToolCall):
                 ...  # TODO
-                # out.append(f"<|turn>model\n{frag.content}<turn|>\n")
+            i += 1
 
         if include_open_turn_to_complete:
-            out.append(self._MODEL_TURN_OPEN)
+            out.extend(self._model_turn_open)
 
-        return "".join(out)
+        return out
 
 
 @dataclass(frozen=True)
@@ -249,40 +309,6 @@ class ToolCall:
     @property
     def content(self) -> str:
         return json.dumps(self.call)  # TODO model expects very different format actually
-
-
-def _normalize_chat_fragments(frags: list[ChatFragment]) -> list[ChatFragment]:
-    if not frags:
-        return []
-
-    frags = frags.copy()  # must not mutate the original list
-
-    out = [frags.pop(0)]
-    while frags:
-        frag = frags.pop(0)
-        last_frag = out[-1]
-        if isinstance(last_frag, PromptFragment) and isinstance(frag, PromptFragment):  # adjacent user prompts
-            out[-1] = PromptFragment(last_frag.content + frag.content)
-        elif isinstance(last_frag, ResponseFragment) and isinstance(frag, ResponseFragment):  # adjacent response chunks
-            # TODO maybe I shouldn't actually merge responses (thought or normal) that come from separate <|channel>'s
-            if last_frag.channel == frag.channel:
-                # Same channel: concatenate raw, keep the channel un-baked so a run
-                # of e.g. thought chunks bakes into a single <|channel> span (not one per chunk).
-                out[-1] = ResponseFragment(last_frag.content + frag.content, last_frag.channel)
-            else:
-                # Channel boundary within one model turn: bake both so the markers
-                # are preserved, collapsing the turn into one channel-less fragment.
-                merged = _bake_channel_into_content(last_frag).content + _bake_channel_into_content(frag).content
-                out[-1] = ResponseFragment(merged, None)
-        else:
-            out.append(frag)
-    return out
-
-
-def _bake_channel_into_content(frag: ResponseFragment) -> ResponseFragment:
-    if frag.channel == "thought":
-        return ResponseFragment(f"<|channel>thought\n{frag.content}<channel|>", None)
-    return frag
 
 
 def _utf8_incomplete_tail_len(b: bytes | bytearray) -> int:

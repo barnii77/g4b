@@ -33,9 +33,8 @@ def submit_generated_interactions(
     for i in range(batch_size):
         prompt = PROMPTS[i % len(PROMPTS)]
         if i % 2 == 0:
-            prompt = _make_long_prompt(tokenizer, chat_template, prompt, max_prompt_tokens)
-        text = chat_template.apply([PromptFragment(prompt)])
-        toks = tokenizer.tokenize(text)
+            prompt = _make_long_prompt(chat_template, prompt, max_prompt_tokens)
+        toks = chat_template.apply([PromptFragment(prompt)])
         if len(toks) < 2:
             toks = [tokenizer.bos, *toks, tokenizer.eos]
         toks = toks[: max(2, max_prompt_tokens)]
@@ -44,12 +43,11 @@ def submit_generated_interactions(
         scheduler.submit(Request(toks, initial_context_len=initial_context_len))
 
 
-def _make_long_prompt(tokenizer: Tokenizer, chat_template: ChatTemplate, prefix: str, target_tokens: int) -> str:
+def _make_long_prompt(chat_template: ChatTemplate, prefix: str, target_tokens: int) -> str:
     prompt = prefix + "\n"
     i = 0
     while True:
-        text = chat_template.apply([PromptFragment(prompt)])
-        if len(tokenizer.tokenize(text)) >= target_tokens:
+        if len(chat_template.apply([PromptFragment(prompt)])) >= target_tokens:
             return prompt
         prompt += GIBBERISH[i % len(GIBBERISH)]
         i += 1

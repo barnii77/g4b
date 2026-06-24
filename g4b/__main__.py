@@ -59,10 +59,10 @@ def main():
             f"The gguf says this model only supports {supported_ctx_len}, but you passed {config.context_len}"
         )
 
-    tokenizer = Tokenizer(config, gguf_meta)
+    tokenizer = Tokenizer(gguf_meta)
     model = models[config.model_arch].load(gguf_meta, gguf_tensors, config)
     scheduler = Scheduler(model, tokenizer)
-    chat_template = ChatTemplate(config, gguf_meta)
+    chat_template = ChatTemplate(gguf_meta, tokenizer)
 
     lifecycle.complete_phase("init")
     tokenizer._gen_ending_tokens_provider = (

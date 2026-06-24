@@ -243,10 +243,10 @@ def main():
         assert config.batch_size == 1, "comparison script currently expects B=1"
 
         print("loading g4b model")
-        tokenizer = Tokenizer(config, meta)
+        tokenizer = Tokenizer(meta)
         model = models[config.model_arch].load(meta, tensors, config)
         scheduler = Scheduler(model, tokenizer)
-        chat_template = ChatTemplate(config, meta)
+        chat_template = ChatTemplate(meta, tokenizer)
         lifecycle.complete_phase("init")
 
         ref_model = ref_conf = None
@@ -255,8 +255,7 @@ def main():
             ref_model, ref_conf, _, _, _ = R.load_model(args.gguf)
             ref_model.eval()
 
-        text = chat_template.apply([PromptFragment(args.prompt)])
-        toks = tokenizer.tokenize(text)[: config.context_len]
+        toks = chat_template.apply([PromptFragment(args.prompt)])[: config.context_len]
         if len(toks) < 2:
             toks = [tokenizer.bos, *toks, tokenizer.eos]
         print("prompt tokens:", toks)
