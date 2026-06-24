@@ -1051,7 +1051,8 @@ for tok in tokenizer.tokenize(inp)[:20]:
     print("   ", tokenizer._tok_to_str[tok], "->", tok)
 
 tokenize = lambda: tokenizer.tokenize(inp)
-detokenize = lambda: tokenizer.detokenize([random.randint(0, 1000) for _ in range(10_000_000)])
+detok_inp = [random.randint(0, 1000) for _ in range(10_000_000)]
+detokenize = lambda: tokenizer.detokenize(detok_inp)
 
 print("timing now")
 
