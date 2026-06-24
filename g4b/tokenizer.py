@@ -1,15 +1,11 @@
 import re
-import os
 import json
+import heapq
 from abc import ABC, abstractmethod
+from typing import Sequence
 from dataclasses import dataclass
-from g4b import lifecycle
 from g4b.config import Config
 from g4b.gguf import GGUFMeta
-from g4b.utils import create_file_logger
-
-_log_all_prompts_path = os.environ.get("G4B_LOG_ALL_PROMPTS_PATH")
-_prompts_logger = create_file_logger(_log_all_prompts_path) if _log_all_prompts_path else None
 
 
 class GenEndingTokensProvider(ABC):
@@ -42,6 +38,15 @@ class Tokenizer:
                 reverse=True,
             )
         )
+        merges: list[str] = meta["tokenizer.ggml.merges"]
+        self._merges: dict[tuple[str, str], int] = {}
+        for i, merge in enumerate(merges):
+            assert merge
+            parts = merge[1:].split(' ', maxsplit=1)
+            assert len(parts) == 2
+            a, b = parts
+            a = merge[0] + a
+            self._merges[a, b] = i
 
     def gen_ending_tokens(self):
         if self._gen_ending_tokens_provider:
@@ -52,7 +57,8 @@ class Tokenizer:
     def _byte_token(b: int) -> str:
         return f"<0x{b:02X}>"
 
-    def _bpe_merge(self, pieces: list[str]) -> list[str]:
+    def _bpe_merge(self, pieces: str) -> list[str]:
+        pieces = list(pieces)
         while True:
             counts = {}
             for a, b in zip(pieces, pieces[1:]):
@@ -76,9 +82,9 @@ class Tokenizer:
             pieces = new_pieces
         return pieces
 
-    def tokenize(self, sequence: str) -> list[int]:
+    def tokenize(self, sequence: str, *, add_bos: bool = True) -> list[int]:
         sequence = sequence.replace(" ", "▁")
-        out: list[int] = [self.bos]
+        out: list[int] = [self.bos] if add_bos else []
         for chunk in self._split_special_tokens(sequence):
             if chunk and set(chunk) == {"\n"} and chunk in self._str_to_tok:
                 out.append(self._str_to_tok[chunk])
@@ -86,7 +92,7 @@ class Tokenizer:
             if chunk in self._str_to_tok and chunk in self._special_toks:
                 out.append(self._str_to_tok[chunk])
                 continue
-            for piece in self._bpe_merge(list(chunk)):
+            for piece in self._bpe_merge(chunk):
                 if piece in self._str_to_tok:
                     out.append(self._str_to_tok[piece])
                 else:
@@ -95,8 +101,8 @@ class Tokenizer:
 
     def _split_special_tokens(self, sequence: str) -> list[str]:
         # TODO unsafe: this lets user-provided text inject control-sequence tokens.
-        # Chat-template control tokens should be inserted out-of-band, while user text
-        # should be tokenized with special-token matching disabled or sanitized.
+        #  Chat-template control tokens should be inserted out-of-band, while user text
+        #  should be tokenized with special-token matching disabled or sanitized.
         out: list[str] = []
         buf: list[str] = []
         i = 0
@@ -154,33 +160,38 @@ type ChatFragment = PromptFragment | ToolOutput | ResponseFragment | ToolCall
 
 
 class ChatTemplate:
+    _CONVERSATION_INIT = "<|turn>system\n<|think|><turn|>\n"
+    _MODEL_TURN_OPEN = "<|turn>model\n"
+    _TURN_CLOSE = "<turn|>\n"
+
     def __init__(self, config: Config, meta: GGUFMeta):
         self._template: str = meta["tokenizer.chat_template"]
 
-    def apply(self, chat_fragments: list[ChatFragment]) -> str:
-        # Gemma chat templates use these literal control strings; the tokenizer
-        # BPE pass merges them to the corresponding control tokens.
+    def apply(self, chat_fragments: list[ChatFragment], *, include_conversation_init: bool = True, include_open_turn_to_complete: bool = True) -> str:
         chat_fragments = _normalize_chat_fragments(chat_fragments)
-        out = ["<|turn>system\n<|think|><turn|>\n"]
+
+        # TODO should be handled by prompt template
+        out = [self._CONVERSATION_INIT] if include_conversation_init else []
+
         for frag in chat_fragments:
             if isinstance(frag, PromptFragment):
-                out.append(f"<|turn>user\n{frag.content}<turn|>\n")
+                out.append(f"<|turn>user\n{frag.content}{self._TURN_CLOSE}")
             elif isinstance(frag, ResponseFragment):
                 # Bake here (idempotent for channel=None) so a model turn that is a
                 # single un-baked channel run, e.g. a lone thought, keeps its markers.
-                out.append(f"<|turn>model\n{_bake_channel_into_content(frag).content}<turn|>\n")
+                out.append(f"{self._MODEL_TURN_OPEN}{_bake_channel_into_content(frag).content}{self._TURN_CLOSE}")
             # TODO the two below are probably completely wrong
             elif isinstance(frag, ToolOutput):
                 ...  # TODO
-                #out.append(f"<|turn>tool\n{frag.content}<turn|>\n")
+                # out.append(f"<|turn>tool\n{frag.content}<turn|>\n")
             elif isinstance(frag, ToolCall):
                 ...  # TODO
-                #out.append(f"<|turn>model\n{frag.content}<turn|>\n")
-        out.append("<|turn>model\n")
-        inp = "".join(out)
-        if _prompts_logger and lifecycle.is_deployment():
-            _prompts_logger.info(inp)
-        return inp
+                # out.append(f"<|turn>model\n{frag.content}<turn|>\n")
+
+        if include_open_turn_to_complete:
+            out.append(self._MODEL_TURN_OPEN)
+
+        return "".join(out)
 
 
 @dataclass(frozen=True)

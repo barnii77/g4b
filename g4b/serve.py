@@ -25,6 +25,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import random
 import secrets
 import threading
@@ -34,9 +35,14 @@ from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from g4b import lifecycle
 from g4b import scheduler as scheduler_mod
 from g4b import tokenizer as tokenizer_mod
 from g4b.config import Config
+from g4b.utils import create_file_logger
+
+_log_all_prompts_path = os.environ.get("G4B_LOG_ALL_PROMPTS_PATH")
+_prompts_logger = create_file_logger(_log_all_prompts_path) if _log_all_prompts_path else None
 
 app = FastAPI()
 
@@ -108,15 +114,54 @@ async def _notify_condition(cv: asyncio.Condition):
         cv.notify_all()
 
 
+def _strip_channel(tokens: list[int], drop: str) -> list[int]:
+    """Splice out every `<|channel>{drop}\n ... <channel|>` span (markers included)
+    from verbatim tokens, leaving other channels untouched. An unterminated span is
+    closed implicitly at the next channel/turn boundary, matching the display parser."""
+    out: list[int] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        if tokens[i] != _tokenizer.start_of_channel:
+            out.append(tokens[i])
+            i += 1
+            continue
+        # Read the channel name: tokens after the marker up to the first newline.
+        j, name = i + 1, ""
+        while j < n and "\n" not in name:
+            name += _tokenizer.detokenize([tokens[j]])
+            j += 1
+        if name.split("\n", 1)[0].strip() != drop:
+            out.extend(tokens[i:j])  # keep this channel's marker + name verbatim
+            i = j
+            continue
+        # Drop this channel's body up to (and including) its closing marker.
+        stops = (
+            _tokenizer.end_of_channel,
+            _tokenizer.start_of_channel,
+            _tokenizer.start_of_turn,
+            _tokenizer.end_of_turn,
+        )
+        while j < n and tokens[j] not in stops:
+            j += 1
+        i = j + 1 if j < n and tokens[j] == _tokenizer.end_of_channel else j
+    return out
+
+
 class _UserChatManager:
     def __init__(self):
-        self.chat_fragments: list["tokenizer_mod.ChatFragment"] = []
+        # The running token prompt: BOS + system prefix + every turn so far. While
+        # a request is in flight it ends with the `<|turn>model\n` opener the model
+        # is completing; the model's generated tokens are committed onto it.
+        self.history_tokens: list[int] = []
         self.active_request: "scheduler_mod.Request | None" = None
 
         self.loop = asyncio.get_running_loop()
         self.change_cv = asyncio.Condition()
 
         self.token_buf: list[int] = []
+        # Verbatim raw tokens of the in-progress model turn, accumulated across
+        # polls and committed to history (wrapped in turn markers) on termination.
+        self._gen_tokens: list[int] = []
 
         self._terminal_pending = False
         self._terminal_error_code: int | None = None
@@ -138,24 +183,23 @@ class _UserChatManager:
 
     def init(self, chat_fragments: list["tokenizer_mod.ChatFragment"]) -> int:
         """
-        Initialize history. Returns MAX_CONTEXT_WINDOW_EXCEEDED_ERROR if the
-        serialized history already exceeds max_context_len, otherwise 0.
+        Initialize history from prior chat fragments (text/json from the client).
+
+        These are tokenized once here via the chat template; only in-session
+        model generations are stored verbatim. Returns
+        MAX_CONTEXT_WINDOW_EXCEEDED_ERROR if the serialized history already
+        exceeds max_context_len, otherwise 0.
         """
-        self.chat_fragments = chat_fragments
+        self.history_tokens = _tokenizer.tokenize(_chat_template.apply(chat_fragments, include_open_turn_to_complete=False))
         self.active_request = None
         self.token_buf.clear()
+        self._gen_tokens.clear()
         self._terminal_pending = False
         self._terminal_error_code = None
         self._reset_stream_parser()
-        if self._tokenize_history_len() > _config.context_len:
+        if len(self.history_tokens) > _config.context_len:
             return MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
         return 0
-
-    def _tokenize_history_len(self) -> int:
-        if not self.chat_fragments:
-            return 0
-        inp = _chat_template.apply(self.chat_fragments)
-        return len(_tokenizer.tokenize(inp))
 
     def submit(self, frag: _ModelInput) -> tuple[bool, int | None]:
         """
@@ -163,32 +207,37 @@ class _UserChatManager:
 
         Returns (ok, error_code).  ok is False if a request is already active
         or if the resulting token sequence would exceed max_context_len.
-        Crucially, on failure the fragment is not appended to chat history,
-        avoiding silent history corruption.
+        Crucially, on failure the fragment is not appended to history, avoiding
+        silent history corruption (e.g. model produced `t` then `p` but token `tp` exists).
         """
         self._poll_active_request()
 
         if self.active_request is not None or self._terminal_pending:
             return False, GENERIC_ERROR
 
-        self.chat_fragments.append(frag)
-        inp = _chat_template.apply(self.chat_fragments)
-        toks = _tokenizer.tokenize(inp)
+        # The chat template synthesises the user/tool turn followed by the
+        # `<|turn>model\n` generation prompt; both become part of the running
+        # prompt. The model then generates its response and its own closing
+        # `<turn|>` onto it (see _commit_model_turn).
+        turn = _tokenizer.tokenize(_chat_template.apply([frag], include_conversation_init=False), add_bos=False)
 
-        if len(toks) > _config.context_len:
-            # Roll back the history append because we cannot honor this request.
-            self.chat_fragments.pop()
+        if len(self.history_tokens) + len(turn) > _config.context_len:
+            # Do not mutate history: the turn is never appended.
             return False, MAX_CONTEXT_WINDOW_EXCEEDED_ERROR
 
+        self.history_tokens.extend(turn)
         max_context_len = None if _config.allow_sliding_global_context else _config.context_len
-        rq = scheduler_mod.Request(toks, self.change_cv, self.loop, max_context_len=max_context_len)
+        rq = scheduler_mod.Request(self.history_tokens, self.change_cv, self.loop, max_context_len=max_context_len)
         _scheduler.submit(rq)
         self.active_request = rq
 
         self.token_buf.clear()
+        self._gen_tokens.clear()
         self._terminal_pending = False
         self._terminal_error_code = None
         self._reset_stream_parser()
+        if _prompts_logger and lifecycle.is_deployment():
+            _prompts_logger.info(_tokenizer.detokenize(self.history_tokens))
         return True, None
 
     def abort(self) -> bool:
@@ -199,14 +248,23 @@ class _UserChatManager:
         emits assistant.response.done immediately so the frontend can stop its
         spinner deterministically.
         """
+        self._poll_active_request()  # capture any last-moment generated tokens
+
         had_active = (
-            self.active_request is not None or bool(self.token_buf) or bool(self._held_toks) or self._terminal_pending
+            self.active_request is not None
+            or bool(self.token_buf)
+            or bool(self._held_toks)
+            or bool(self._gen_tokens)
+            or self._terminal_pending
         )
 
         if self.active_request is not None:
             _scheduler.abort(self.active_request)
 
         self.active_request = None
+        # Persist whatever the model produced so far so history matches what the
+        # client was streamed before the abort.
+        self._commit_model_turn()
         self.token_buf.clear()
         self._terminal_pending = False
         self._terminal_error_code = None
@@ -235,6 +293,9 @@ class _UserChatManager:
         new_toks = rq.get_new_tokens()
         if new_toks:
             self.token_buf.extend(new_toks)
+            # Accumulate the verbatim model turn independently of the display
+            # drain, which consumes token_buf and holds back partial UTF-8.
+            self._gen_tokens.extend(new_toks)
 
         if rq.done:
             self.active_request = None
@@ -267,13 +328,13 @@ class _UserChatManager:
         UTF-8 tail) persists across calls via the instance, so chunked drains
         reconstruct the same result as a single pass.
 
-        Emitted fragments are streamed to the client and appended straight to
-        chat history; same-channel/cross-channel coalescing is left to the chat
-        template's normalization. Thought channels are persisted by default and
-        omitted only when drop_thoughts_from_history is set (they are always streamed).
+        This is purely the *display* path: emitted fragments are streamed to the
+        client. History is maintained separately and verbatim from the raw
+        generated tokens (see _commit_model_turn), so nothing here writes to it.
         """
         # TODO this parser only ever emits text ResponseFragments; it has no path to recognize a tool call in the
-        #  model's output and emit a ToolCall. Until that exists, tool calls the model generates are silently dropped.
+        #  model's output and emit a ToolCall, so tool calls the model generates are not surfaced as ToolCall events.
+        #  Their tokens are still retained verbatim in history.
         raw = self.token_buf
         self.token_buf = []
 
@@ -296,10 +357,7 @@ class _UserChatManager:
                 if held:
                     self._held_toks = held
                 if text:
-                    frag = tokenizer_mod.ResponseFragment(text, self._channel)
-                    out.append(frag)
-                    if self._channel != "thought" or not _config.drop_thoughts_from_history:
-                        self.chat_fragments.append(frag)
+                    out.append(tokenizer_mod.ResponseFragment(text, self._channel))
             run = []
 
         for t in toks:
@@ -337,10 +395,29 @@ class _UserChatManager:
 
     def _make_terminal_event(self) -> _UserChatManagerEvent:
         frags = self._drain_token_buffer_as_far_as_possible(final=True)
+        self._commit_model_turn()
         self._terminal_pending = False
         error_code = self._terminal_error_code
         self._terminal_error_code = None
         return _UserChatManagerEvent(frags, True, error_code)
+
+    def _commit_model_turn(self):
+        """
+        Commit the just-generated model turn onto history as verbatim tokens.
+
+        The opener `<|turn>model\n` is already in history (appended on submit) and
+        the model emits its own closing `<turn|>`, so the raw tokens are kept
+        exactly as generated — only the trailing newline that separates turns is
+        missing, since generation stops at `<turn|>` before it. With
+        drop_thoughts_from_history set, thought channels are spliced out.
+        Idempotent: clears the accumulator so repeat calls no-op.
+        """
+        body, self._gen_tokens = self._gen_tokens, []
+        if _config.drop_thoughts_from_history:
+            body = _strip_channel(body, "thought")
+        if body:
+            self.history_tokens.extend(body)
+            self.history_tokens.extend(_tokenizer.tokenize("\n", add_bos=False))
 
     async def _wait_for_change(self):
         async with self.change_cv:

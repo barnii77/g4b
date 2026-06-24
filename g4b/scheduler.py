@@ -19,7 +19,7 @@ class Request:
         initial_context_len: int = 0,
         max_context_len: int | None = None,
     ):
-        self.input_tokens = input_tokens
+        self.input_tokens = input_tokens.copy()
         self.done = False
         self._output_tokens: list[int] = []
         self._prev_retrieve_last_token_idx = 0
