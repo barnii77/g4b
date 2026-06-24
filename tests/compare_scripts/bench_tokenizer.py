@@ -1033,7 +1033,7 @@ tokenizer = Tokenizer(config, gguf_meta)
 # *_, tokenizer = load_model("/mnt/C/models/gemma-4-E4B-it-UD-Q4_K_XL.gguf")
 
 inp = []
-for i in range(10_000):
+for i in range(100_000):
     word = random.choice(words)
     inp.append(word)
     punct = random.choice("         .,_")
