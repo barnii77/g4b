@@ -615,6 +615,7 @@ def convert_to_fp32_tensor(tensor: gguf.GGUFTensor) -> torch.Tensor:
 
 
 class Tokenizer:
+    # TODO this tokenizer still implements the wrong algorithm and should really implement what my g4b tokenizer does
     def __init__(self, conf: TokenizerConfig):
         self._conf = conf
         self._str_to_tok: dict[str, int] = {tok: i for i, tok in enumerate(conf.tokens)}
