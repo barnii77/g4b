@@ -267,7 +267,7 @@ class Scheduler:
 
     @staticmethod
     def _notify(rq: Request):
-        # The websocket condition lives on the uvicorn loop, on a different thread
+        # The request condition lives on the uvicorn loop, on a different thread
         # than the scheduler. If notification fails, timeout-based draining still
         # makes progress.
         if rq._change_cv is None or rq._loop is None:

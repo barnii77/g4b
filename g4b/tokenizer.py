@@ -52,6 +52,8 @@ class Tokenizer:
         self.end_of_turn = self._str_to_tok["<turn|>"]
         self.start_of_channel = self._str_to_tok["<|channel>"]
         self.end_of_channel = self._str_to_tok["<channel|>"]
+        self.start_of_tool_call = self._str_to_tok.get("<|tool_call>")
+        self.end_of_tool_call = self._str_to_tok.get("<tool_call|>")
         self._gen_ending_tokens = [self.eos, self.end_of_turn]
         self._gen_ending_tokens_provider: GenEndingTokensProvider | None = None
 

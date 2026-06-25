@@ -16,7 +16,7 @@
     padding: 12px 16px; border-bottom: 1px solid #23262e;
     display: flex; align-items: center; gap: 10px; font-weight: 600;
   }
-  #status { width: 9px; height: 9px; border-radius: 50%; background: #888; }
+  #status { width: 9px; height: 9px; border-radius: 50%; background: #3fb950; }
   #status.on { background: #3fb950; }
   #status.off { background: #f85149; }
   #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
@@ -69,7 +69,8 @@ const abortBtn = document.getElementById("abort");
 const statusDot = document.getElementById("status");
 const tpsLabel = document.getElementById("tps");
 
-let ws, ready = false, busy = false, current = null;
+let ready = true, busy = false, current = null, abortController = null;
+let messages = [];
 
 // ---- TPS-paced streaming -------------------------------------------------
 // The server delivers text in bursts. We split each burst into token-ish
@@ -81,7 +82,7 @@ let ws, ready = false, busy = false, current = null;
 // a token as a word plus its leading whitespace. The displayed tok/s is thus an
 // approximation of the model's true token rate.
 let queue = [];          // {text, el} pieces awaiting display (el = target DOM node)
-let finished = false;    // server sent assistant.response.done
+let finished = false;    // server sent a terminal streaming chunk
 let raf = null;
 let tps = 0;             // smoothed tokens/sec estimate
 let budget = 0;          // fractional tokens we're allowed to release this frame
@@ -194,19 +195,6 @@ function flushNow() {
   finalize();
 }
 
-// Mirrors the server's _add_obfuscation: append a crypto-random base64 blob
-// whose byte length is a uniform sample from [L/2, 3L/2], L being the length
-// of the payload (compact JSON) before obfuscation.
-function obfuscated(payload) {
-  const l = JSON.stringify(payload).length;
-  const n = Math.round(l / 2 + Math.random() * l);
-  const bytes = new Uint8Array(Math.max(n, 0));
-  crypto.getRandomValues(bytes);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return { ...payload, obfuscation: btoa(bin) };
-}
-
 function setBusy(b) {
   busy = b;
   sendBtn.disabled = b || !ready;
@@ -257,47 +245,115 @@ function ensureThought() {
   return current._thoughtBody;
 }
 
-function connect() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(proto + "://" + location.host + "/api/v1/chat");
-  ws.onopen = () => {
-    statusDot.className = "on";
-    ws.send(JSON.stringify({ type: "user.init", chat: [] }));
-    ready = true;
-    setBusy(false);
-  };
-  ws.onclose = () => {
-    statusDot.className = "off";
-    ready = false; setBusy(false);
-    setTimeout(connect, 1500);
-  };
-  ws.onerror = () => ws.close();
-  ws.onmessage = (e) => {
-    let m;
-    try { m = JSON.parse(e.data); } catch { return; }
-    switch (m.type) {
-      case "assistant.response.chunk": {
-        if (!current) { current = startAssistant(); resetStream(); }
-        const pieces = tokenize(m.content);
-        if (pieces.length) {
-          const el = m.channel === "thought" ? ensureThought() : ensureAnswer();
-          for (const p of pieces) queue.push({ text: p, el });
-          onTokensArrived(pieces);
-          schedulePump();
-        }
-        break;
-      }
-      case "assistant.response.done":
-        // Let the queue drain, then finalize.
-        finished = true;
-        schedulePump();
-        break;
-      case "error":
-        flushNow();
-        addMsg("assistant", "[error " + m.code + "] " + (m.detail || ""));
-        break;
+function queueText(text, el) {
+  const pieces = tokenize(text || "");
+  if (!pieces.length) return;
+  for (const p of pieces) queue.push({ text: p, el });
+  onTokensArrived(pieces);
+  schedulePump();
+}
+
+function renderToolCalls(toolCalls) {
+  if (!toolCalls || !toolCalls.length) return;
+  const text = toolCalls.map((tc) => {
+    const fn = tc.function || {};
+    return "tool call: " + (fn.name || "(unknown)") + "\n" + (fn.arguments || "");
+  }).join("\n\n");
+  addMsg("assistant", text);
+}
+
+async function sendChatRequest() {
+  abortController = new AbortController();
+  let assistantMessage = { role: "assistant", content: "" };
+  current = startAssistant();
+  resetStream();
+
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "g4b",
+        messages,
+        stream: true,
+      }),
+      signal: abortController.signal,
+    });
+    if (!resp.ok) {
+      let detail = await resp.text();
+      try { detail = JSON.parse(detail).error?.message || detail; } catch {}
+      throw new Error(detail || ("HTTP " + resp.status));
     }
-  };
+    if (!resp.body) throw new Error("streaming response body missing");
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split;
+      while ((split = buffer.indexOf("\n\n")) !== -1) {
+        const event = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        for (const line of event.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6);
+          if (data === "[DONE]") {
+            finished = true;
+            schedulePump();
+            continue;
+          }
+
+          const chunk = JSON.parse(data);
+          for (const choice of chunk.choices || []) {
+            const delta = choice.delta || {};
+            if (delta.reasoning) {
+              assistantMessage.reasoning = (assistantMessage.reasoning || "") + delta.reasoning;
+              queueText(delta.reasoning, ensureThought());
+            }
+            if (delta.content) {
+              assistantMessage.content = (assistantMessage.content || "") + delta.content;
+              queueText(delta.content, ensureAnswer());
+            }
+            if (delta.tool_calls) {
+              assistantMessage.tool_calls = delta.tool_calls.map((tc) => ({
+                id: tc.id,
+                type: tc.type || "function",
+                function: {
+                  name: tc.function?.name || "",
+                  arguments: tc.function?.arguments || "",
+                },
+              }));
+            }
+            if (choice.finish_reason) {
+              finished = true;
+              schedulePump();
+            }
+          }
+        }
+      }
+    }
+
+    if (assistantMessage.tool_calls) {
+      renderToolCalls(assistantMessage.tool_calls);
+      assistantMessage.content = assistantMessage.content || null;
+    }
+    if (assistantMessage.content || assistantMessage.reasoning || assistantMessage.tool_calls) {
+      messages.push(assistantMessage);
+    }
+    finished = true;
+    schedulePump();
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      flushNow();
+      addMsg("assistant", "[error] " + err.message);
+    }
+  } finally {
+    abortController = null;
+  }
 }
 
 form.addEventListener("submit", (e) => {
@@ -305,16 +361,16 @@ form.addEventListener("submit", (e) => {
   const text = input.value.trim();
   if (!text || !ready || busy) return;
   addMsg("user", text);
-  ws.send(JSON.stringify(obfuscated({ type: "user.prompt", content: text })));
+  messages.push({ role: "user", content: text });
   input.value = "";
   input.style.height = "auto";
-  current = null;
   setBusy(true);
+  sendChatRequest();
 });
 
 abortBtn.addEventListener("click", () => {
-  if (ready && busy) {
-    ws.send(JSON.stringify(obfuscated({ type: "user.abort" })));
+  if (abortController) {
+    abortController.abort();
     flushNow();
   }
 });
@@ -327,7 +383,8 @@ input.addEventListener("input", () => {
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
 });
 
-connect();
+statusDot.className = "on";
+setBusy(false);
 </script>
 </body>
 </html>
