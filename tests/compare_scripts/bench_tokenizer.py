@@ -1021,7 +1021,6 @@ config = Config(
     host="127.0.0.1",
     port=8000,
     seed=1,
-    drop_thoughts_from_history=False,
     allow_sliding_global_context=False,
 )
 gguf_meta, gguf_tensors = gguf.load(config.gguf_path)

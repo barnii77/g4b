@@ -114,39 +114,6 @@ async def _notify_condition(cv: asyncio.Condition):
         cv.notify_all()
 
 
-def _strip_channel(tokens: list[int], drop: str) -> list[int]:
-    """Splice out every `<|channel>{drop}\n ... <channel|>` span (markers included)
-    from verbatim tokens, leaving other channels untouched. An unterminated span is
-    closed implicitly at the next channel/turn boundary, matching the display parser."""
-    out: list[int] = []
-    i, n = 0, len(tokens)
-    while i < n:
-        if tokens[i] != _tokenizer.start_of_channel:
-            out.append(tokens[i])
-            i += 1
-            continue
-        # Read the channel name: tokens after the marker up to the first newline.
-        j, name = i + 1, ""
-        while j < n and "\n" not in name:
-            name += _tokenizer.detokenize([tokens[j]])
-            j += 1
-        if name.split("\n", 1)[0].strip() != drop:
-            out.extend(tokens[i:j])  # keep this channel's marker + name verbatim
-            i = j
-            continue
-        # Drop this channel's body up to (and including) its closing marker.
-        stops = (
-            _tokenizer.end_of_channel,
-            _tokenizer.start_of_channel,
-            _tokenizer.start_of_turn,
-            _tokenizer.end_of_turn,
-        )
-        while j < n and tokens[j] not in stops:
-            j += 1
-        i = j + 1 if j < n and tokens[j] == _tokenizer.end_of_channel else j
-    return out
-
-
 class _UserChatManager:
     def __init__(self):
         # The running token prompt: BOS + system prefix + every turn so far. While
@@ -408,13 +375,10 @@ class _UserChatManager:
         The opener `<|turn>model\n` is already in history (appended on submit) and
         the model emits its own closing `<turn|>`, so the raw tokens are kept
         exactly as generated — only the trailing newline that separates turns is
-        missing, since generation stops at `<turn|>` before it. With
-        drop_thoughts_from_history set, thought channels are spliced out.
+        missing, since generation stops at `<turn|>`.
         Idempotent: clears the accumulator so repeat calls no-op.
         """
         body, self._gen_tokens = self._gen_tokens, []
-        if _config.drop_thoughts_from_history:
-            body = _strip_channel(body, "thought")
         if body:
             self.history_tokens.extend(body)
             self.history_tokens.extend(_tokenizer.tokenize("\n", add_bos=False))
