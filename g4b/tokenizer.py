@@ -1,10 +1,11 @@
 import re
-import json
 import heapq
+import hashlib
 from abc import ABC, abstractmethod
-from typing import Iterator, Sequence
-from dataclasses import dataclass
+from typing import Any, Iterator, Sequence
+from jinja2 import Template
 from g4b.gguf import GGUFMeta
+from g4b import protocol
 
 
 class GenEndingTokensProvider(ABC):
@@ -63,6 +64,14 @@ class Tokenizer:
     def _byte_token(b: int) -> str:
         return f"<0x{b:02X}>"
 
+    @staticmethod
+    def _with_special_spaces(s: str) -> str:
+        return s.replace(" ", "▁")
+
+    @staticmethod
+    def _without_special_spaces(s: str) -> str:
+        return s.replace("▁", " ")
+
     def _bpe_merge(self, pieces: Sequence[str]) -> list[str]:
         pieces: list[str | None] = list(pieces)
         merges, links = [], []
@@ -120,9 +129,9 @@ class Tokenizer:
 
         return [x for x in pieces if x is not None]
 
-    def tokenize(self, sequence: str, *, add_bos: bool = True, allow_special: bool = False) -> list[int]:
-        sequence = sequence.replace(" ", "▁")
-        out: list[int] = [self.bos] if add_bos else []
+    def tokenize(self, sequence: str, *, allow_special: bool = False) -> list[int]:
+        sequence = Tokenizer._with_special_spaces(sequence)
+        out: list[int] = []
         chunks = self._split_special_tokens(sequence) if allow_special else self._split_newline_chunks(sequence)
         for chunk in chunks:
             if isinstance(chunk, int):
@@ -139,6 +148,9 @@ class Tokenizer:
                 else:
                     out.extend(self._byte_to_tok[b] for b in piece.encode())
         return out
+
+    def split_special_tokens(self, sequence: str) -> Iterator[str | int]:
+        return self._split_special_tokens(Tokenizer._with_special_spaces(sequence))
 
     @classmethod
     def _split_newline_chunks(cls, sequence: str) -> Iterator[str]:
@@ -178,7 +190,7 @@ class Tokenizer:
         return out
 
     def detokenize(self, tokens: list[int]) -> str:
-        return self._tokens_to_bytes(tokens).decode(errors="replace").replace("▁", " ")
+        return Tokenizer._without_special_spaces(self._tokens_to_bytes(tokens).decode(errors="replace"))
 
     def detokenize_streaming(self, tokens: list[int], *, flush: bool) -> tuple[str, list[int]]:
         """
@@ -194,121 +206,141 @@ class Tokenizer:
         buf = self._tokens_to_bytes(tokens)
         hold = 0 if flush else _utf8_incomplete_tail_len(buf)
         if not hold:
-            return buf.decode(errors="replace").replace("▁", " "), []
-        text = buf[: len(buf) - hold].decode(errors="replace").replace("▁", " ")
+            return Tokenizer._without_special_spaces(buf.decode(errors="replace")), []
+        text = Tokenizer._without_special_spaces(buf[: len(buf) - hold].decode(errors="replace"))
         return text, tokens[len(tokens) - hold :]
-
-
-type ChatFragment = PromptFragment | ToolOutput | ResponseFragment | ToolCall
 
 
 class ChatTemplate:
     def __init__(self, meta: GGUFMeta, tokenizer: Tokenizer):
-        # TODO render tokenizer.chat_template instead of hardcoding the Gemma 4 prompt format below
         self._template: str = meta["tokenizer.chat_template"]
+        self._compiled_template = Template(self._template)
+        self._template_hash = hashlib.sha512(self._template.encode()).hexdigest()
         self._tokenizer = tokenizer
-        tok_text = lambda text: tokenizer.tokenize(text, add_bos=False, allow_special=False)
-        special = tokenizer._special_toks
-        self._start_of_turn = special["<|turn>"]
-        self._end_of_turn = special["<turn|>"]
-        self._start_of_channel = special["<|channel>"]
-        self._end_of_channel = special["<channel|>"]
-        self._think = special["<|think|>"]
-        self._newline = tok_text("\n")
-        self._user_turn_open = [self._start_of_turn, *tok_text("user\n")]
-        self._thought_channel_open = [self._start_of_channel, *tok_text("thought\n")]
-        self._conversation_init = [
-            self._start_of_turn,
-            *tok_text("system\n"),
-            self._think,
-            self._end_of_turn,
-            *self._newline,
-        ]
-        self._model_turn_open = [self._start_of_turn, *tok_text("model\n")]
-        self._turn_close = [self._end_of_turn, *self._newline]
 
-    def apply(
-        self,
-        chat_fragments: list[ChatFragment],
-        *,
-        include_conversation_init: bool = True,
-        include_open_turn_to_complete: bool = True,
-        add_bos: bool = True,
-    ) -> list[int]:
-        # TODO should be handled by prompt template
-        out = [self._tokenizer.bos] if add_bos else []
-        emit = out.extend
-        emit_text = lambda text: out.extend(self._tokenizer.tokenize(text, add_bos=False, allow_special=False))
-        if include_conversation_init:
-            emit(self._conversation_init)
+    def apply(self, messages: list[protocol.ChatMessage], tools: list[protocol.Tool] | None = None) -> list[int]:
+        placeholder_registry = _PlaceholderRegistry(self._template_hash)
+        rendered = self._compiled_template.render(
+            messages=[self._message_to_template_dict(m, placeholder_registry) for m in messages],
+            tools=[self._tool_to_template_dict(tool, placeholder_registry) for tool in tools or []],
+            bos_token=self._tokenizer._tok_to_str[self._tokenizer.bos],
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        mixed = self._tokenize_privileged(rendered)
+        return self._tokenize_mixed_unprivileged(placeholder_registry.replace_in_mixed(mixed))
 
-        i = 0
-        while i < len(chat_fragments):
-            frag = chat_fragments[i]
-            if isinstance(frag, PromptFragment):
-                emit(self._user_turn_open)
-                while i < len(chat_fragments) and isinstance(chat_fragments[i], PromptFragment):
-                    emit_text(chat_fragments[i].content)
-                    i += 1
-                emit(self._turn_close)
+    def _message_to_template_dict(
+        self, message: protocol.ChatMessage, placeholder_registry: "_PlaceholderRegistry"
+    ) -> dict[str, Any]:
+        out = message.model_dump(exclude_none=True)
+        self._placeholder_message_strings(out, placeholder_registry)
+        return out
+
+    def _placeholder_message_strings(self, message: dict[str, Any], placeholder_registry: "_PlaceholderRegistry"):
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = placeholder_registry.add(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    part["text"] = placeholder_registry.add(part["text"])
+
+        if isinstance(message.get("reasoning"), str):
+            message["reasoning"] = placeholder_registry.add(message["reasoning"])
+
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
                 continue
-            elif isinstance(frag, ResponseFragment):
-                # TODO maybe I shouldn't actually merge responses (thought or normal) that come from separate <|channel>'s
-                emit(self._model_turn_open)
-                last_channel = None
-                while i < len(chat_fragments) and isinstance(chat_fragments[i], ResponseFragment):
-                    response = chat_fragments[i]
-                    if response.channel == "thought":
-                        if last_channel != "thought":
-                            emit(self._thought_channel_open)
-                        emit_text(response.content)
-                    else:
-                        if last_channel == "thought":
-                            out.append(self._end_of_channel)
-                        emit_text(response.content)
-                    last_channel = response.channel
-                    i += 1
-                if last_channel == "thought":
-                    out.append(self._end_of_channel)
-                emit(self._turn_close)
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
                 continue
-            # TODO the two below are probably completely wrong
-            elif isinstance(frag, ToolOutput):
-                ...  # TODO
-            elif isinstance(frag, ToolCall):
-                ...  # TODO
-            i += 1
+            if isinstance(function.get("name"), str):
+                function["name"] = placeholder_registry.add(function["name"])
+            if isinstance(function.get("arguments"), str):
+                function["arguments"] = placeholder_registry.add(function["arguments"])
+            elif isinstance(function.get("arguments"), dict):
+                function["arguments"] = self._placeholder_schema_strings(function["arguments"], placeholder_registry)
 
-        if include_open_turn_to_complete:
-            out.extend(self._model_turn_open)
+    def _tool_to_template_dict(
+        self, tool: protocol.Tool, placeholder_registry: "_PlaceholderRegistry"
+    ) -> dict[str, Any]:
+        out = tool.model_dump(exclude_none=True)
+        function = out.get("function")
+        if isinstance(function, dict):
+            if isinstance(function.get("name"), str):
+                function["name"] = placeholder_registry.add(function["name"])
+            if isinstance(function.get("description"), str):
+                function["description"] = placeholder_registry.add(function["description"])
+            if isinstance(function.get("parameters"), dict):
+                function["parameters"] = self._placeholder_schema_strings(function["parameters"], placeholder_registry)
+            response = function.get("response")
+            if isinstance(response, dict):
+                function["response"] = self._placeholder_schema_strings(response, placeholder_registry)
+        return out
 
+    def _placeholder_schema_strings(self, value: Any, placeholder_registry: "_PlaceholderRegistry", key: str = ""):
+        if isinstance(value, str):
+            return value if key == "type" else placeholder_registry.add(value)
+        if isinstance(value, list):
+            return [self._placeholder_schema_strings(item, placeholder_registry, key) for item in value]
+        if isinstance(value, dict):
+            return {
+                item_key: self._placeholder_schema_strings(item_value, placeholder_registry, item_key)
+                for item_key, item_value in value.items()
+            }
+        return value
+
+    def _tokenize_privileged(self, text: str) -> list[int | str]:
+        return list(self._tokenizer.split_special_tokens(text))
+
+    def _tokenize_mixed_unprivileged(self, mixed: list[int | str]) -> list[int]:
+        out: list[int] = []
+        for item in mixed:
+            if isinstance(item, int):
+                out.append(item)
+            else:
+                out.extend(self._tokenizer.tokenize(item, allow_special=False))
         return out
 
 
-@dataclass(frozen=True)
-class PromptFragment:
-    content: str
+class _PlaceholderRegistry:
+    def __init__(self, template_hash: str):
+        self._prefix = f"{template_hash}-"
+        self._values_by_hash: dict[str, str] = {}
 
+    def add(self, value: str) -> str:
+        value_hash = hashlib.sha512(value.encode()).hexdigest()
+        previous = self._values_by_hash.setdefault(value_hash, value)
+        if previous != value:
+            raise AssertionError("sha512 collision while building chat-template placeholders")
+        return f"{self._prefix}{value_hash}-"
 
-@dataclass(frozen=True)
-class ToolOutput:
-    content: str
+    def replace_in_mixed(self, mixed: list[int | str]) -> list[int | str]:
+        return [self._replace_in_text(item) if isinstance(item, str) else item for item in mixed]
 
+    def _replace_in_text(self, text: str) -> str:
+        out: list[str] = []
+        i = 0
+        while True:
+            j = text.find(self._prefix, i)
+            if j == -1:
+                out.append(text[i:])
+                return "".join(out)
 
-@dataclass(frozen=True)
-class ResponseFragment:
-    content: str
-    channel: str | None
+            value_hash_start = j + len(self._prefix)
+            value_hash_end = value_hash_start + 128
+            if value_hash_end >= len(text) or text[value_hash_end] != "-":
+                raise AssertionError("template hash appeared outside a valid placeholder")
 
+            value_hash = text[value_hash_start:value_hash_end]
+            value = self._values_by_hash.get(value_hash)
+            if value is None:
+                raise AssertionError("chat-template placeholder referenced an unknown value hash")
 
-# TODO possibly this should store some predefined attributes that are definitely required like a name?
-@dataclass(frozen=True)
-class ToolCall:
-    call: dict
-
-    @property
-    def content(self) -> str:
-        return json.dumps(self.call)  # TODO model expects very different format actually
+            out.append(text[i:j])
+            out.append(value)
+            i = value_hash_end + 1
 
 
 def _utf8_incomplete_tail_len(b: bytes | bytearray) -> int:

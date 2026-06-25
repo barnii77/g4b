@@ -1,5 +1,6 @@
 from g4b.scheduler import Request, Scheduler
-from g4b.tokenizer import Tokenizer, ChatTemplate, PromptFragment, GenEndingTokensProvider
+from g4b.protocol import ChatMessage
+from g4b.tokenizer import Tokenizer, ChatTemplate, GenEndingTokensProvider
 
 PROMPTS = (
     "Hello. Give a short answer.",
@@ -34,7 +35,7 @@ def submit_generated_interactions(
         prompt = PROMPTS[i % len(PROMPTS)]
         if i % 2 == 0:
             prompt = _make_long_prompt(chat_template, prompt, max_prompt_tokens)
-        toks = chat_template.apply([PromptFragment(prompt)])
+        toks = chat_template.apply([ChatMessage(role="user", content=prompt)])
         if len(toks) < 2:
             toks = [tokenizer.bos, *toks, tokenizer.eos]
         toks = toks[: max(2, max_prompt_tokens)]
@@ -47,7 +48,7 @@ def _make_long_prompt(chat_template: ChatTemplate, prefix: str, target_tokens: i
     prompt = prefix + "\n"
     i = 0
     while True:
-        if len(chat_template.apply([PromptFragment(prompt)])) >= target_tokens:
+        if len(chat_template.apply([ChatMessage(role="user", content=prompt)])) >= target_tokens:
             return prompt
         prompt += GIBBERISH[i % len(GIBBERISH)]
         i += 1

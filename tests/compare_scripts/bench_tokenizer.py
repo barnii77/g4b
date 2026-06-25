@@ -1040,7 +1040,7 @@ for i in range(100_000):
 inp = "".join(inp)
 
 print("correctness assertion")
-tokenized = tokenizer.tokenize(inp, add_bos=False)
+tokenized = tokenizer.tokenize(inp)
 detokenized = tokenizer.detokenize(tokenized)
 if detokenized != inp:
     raise RuntimeError("tokenization or detokenization is broken")

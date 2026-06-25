@@ -12,8 +12,9 @@ import torch
 from g4b import device, gguf, lifecycle
 from g4b.config import Config
 from g4b.models import models
+from g4b.protocol import ChatMessage
 from g4b.scheduler import Request, Scheduler
-from g4b.tokenizer import ChatTemplate, PromptFragment, Tokenizer
+from g4b.tokenizer import ChatTemplate, Tokenizer
 from scripts import reference_impl as R
 
 
@@ -66,10 +67,14 @@ def g4b_topk(model, t_idx: int, topn: int):
         model.sampling_state.top_k_logits_scratchpad_B1__num_splits__top_k__dtsamp,
         torch.float32,
     )[0, 0].flatten()
-    partial_idx = tensor_to_torch(
-        model.sampling_state.top_k_idx_scratchpad_B1__num_splits__top_k__int32,
-        torch.int32,
-    )[0, 0].flatten().long()
+    partial_idx = (
+        tensor_to_torch(
+            model.sampling_state.top_k_idx_scratchpad_B1__num_splits__top_k__int32,
+            torch.int32,
+        )[0, 0]
+        .flatten()
+        .long()
+    )
     vals, order = torch.topk(partial_logits, min(topn, partial_logits.numel()))
     ids = partial_idx[order]
     softcap = model.lm_head.logit_softcap
@@ -255,7 +260,7 @@ def main():
             ref_model, ref_conf, _, _, _ = R.load_model(args.gguf)
             ref_model.eval()
 
-        toks = chat_template.apply([PromptFragment(args.prompt)])[: config.context_len]
+        toks = chat_template.apply([ChatMessage(role="user", content=args.prompt)])[: config.context_len]
         if len(toks) < 2:
             toks = [tokenizer.bos, *toks, tokenizer.eos]
         print("prompt tokens:", toks)
