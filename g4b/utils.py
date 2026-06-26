@@ -1,6 +1,11 @@
 import math
 import logging
+import shutil
+import subprocess
+import ctypes
+import tempfile
 from pathlib import Path
+from functools import cache
 from cuda.bindings import runtime as cudart
 from typing import Sequence
 from g4b.gguf import GGUFTensor
@@ -43,7 +48,7 @@ def canonicalize_shape_for_size(shape: Sequence[int], size: int) -> list[int]:
         return list(shape)
     dim_idx = shape.index(-1)
     dim_size = to_int_exact(size / -math.prod(shape))
-    return [*shape[:dim_idx], dim_size, *shape[dim_idx + 1 :]]
+    return [*shape[:dim_idx], dim_size, *shape[dim_idx + 1:]]
 
 
 def to_int_exact(x: int | float) -> int:
@@ -92,3 +97,27 @@ def shared_prefix_length(a: list, b: list) -> int:
 
 def floor_to_multiple_of(x: int, m: int) -> int:
     return x // m * m
+
+
+def get_cpp_compiler_path():
+    return (
+        shutil.which("c++")
+        or shutil.which("g++")
+        or shutil.which("clang++")
+        or runtime_error("C++ compiler missing")
+    )
+
+
+def compile_and_load_cpp(src: Path) -> ctypes.CDLL:
+    if not src.is_file():
+        raise RuntimeError("src must reference file")
+    cc = get_cpp_compiler_path()
+    dest = get_temp_dir() / src.name
+    cmd = [cc, src, "-O3", "-shared", "-fPIC", "-o", dest]
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+    return ctypes.cdll.LoadLibrary(str(dest))
+
+
+@cache
+def get_temp_dir() -> Path:
+    return Path(tempfile.gettempdir())

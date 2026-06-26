@@ -1,11 +1,15 @@
 import re
 import heapq
 import hashlib
+import warnings
+import ctypes
 from abc import ABC, abstractmethod
 from typing import Any, Iterator, Sequence
 from jinja2 import Template
+from pathlib import Path
+from functools import cache
 from g4b.gguf import GGUFMeta
-from g4b import protocol
+from g4b import protocol, utils
 
 
 class GenEndingTokensProvider(ABC):
@@ -13,6 +17,9 @@ class GenEndingTokensProvider(ABC):
     def get(self) -> list[int]: ...
 
 
+# TODO try to load and utilize the native tokenizer if possible. If compilation fails, use current python impl.
+#  the native tokenizer exposes a c api which requires calling create() and destroy() for resource management, and all
+#  python data must first be serialized into ctypes data in python explicitly to bridge the gap to C++ land.
 class Tokenizer:
     _NEWLINE_CHUNKS_RE = re.compile(r"[^\n]+|\n+")
 
@@ -56,6 +63,15 @@ class Tokenizer:
         self.end_of_tool_call = self._str_to_tok.get("<tool_call|>")
         self._gen_ending_tokens = [self.eos, self.end_of_turn]
         self._gen_ending_tokens_provider: GenEndingTokensProvider | None = None
+
+        try:
+            self._native_tokenizer_dll = _get_native_tokenizer_dll()
+        except Exception:
+            warnings.warn(
+                "Failed to compile and load native tokenizer: switching to python implementation. "
+                "This may be noticeably slower."
+            )
+            self._native_tokenizer_dll = None
 
     def gen_ending_tokens(self):
         if self._gen_ending_tokens_provider:
@@ -367,3 +383,8 @@ def _utf8_incomplete_tail_len(b: bytes | bytearray) -> int:
             return 0  # invalid lead byte; let errors="replace" deal with it
         return back if back < seq else 0
     return 0  # only continuation bytes seen (malformed); don't hold anything back
+
+
+@cache
+def _get_native_tokenizer_dll() -> ctypes.CDLL:
+    return utils.compile_and_load_cpp(Path(__file__).parent / "tokenizer.cpp")
