@@ -91,7 +91,7 @@ class Tokenizer:
     def _without_special_spaces(s: str) -> str:
         return s.replace("▁", " ")
 
-    def _bpe_merge(self, pieces: Sequence[str]) -> list[str]:
+    def _bpe_merge(self, pieces: str) -> list[str]:
         pieces: list[str | None] = list(pieces)
         merges, links = [], []
         for i, (a, b) in enumerate(zip(pieces, pieces[1:])):
