@@ -35,7 +35,7 @@ public:
 		return out;
 	}
 
-	void putAll(std::span<T> values) {
+	void put_all(std::span<T> values) {
 		std::lock_guard lk(m_mutex);
 		for (T &t: values)
 			m_queue.push(t);
@@ -188,7 +188,7 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 	auto &submission = m_submissions.at(submission_id);
 
 	// Enqueue jobs
-	m_jobs.putAll(jobs);
+	m_jobs.put_all(jobs);
 
 	// Await completion by workers
 	submission.jobs_left.wait();
