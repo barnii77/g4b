@@ -6,16 +6,17 @@
 #include <thread>
 #include <utility>
 #include <mutex>
+#include <atomic>
+#include <ranges>
+#include <numeric>
 #include <condition_variable>
+#include <latch>
 #include <queue>
 #include <unordered_map>
+#include <variant>
 #include <cstdint>
-
-#ifdef _MSC_VER
-#define _export extern "C" __cdecl
-#else
-#define _export extern "C" __attribute__((cdecl))
-#endif
+#include <cstddef>
+#include <cassert>
 
 template<typename T>
 class ThreadSafeQueue {
@@ -51,22 +52,51 @@ static inline token_pair_t make_token_pair(const token_t t1, const token_t t2) {
 }
 
 class Tokenizer {
-	ThreadSafeQueue<std::u32string> m_jobs{};
+	struct Job {
+		uint64_t submission_id;
+		uint64_t job_id;
+		std::u32string_view seq;
+	};
+
+	struct Solution {
+		uint64_t job_id;
+		std::vector<token_t> seq;
+	};
+
+	struct Submission {
+		uint64_t id;
+		std::latch jobs_left;
+		std::vector<Solution> solutions{};
+		std::mutex solutions_mutex{};
+
+		Submission(uint64_t id, uint64_t n_jobs);
+	};
+
+	std::unordered_map<uint64_t, Submission> m_submissions{};
+	std::mutex m_submissions_mutex{};
+	std::atomic_uint64_t m_next_submission_id{};
+
+	ThreadSafeQueue<Job> m_jobs{};
 	std::vector<std::thread> m_workers{};
-	std::unordered_map<std::u32string, token_t> m_normal_str_to_tok{};
-	std::unordered_map<std::u32string, token_t> m_special_str_to_tok{};
+
+	std::unordered_map<std::u32string_view, token_t> m_str_to_tok{};
+	std::unordered_map<std::u32string_view, token_t> m_special_str_to_tok{};
+	uint64_t m_max_special_token_str_len;
 	std::array<token_t, 256> m_byte_to_tok{};
 	std::unordered_map<token_pair_t, token_t> m_merges{};
 	token_t m_eos_id;
 
+	std::vector<std::u32string> m_string_pool{};
+
 public:
 	Tokenizer(std::span<std::span<utf32_t> > tokens, std::span<token_t> token_types,
 	          std::span<token_t> merges, token_t eos_id);
+
+	std::tuple<token_t *, uint64_t> tokenize(std::u32string_view seq, bool allow_special);
 };
 
-_export Tokenizer *create(utf32_t **tokens, const uint64_t *token_lengths, token_t *token_types,
-                          const uint64_t token_count, token_t *merges, const uint64_t merge_count,
-                          const token_t eos_id) {
+extern "C" void *create_tokenizer(utf32_t **tokens, const uint64_t *token_lengths, token_t *token_types,
+                        const uint64_t token_count, token_t *merges, const uint64_t merge_count, const token_t eos_id) {
 	std::vector<std::span<utf32_t> > tokens_;
 	tokens_.reserve(token_count);
 	for (size_t i = 0; i < token_count; i++)
@@ -74,28 +104,179 @@ _export Tokenizer *create(utf32_t **tokens, const uint64_t *token_lengths, token
 	return new Tokenizer{tokens_, std::span(token_types, token_count), std::span(merges, merge_count), eos_id};
 }
 
-_export void destroy(const Tokenizer *tokenizer) {
-	delete tokenizer;
+extern "C" void destroy_tokenizer(const void *tokenizer) {
+	delete static_cast<const Tokenizer *>(tokenizer);
 }
 
-// TODO impl
+extern "C" void tokenize(void *tokenizer, const utf32_t *sequence, const uint64_t length, token_t **out,
+                         uint64_t *out_length, const int32_t allow_special) {
+	auto *tokenizer_ = static_cast<Tokenizer *>(tokenizer);
+	const std::u32string_view seq{reinterpret_cast<const char32_t *>(sequence), length};
+	auto [out_p, out_len] = tokenizer_->tokenize(seq, allow_special);
+	*out = out_p;
+	*out_length = out_len;
+}
+
+extern "C" void destroy_tokens(const token_t *tokens) {
+	delete[] tokens;
+}
+
+std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, const bool allow_special) {
+	const uint64_t submission_id = m_next_submission_id.fetch_add(1, std::memory_order::relaxed);
+
+	// Split into chunks at runs of newlines and if allow_special, also at special tokens
+	std::vector<std::variant<token_t, Job> > tokens_or_jobs;
+	{
+		uint64_t next_job_id = 0;
+		std::u32string_view seq_after_prev_split = seq;
+		const auto append_normal_job_since_prev_split = [
+					&tokens_or_jobs, &next_job_id, &seq, &seq_after_prev_split, submission_id
+				] {
+			tokens_or_jobs.emplace_back(Job{
+				submission_id,
+				next_job_id++,
+				seq_after_prev_split.substr(0, seq_after_prev_split.length() - seq.length())
+			});
+		};
+		while (!seq.empty()) {
+			if (seq.starts_with('\n')) {
+				append_normal_job_since_prev_split();
+				// Consume run of newlines
+				const auto seq_orig = seq;
+				while (seq.starts_with('\n'))
+					seq = seq.substr(1);
+				if (const auto newlines = seq_orig.substr(0, seq_orig.length() - seq.length());
+					m_str_to_tok.contains(newlines)) {
+					tokens_or_jobs.emplace_back(m_str_to_tok.at(newlines));
+				} else {
+					tokens_or_jobs.emplace_back(Job{submission_id, next_job_id++, newlines});
+				}
+				seq_after_prev_split = seq;
+				continue;
+			}
+			if (allow_special) {
+				// Try consuming a special token
+				std::u32string_view head = seq.substr(0, m_max_special_token_str_len);
+				while (!head.empty()) {
+					if (m_special_str_to_tok.contains(head)) {
+						append_normal_job_since_prev_split();
+						tokens_or_jobs.emplace_back(m_special_str_to_tok.at(head));
+						seq = seq.substr(head.length());
+						seq_after_prev_split = seq;
+						continue;
+					}
+					head = head.substr(0, head.length() - 1);
+				}
+			}
+			// Normal char
+			seq = seq.substr(1);
+		}
+	}
+	std::vector<Job> jobs{};
+	for (const auto &x: tokens_or_jobs) {
+		if (std::holds_alternative<Job>(x)) {
+			jobs.emplace_back(std::get<Job>(x));
+		}
+	}
+
+	// Create submission
+	{
+		std::lock_guard lk(m_submissions_mutex);
+		m_submissions.erase(submission_id);
+		m_submissions.try_emplace(submission_id, submission_id, jobs.size());
+	}
+	auto &submission = m_submissions.at(submission_id);
+
+	// Enqueue jobs
+	m_jobs.putAll(jobs);
+
+	// Await completion by workers
+	submission.jobs_left.wait();
+
+	// Collect results and assemble the final output sequence
+	std::lock_guard lk(submission.solutions_mutex);
+	std::sort( // Sort to prepare for merge with tokens_or_jobs
+		submission.solutions.begin(), submission.solutions.end(),
+		[](const Solution &a, const Solution &b) { return a.job_id < b.job_id; }
+	);
+
+	// Allocate output buffer
+	size_t n_output_tokens =
+			std::count_if(
+				tokens_or_jobs.begin(), tokens_or_jobs.end(),
+				[](const auto &x) { return std::holds_alternative<token_t>(x); }
+			) + std::accumulate(
+				submission.solutions.begin(), submission.solutions.end(), 0,
+				[](const auto accum, const auto &sol) {
+					return accum + sol.seq.size();
+				}
+			);
+	auto *out = new token_t[n_output_tokens];
+	size_t out_i = 0;
+	const auto append_to_out = [&out, &out_i, &n_output_tokens](const std::span<token_t> tokens) {
+		if (out_i + tokens.size() >= n_output_tokens) {
+			// Reallocate
+			size_t new_n_output_tokens = n_output_tokens;
+			while (out_i + tokens.size() >= new_n_output_tokens)
+				new_n_output_tokens *= 2;
+			auto *new_out = new token_t[new_n_output_tokens];
+			std::copy_n(out, out_i, new_out);
+			delete[] out;
+			out = new_out;
+			n_output_tokens = new_n_output_tokens;
+		}
+		std::ranges::copy(tokens, &out[out_i]);
+		out_i += tokens.size();
+	};
+
+	// Merge in one pass
+	size_t solution_i = 0, toj_i = 0;
+	while (toj_i < tokens_or_jobs.size()) {
+		assert(solution_i <= submission.solutions.size());
+
+		if (std::holds_alternative<Job>(tokens_or_jobs.at(toj_i))) {
+			const std::span new_tokens = submission.solutions.at(solution_i).seq;
+			append_to_out(new_tokens);
+			solution_i++, toj_i++;
+		} else {
+			std::array new_tokens{std::get<token_t>(tokens_or_jobs.at(toj_i))};
+			append_to_out(new_tokens);
+			toj_i++;
+		}
+	}
+	assert(solution_i == submission.solutions.size());
+
+	return {out, out_i};
+}
+
+// TODO implement workers
+// TODO spawn worker threads in constructor
+// TODO kill worker threads in destructor
 
 Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::span<token_t> token_types,
-                     const std::span<token_t> merges, const token_t eos_id) : m_eos_id(eos_id) {
+                     const std::span<token_t> merges, const token_t eos_id)
+	: m_max_special_token_str_len(0), m_eos_id(eos_id) {
 	for (size_t i = 0; i < tokens.size(); i++) {
 		const std::u32string k{tokens[i].begin(), tokens[i].end()};
-		if (token_types[i] == 1)
-			m_normal_str_to_tok.emplace(k, i);
-		else
-			m_special_str_to_tok.emplace(k, i);
+		m_string_pool.emplace_back(k);
+		m_str_to_tok.emplace(m_string_pool.at(m_string_pool.size() - 1), i);
+		if (token_types[i] != 1) {
+			m_special_str_to_tok.emplace(m_string_pool.at(m_string_pool.size() - 1), i);
+			m_max_special_token_str_len = std::max(m_max_special_token_str_len, k.length());
+		}
 	}
 
 	for (size_t i = 0; i < 256; i++) {
 		std::string hex = std::format("<0x{:02X}>", i);
-		m_byte_to_tok[i] = m_normal_str_to_tok.at(std::u32string(hex.begin(), hex.end()));
+		m_byte_to_tok[i] = m_str_to_tok.at(std::u32string(hex.begin(), hex.end()));
 	}
 
 	m_merges.reserve(merges.size());
 	for (size_t i = 0; i < merges.size(); i += 3)
 		m_merges.emplace(make_token_pair(merges[i], merges[i + 1]), merges[i + 2]);
+}
+
+Tokenizer::Submission::Submission(const uint64_t id, const uint64_t n_jobs)
+	: id(id), jobs_left(std::latch(static_cast<std::ptrdiff_t>(n_jobs))) {
+	solutions.reserve(n_jobs);
 }
