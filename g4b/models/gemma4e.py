@@ -165,7 +165,7 @@ class LmHead:
     input_B1D_dtr: Tensor
     input_rsos_B1_dtss: Tensor
     logits_B1V_dtsamp: Tensor
-    logit_softcap: float  # TODO don't forget to epilogue fuse this into the residual->logits matmul
+    logit_softcap: float
 
 
 @dataclass(frozen=True)
@@ -193,7 +193,7 @@ class Gemma4E(Model):
     layers: list[DecoderLayer]
     lm_head: LmHead
     sampling_state: SamplingState
-    rmsnorm_epsilon: float  # TODO ensure all RMSNorms use the epsilon from the gguf file
+    rmsnorm_epsilon: float
     identity_rmsnorm_w_D_fp32: Tensor
 
     # runtime state
