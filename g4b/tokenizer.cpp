@@ -14,6 +14,7 @@
 #include <queue>
 #include <unordered_map>
 #include <variant>
+#include <exception>
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
@@ -23,13 +24,19 @@ class ThreadSafeQueue {
 	std::mutex m_mutex;
 	std::queue<T> m_queue;
 	std::condition_variable m_condition;
+	std::atomic_bool m_interrupted;
 
 public:
+	struct InterruptedError : std::exception {
+	};
+
 	ThreadSafeQueue() = default;
 
 	T get() {
 		std::unique_lock lk(m_mutex);
-		m_condition.wait(lk, [this] { return !m_queue.empty(); });
+		m_condition.wait(lk, [this] { return !m_queue.empty() || m_interrupted.load(); });
+		if (m_interrupted.load())
+			throw InterruptedError{};
 		const T out = m_queue.front();
 		m_queue.pop();
 		return out;
@@ -40,6 +47,10 @@ public:
 		for (T &t: values)
 			m_queue.push(t);
 		m_condition.notify_all();
+	}
+
+	void interrupt() {
+		m_interrupted.store(true);
 	}
 };
 
@@ -53,13 +64,13 @@ static inline token_pair_t make_token_pair(const token_t t1, const token_t t2) {
 
 class Tokenizer {
 	struct Job {
-		uint64_t submission_id;
-		uint64_t job_id;
+		uint64_t submission_id{};
+		uint64_t job_id{};
 		std::u32string_view seq;
 	};
 
 	struct Solution {
-		uint64_t job_id;
+		uint64_t job_id{};
 		std::vector<token_t> seq;
 	};
 
@@ -79,6 +90,8 @@ class Tokenizer {
 	ThreadSafeQueue<Job> m_jobs{};
 	std::vector<std::thread> m_workers{};
 
+	std::atomic_uint64_t m_num_workers_exited{};
+
 	std::unordered_map<std::u32string_view, token_t> m_str_to_tok{};
 	std::unordered_map<std::u32string_view, token_t> m_special_str_to_tok{};
 	uint64_t m_max_special_token_str_len;
@@ -88,15 +101,20 @@ class Tokenizer {
 
 	std::vector<std::u32string> m_string_pool{};
 
+	static void worker(Tokenizer &self);
+
 public:
 	Tokenizer(std::span<std::span<utf32_t> > tokens, std::span<token_t> token_types,
 	          std::span<token_t> merges, token_t eos_id);
+
+	~Tokenizer();
 
 	std::tuple<token_t *, uint64_t> tokenize(std::u32string_view seq, bool allow_special);
 };
 
 extern "C" void *create_tokenizer(utf32_t **tokens, const uint64_t *token_lengths, token_t *token_types,
-                        const uint64_t token_count, token_t *merges, const uint64_t merge_count, const token_t eos_id) {
+                                  const uint64_t token_count, token_t *merges, const uint64_t merge_count,
+                                  const token_t eos_id) {
 	std::vector<std::span<utf32_t> > tokens_;
 	tokens_.reserve(token_count);
 	for (size_t i = 0; i < token_count; i++)
@@ -249,9 +267,23 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 	return {out, out_i};
 }
 
-// TODO implement workers
-// TODO spawn worker threads in constructor
-// TODO kill worker threads in destructor
+void Tokenizer::worker(Tokenizer &self) {
+	while (true) {
+		// Fetch job
+		Job job;
+		try {
+			job = self.m_jobs.get();
+		} catch (ThreadSafeQueue<Job>::InterruptedError &) {
+			// Worker should exit
+			break;
+		}
+
+		// Process
+		// TODO port tokenizer algo over from python
+	}
+	self.m_num_workers_exited.fetch_add(1);
+	self.m_num_workers_exited.notify_all();
+}
 
 Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::span<token_t> token_types,
                      const std::span<token_t> merges, const token_t eos_id)
@@ -274,6 +306,20 @@ Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::spa
 	m_merges.reserve(merges.size());
 	for (size_t i = 0; i < merges.size(); i += 3)
 		m_merges.emplace(make_token_pair(merges[i], merges[i + 1]), merges[i + 2]);
+
+	const size_t n_workers = std::max(2 * std::thread::hardware_concurrency() / 3, 1u);
+	m_workers.reserve(n_workers);
+	for (size_t i = 0; i < n_workers; i++)
+		m_workers.emplace_back(worker, *this);
+}
+
+Tokenizer::~Tokenizer() {
+	// Terminate the workers gracefully
+	m_jobs.interrupt();
+	for (uint64_t num_workers_exited = 0; num_workers_exited != m_workers.size();
+	     num_workers_exited = m_num_workers_exited.load()) {
+		m_num_workers_exited.wait(num_workers_exited);
+	}
 }
 
 Tokenizer::Submission::Submission(const uint64_t id, const uint64_t n_jobs)
