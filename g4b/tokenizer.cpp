@@ -7,7 +7,6 @@
 #include <utility>
 #include <mutex>
 #include <atomic>
-#include <ranges>
 #include <numeric>
 #include <condition_variable>
 #include <latch>
@@ -89,19 +88,22 @@ class Tokenizer {
 
 	ThreadSafeQueue<Job> m_jobs{};
 	std::vector<std::thread> m_workers{};
-
 	std::atomic_uint64_t m_num_workers_exited{};
 
+	// Constant-after-load tokenizer state
 	std::unordered_map<std::u32string_view, token_t> m_str_to_tok{};
 	std::unordered_map<std::u32string_view, token_t> m_special_str_to_tok{};
 	uint64_t m_max_special_token_str_len;
 	std::array<token_t, 256> m_byte_to_tok{};
 	std::unordered_map<token_pair_t, token_t> m_merges{};
 	token_t m_eos_id;
-
 	std::vector<std::u32string> m_string_pool{};
 
-	static void worker(Tokenizer &self);
+	std::vector<token_t> merge(std::u32string_view seq);
+
+	void worker();
+
+	static void worker_wrapper(Tokenizer &self);
 
 public:
 	Tokenizer(std::span<std::span<utf32_t> > tokens, std::span<token_t> token_types,
@@ -212,77 +214,104 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 	submission.jobs_left.wait();
 
 	// Collect results and assemble the final output sequence
-	std::lock_guard lk(submission.solutions_mutex);
-	std::sort( // Sort to prepare for merge with tokens_or_jobs
-		submission.solutions.begin(), submission.solutions.end(),
-		[](const Solution &a, const Solution &b) { return a.job_id < b.job_id; }
-	);
+	token_t *out;
+	size_t out_i;
+	{
+		std::lock_guard lk(submission.solutions_mutex);
+		std::sort( // Sort to prepare for merge with tokens_or_jobs
+			submission.solutions.begin(), submission.solutions.end(),
+			[](const Solution &a, const Solution &b) { return a.job_id < b.job_id; }
+		);
 
-	// Allocate output buffer
-	size_t n_output_tokens =
-			std::count_if(
-				tokens_or_jobs.begin(), tokens_or_jobs.end(),
-				[](const auto &x) { return std::holds_alternative<token_t>(x); }
-			) + std::accumulate(
-				submission.solutions.begin(), submission.solutions.end(), 0,
-				[](const auto accum, const auto &sol) {
-					return accum + sol.seq.size();
-				}
-			);
-	auto *out = new token_t[n_output_tokens];
-	size_t out_i = 0;
-	const auto append_to_out = [&out, &out_i, &n_output_tokens](const std::span<token_t> tokens) {
-		if (out_i + tokens.size() >= n_output_tokens) {
-			// Reallocate
-			size_t new_n_output_tokens = n_output_tokens;
-			while (out_i + tokens.size() >= new_n_output_tokens)
-				new_n_output_tokens *= 2;
-			auto *new_out = new token_t[new_n_output_tokens];
-			std::copy_n(out, out_i, new_out);
-			delete[] out;
-			out = new_out;
-			n_output_tokens = new_n_output_tokens;
+		// Allocate output buffer
+		size_t n_output_tokens =
+				std::count_if(
+					tokens_or_jobs.begin(), tokens_or_jobs.end(),
+					[](const auto &x) { return std::holds_alternative<token_t>(x); }
+				) + std::accumulate(
+					submission.solutions.begin(), submission.solutions.end(), 0,
+					[](const auto accum, const auto &sol) {
+						return accum + sol.seq.size();
+					}
+				);
+		out = new token_t[n_output_tokens];
+		out_i = 0;
+		const auto append_to_out = [&out, &out_i, &n_output_tokens](const std::span<token_t> tokens) {
+			if (out_i + tokens.size() >= n_output_tokens) {
+				// Reallocate
+				size_t new_n_output_tokens = n_output_tokens;
+				while (out_i + tokens.size() >= new_n_output_tokens)
+					new_n_output_tokens *= 2;
+				auto *new_out = new token_t[new_n_output_tokens];
+				std::copy_n(out, out_i, new_out);
+				delete[] out;
+				out = new_out;
+				n_output_tokens = new_n_output_tokens;
+			}
+			std::ranges::copy(tokens, &out[out_i]);
+			out_i += tokens.size();
+		};
+
+		// Merge in one pass
+		size_t solution_i = 0, toj_i = 0;
+		while (toj_i < tokens_or_jobs.size()) {
+			assert(solution_i <= submission.solutions.size());
+
+			if (std::holds_alternative<Job>(tokens_or_jobs.at(toj_i))) {
+				const std::span new_tokens = submission.solutions.at(solution_i).seq;
+				append_to_out(new_tokens);
+				solution_i++, toj_i++;
+			} else {
+				std::array new_tokens{std::get<token_t>(tokens_or_jobs.at(toj_i))};
+				append_to_out(new_tokens);
+				toj_i++;
+			}
 		}
-		std::ranges::copy(tokens, &out[out_i]);
-		out_i += tokens.size();
-	};
-
-	// Merge in one pass
-	size_t solution_i = 0, toj_i = 0;
-	while (toj_i < tokens_or_jobs.size()) {
-		assert(solution_i <= submission.solutions.size());
-
-		if (std::holds_alternative<Job>(tokens_or_jobs.at(toj_i))) {
-			const std::span new_tokens = submission.solutions.at(solution_i).seq;
-			append_to_out(new_tokens);
-			solution_i++, toj_i++;
-		} else {
-			std::array new_tokens{std::get<token_t>(tokens_or_jobs.at(toj_i))};
-			append_to_out(new_tokens);
-			toj_i++;
-		}
+		assert(solution_i == submission.solutions.size());
 	}
-	assert(solution_i == submission.solutions.size());
+
+	{
+		std::lock_guard lk(m_submissions_mutex);
+		m_submissions.erase(submission_id);
+	}
 
 	return {out, out_i};
 }
 
-void Tokenizer::worker(Tokenizer &self) {
+std::vector<token_t> Tokenizer::merge(std::u32string_view seq) {
+	// TODO port tokenizer algo over from python
+	return {};
+}
+
+void Tokenizer::worker() {
+	const auto submit = [this] (const Job &job, std::vector<token_t> seq) {
+		std::lock_guard lk(m_submissions_mutex);
+		Submission &submission = m_submissions.at(job.submission_id);
+		submission.solutions.emplace_back(job.job_id, std::move(seq));
+		submission.jobs_left.count_down();
+	};
+
 	while (true) {
 		// Fetch job
 		Job job;
 		try {
-			job = self.m_jobs.get();
+			job = m_jobs.get();
 		} catch (ThreadSafeQueue<Job>::InterruptedError &) {
 			// Worker should exit
 			break;
 		}
 
 		// Process
-		// TODO port tokenizer algo over from python
+		assert(!job.seq.empty());
+		if (job.seq.at(0) == '\n' && m_str_to_tok.contains(job.seq)) {
+			// Newline sequences may not have bpe merge entries but still a token entry
+			submit(job, {m_str_to_tok.at(job.seq)});
+		} else {
+			submit(job, merge(job.seq));
+		}
 	}
-	self.m_num_workers_exited.fetch_add(1);
-	self.m_num_workers_exited.notify_all();
+	m_num_workers_exited.fetch_add(1);
+	m_num_workers_exited.notify_all();
 }
 
 Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::span<token_t> token_types,
@@ -310,7 +339,7 @@ Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::spa
 	const size_t n_workers = std::max(2 * std::thread::hardware_concurrency() / 3, 1u);
 	m_workers.reserve(n_workers);
 	for (size_t i = 0; i < n_workers; i++)
-		m_workers.emplace_back(worker, *this);
+		m_workers.emplace_back(worker_wrapper, *this);
 }
 
 Tokenizer::~Tokenizer() {
@@ -325,4 +354,8 @@ Tokenizer::~Tokenizer() {
 Tokenizer::Submission::Submission(const uint64_t id, const uint64_t n_jobs)
 	: id(id), jobs_left(std::latch(static_cast<std::ptrdiff_t>(n_jobs))) {
 	solutions.reserve(n_jobs);
+}
+
+void Tokenizer::worker_wrapper(Tokenizer &self) {
+	self.worker();
 }
