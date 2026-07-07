@@ -281,8 +281,35 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 	return {out, out_i};
 }
 
+static size_t unicode_codepoint_to_utf8(uint8_t buffer[4], const uint32_t code) {
+	if (code <= 0x7F) {
+		buffer[0] = code;
+		return 1;
+	}
+	if (code <= 0x7FF) {
+		buffer[0] = 0xC0 | (code >> 6); // 110xxxxx
+		buffer[1] = 0x80 | (code & 0x3F); // 10xxxxxx
+		return 2;
+	}
+	if (code <= 0xFFFF) {
+		buffer[0] = 0xE0 | (code >> 12); // 1110xxxx
+		buffer[1] = 0x80 | ((code >> 6) & 0x3F); // 10xxxxxx
+		buffer[2] = 0x80 | (code & 0x3F); // 10xxxxxx
+		return 3;
+	}
+	if (code <= 0x10FFFF) {
+		buffer[0] = 0xF0 | (code >> 18); // 11110xxx
+		buffer[1] = 0x80 | ((code >> 12) & 0x3F); // 10xxxxxx
+		buffer[2] = 0x80 | ((code >> 6) & 0x3F); // 10xxxxxx
+		buffer[3] = 0x80 | (code & 0x3F); // 10xxxxxx
+		return 4;
+	}
+	return 0;
+}
+
 std::vector<token_t> Tokenizer::merge(const std::u32string_view seq) {
 	assert(seq.length() <= std::numeric_limits<uint32_t>::max());
+	constexpr uint32_t token_is_unknown_unicode_bit = 1u << 31;
 
 	struct Piece {
 		token_t token;
@@ -323,7 +350,7 @@ std::vector<token_t> Tokenizer::merge(const std::u32string_view seq) {
 		} else {
 			// Code point is not a valid token. Will need to decompose into bytes later. However, I must not do it now
 			//  since that may cause merging with other tokens, which is incorrect tokenization (even if subtle).
-			token = static_cast<uint32_t>(seq[i]) | (1u << 31);
+			token = static_cast<uint32_t>(seq[i]) | token_is_unknown_unicode_bit;
 		}
 		uint32_t prev = i - 1; // overflows to UINT32_MAX naturally
 		uint32_t next = i + 1 < seq.length() ? i + 1 : -1;
@@ -369,7 +396,26 @@ std::vector<token_t> Tokenizer::merge(const std::u32string_view seq) {
 			try_add_merge(merges, merge.i, &a, c, m_merges);
 	}
 
-	return {};
+	std::vector<token_t> out;
+	out.reserve(pieces.size() + pieces.size() / 8); // alloc with safety margin for splitting some tokens into bytes
+	for (const Piece &p: pieces) {
+		if (p.token == -1) continue;
+		if (p.token & token_is_unknown_unicode_bit) {
+			// This is not actually a token, it's just a Unicode codepoint without a corresponding token.
+			//  Must be decomposed into tokens representing its individual bytes depending on how many it has.
+			const token_t codepoint = p.token & ~token_is_unknown_unicode_bit;
+			uint8_t buffer[4];
+			const size_t n_bytes = unicode_codepoint_to_utf8(buffer, codepoint);
+			for (size_t i = 0; i < n_bytes; i++) {
+				out.emplace_back(m_byte_to_tok[buffer[i]]);
+			}
+		} else {
+			out.emplace_back(p.token);
+		}
+	}
+
+	out.shrink_to_fit();
+	return out;
 }
 
 void Tokenizer::worker() {

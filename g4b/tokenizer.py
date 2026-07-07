@@ -21,6 +21,7 @@ class GenEndingTokensProvider(ABC):
 #  the native tokenizer exposes a c api which requires calling create() and destroy() for resource management, and all
 #  python data must first be serialized into ctypes data in python explicitly to bridge the gap to C++ land.
 #  The native impl must include _split_special_tokens, so the entire Tokenizer.tokenize method should be native E2E.
+# TODO ensure I utf32-le encode (i.e. without a BOM) before passing stuff to C++ tokenizer
 class Tokenizer:
     _NEWLINE_CHUNKS_RE = re.compile(r"[^\n]+|\n+")
 
