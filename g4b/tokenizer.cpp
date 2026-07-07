@@ -8,6 +8,7 @@
 #include <mutex>
 #include <atomic>
 #include <numeric>
+#include <limits>
 #include <condition_variable>
 #include <latch>
 #include <queue>
@@ -95,7 +96,7 @@ class Tokenizer {
 	std::unordered_map<std::u32string_view, token_t> m_special_str_to_tok{};
 	uint64_t m_max_special_token_str_len;
 	std::array<token_t, 256> m_byte_to_tok{};
-	std::unordered_map<token_pair_t, token_t> m_merges{};
+	std::unordered_map<token_pair_t, std::tuple<uint32_t, token_t> > m_merges{};
 	token_t m_eos_id;
 	std::vector<std::u32string> m_string_pool{};
 
@@ -165,9 +166,10 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 				const auto seq_orig = seq;
 				while (seq.starts_with('\n'))
 					seq = seq.substr(1);
+				decltype(m_str_to_tok)::iterator it;
 				if (const auto newlines = seq_orig.substr(0, seq_orig.length() - seq.length());
-					m_str_to_tok.contains(newlines)) {
-					tokens_or_jobs.emplace_back(m_str_to_tok.at(newlines));
+					(it = m_str_to_tok.find(newlines)) != m_str_to_tok.end()) {
+					tokens_or_jobs.emplace_back(it->second);
 				} else {
 					tokens_or_jobs.emplace_back(Job{submission_id, next_job_id++, newlines});
 				}
@@ -178,9 +180,10 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 				// Try consuming a special token
 				std::u32string_view head = seq.substr(0, m_max_special_token_str_len);
 				while (!head.empty()) {
-					if (m_special_str_to_tok.contains(head)) {
+					if (decltype(m_special_str_to_tok)::iterator it;
+						(it = m_special_str_to_tok.find(head)) != m_special_str_to_tok.end()) {
 						append_normal_job_since_prev_split();
-						tokens_or_jobs.emplace_back(m_special_str_to_tok.at(head));
+						tokens_or_jobs.emplace_back(it->second);
 						seq = seq.substr(head.length());
 						seq_after_prev_split = seq;
 						continue;
@@ -278,13 +281,99 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 	return {out, out_i};
 }
 
-std::vector<token_t> Tokenizer::merge(std::u32string_view seq) {
-	// TODO port tokenizer algo over from python
+std::vector<token_t> Tokenizer::merge(const std::u32string_view seq) {
+	assert(seq.length() <= std::numeric_limits<uint32_t>::max());
+
+	struct Piece {
+		token_t token;
+		uint32_t prev;
+		uint32_t next;
+	};
+
+	struct Merge {
+		uint32_t rank;
+		uint32_t i;
+		uint32_t a;
+		uint32_t b;
+	};
+
+	auto merge_cmp = [](const Merge &l, const Merge &r) { return l.rank < r.rank; };
+
+	auto try_add_merge = [](
+		std::priority_queue<Merge, std::vector<Merge>, decltype(merge_cmp)> &merges, const uint32_t ai, const Piece *a,
+		const Piece *b, const std::unordered_map<token_pair_t, std::tuple<uint32_t, token_t> > &merge_map
+	) {
+		if (!a || !b) return;
+		const auto m = merge_map.find(make_token_pair(a->token, b->token));
+		if (m == merge_map.end()) return;
+		const uint32_t rank = std::get<0>(m->second);
+		merges.push(Merge{rank, ai, a->token, b->token});
+	};
+
+	std::vector<Piece> pieces;
+	std::priority_queue<Merge, std::vector<Merge>, decltype(merge_cmp)> merges{merge_cmp};
+	pieces.reserve(seq.length());
+
+	token_t prev_token = -1;
+	for (uint32_t i = 0; i < seq.length(); i++) {
+		token_t token;
+		if (const auto it = m_str_to_tok.find(seq.substr(i, 1));
+			it != m_str_to_tok.end()) {
+			token = it->second;
+		} else {
+			// Code point is not a valid token. Will need to decompose into bytes later. However, I must not do it now
+			//  since that may cause merging with other tokens, which is incorrect tokenization (even if subtle).
+			token = static_cast<uint32_t>(seq[i]) | (1u << 31);
+		}
+		uint32_t prev = i - 1; // overflows to UINT32_MAX naturally
+		uint32_t next = i + 1 < seq.length() ? i + 1 : -1;
+		pieces.emplace_back(token, prev, next);
+
+		if (const auto it = m_merges.find(make_token_pair(prev_token, token));
+			it != m_merges.end()) {
+			const uint32_t rank = std::get<0>(it->second);
+			merges.push(Merge{rank, i - 1, prev_token, token});
+		}
+		prev_token = token;
+	}
+
+	while (!merges.empty()) {
+		const Merge merge = merges.top();
+		merges.pop();
+
+		// Load and check if stale
+		Piece &a = pieces.at(merge.i);
+		if (a.token != merge.a) continue;
+		Piece &b = pieces.at(a.next);
+		if (b.token != merge.b) continue;
+
+		// Check if mergeable
+		const auto m = m_merges.find(make_token_pair(a.token, b.token));
+		if (m == m_merges.end()) continue;
+
+		// Merge
+		a.token = std::get<1>(m->second);
+		b.token = -1;
+
+		// Unlink b
+		a.next = b.next;
+		Piece *c = b.next != -1 ? &pieces.at(b.next) : nullptr;
+		if (c) c->prev = b.prev;
+		b.next = -1;
+		b.prev = -1;
+
+		// Try to add merges if pieces have neighbors
+		if (const Piece *aa = a.prev != -1 ? &pieces.at(a.prev) : nullptr)
+			try_add_merge(merges, a.prev, aa, &a, m_merges);
+		if (c)
+			try_add_merge(merges, merge.i, &a, c, m_merges);
+	}
+
 	return {};
 }
 
 void Tokenizer::worker() {
-	const auto submit = [this] (const Job &job, std::vector<token_t> seq) {
+	const auto submit = [this](const Job &job, std::vector<token_t> seq) {
 		std::lock_guard lk(m_submissions_mutex);
 		Submission &submission = m_submissions.at(job.submission_id);
 		submission.solutions.emplace_back(job.job_id, std::move(seq));
@@ -303,9 +392,10 @@ void Tokenizer::worker() {
 
 		// Process
 		assert(!job.seq.empty());
-		if (job.seq.at(0) == '\n' && m_str_to_tok.contains(job.seq)) {
+		if (decltype(m_str_to_tok)::iterator it;
+			job.seq.at(0) == '\n' && (it = m_str_to_tok.find(job.seq)) != m_str_to_tok.end()) {
 			// Newline sequences may not have bpe merge entries but still a token entry
-			submit(job, {m_str_to_tok.at(job.seq)});
+			submit(job, {it->second});
 		} else {
 			submit(job, merge(job.seq));
 		}
@@ -334,12 +424,14 @@ Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::spa
 
 	m_merges.reserve(merges.size());
 	for (size_t i = 0; i < merges.size(); i += 3)
-		m_merges.emplace(make_token_pair(merges[i], merges[i + 1]), merges[i + 2]);
+		m_merges.emplace(make_token_pair(merges[i], merges[i + 1]), std::tuple{i / 3, merges[i + 2]});
 
 	const size_t n_workers = std::max(2 * std::thread::hardware_concurrency() / 3, 1u);
 	m_workers.reserve(n_workers);
 	for (size_t i = 0; i < n_workers; i++)
 		m_workers.emplace_back(worker_wrapper, *this);
+
+	assert(m_str_to_tok.size() <= std::numeric_limits<uint32_t>::max() / 4); // upper bits used by tokenizer
 }
 
 Tokenizer::~Tokenizer() {
