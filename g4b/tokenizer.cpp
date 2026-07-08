@@ -104,7 +104,7 @@ class Tokenizer {
 
 	void worker();
 
-	static void worker_wrapper(Tokenizer &self);
+	static void worker_wrapper(Tokenizer *self);
 
 public:
 	Tokenizer(std::span<std::span<utf32_t> > tokens, std::span<token_t> token_types,
@@ -475,7 +475,7 @@ Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::spa
 	const size_t n_workers = std::max(2 * std::thread::hardware_concurrency() / 3, 1u);
 	m_workers.reserve(n_workers);
 	for (size_t i = 0; i < n_workers; i++)
-		m_workers.emplace_back(worker_wrapper, *this);
+		m_workers.emplace_back(worker_wrapper, this);
 
 	assert(m_str_to_tok.size() <= std::numeric_limits<uint32_t>::max() / 4); // upper bits used by tokenizer
 }
@@ -494,6 +494,6 @@ Tokenizer::Submission::Submission(const uint64_t id, const uint64_t n_jobs)
 	solutions.reserve(n_jobs);
 }
 
-void Tokenizer::worker_wrapper(Tokenizer &self) {
-	self.worker();
+void Tokenizer::worker_wrapper(Tokenizer *self) {
+	self->worker();
 }
