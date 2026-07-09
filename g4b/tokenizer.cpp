@@ -154,11 +154,9 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 		const auto append_normal_job_since_prev_split = [
 					&tokens_or_jobs, &next_job_id, &seq, &seq_after_prev_split, submission_id
 				] {
-			tokens_or_jobs.emplace_back(Job{
-				submission_id,
-				next_job_id++,
-				seq_after_prev_split.substr(0, seq_after_prev_split.length() - seq.length())
-			});
+			if (const auto slice = seq_after_prev_split.substr(0, seq_after_prev_split.length() - seq.length());
+				!slice.empty())
+				tokens_or_jobs.emplace_back(Job{submission_id, next_job_id++, slice});
 		};
 		while (!seq.empty()) {
 			if (seq.starts_with('\n')) {
