@@ -117,7 +117,9 @@ def compile_and_load_cpp(src: Path) -> ctypes.CDLL:
     cc = get_cpp_compiler_path()
     dest = get_temp_dir() / src.name
     cmd = [cc, src, "-O3", "-shared", "-fPIC", "-o", dest]
-    if not G4B_DBG:
+    if G4B_DBG:
+        cmd += ["-g"]  # debug symbols
+    else:
         cmd += ["-DNDEBUG"]  # skip assertions
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
     return ctypes.cdll.LoadLibrary(str(dest))
