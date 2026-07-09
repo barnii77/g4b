@@ -178,7 +178,7 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 			}
 			if (allow_special) {
 				// Try consuming a special token
-				std::u32string_view head = seq.substr(0, m_max_special_token_str_len);
+				std::u32string_view head = seq.substr(0, std::min(m_max_special_token_str_len, seq.length()));
 				while (!head.empty()) {
 					if (decltype(m_special_str_to_tok)::iterator it;
 						(it = m_special_str_to_tok.find(head)) != m_special_str_to_tok.end()) {
@@ -186,14 +186,16 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 						tokens_or_jobs.emplace_back(it->second);
 						seq = seq.substr(head.length());
 						seq_after_prev_split = seq;
-						continue;
+						break;
 					}
 					head = head.substr(0, head.length() - 1);
 				}
+				continue;
 			}
 			// Normal char
 			seq = seq.substr(1);
 		}
+		append_normal_job_since_prev_split();
 	}
 	std::vector<Job> jobs{};
 	for (const auto &x: tokens_or_jobs) {
