@@ -8,7 +8,7 @@ dist/
 *.egg-info/
 tmp/
 worklog/
-cmake-build-debug/
-CMakeLists.txt
 .agents/
 .codex/
+cmake-build-debug/
+cmake-build-release/
