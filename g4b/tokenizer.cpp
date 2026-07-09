@@ -51,6 +51,7 @@ public:
 
 	void interrupt() {
 		m_interrupted.store(true);
+		m_condition.notify_all();
 	}
 };
 
