@@ -168,6 +168,7 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 				decltype(m_str_to_tok)::iterator it;
 				if (const auto newlines = seq_orig.substr(0, seq_orig.length() - seq.length());
 					(it = m_str_to_tok.find(newlines)) != m_str_to_tok.end()) {
+					// Newline sequences may not have bpe merge entries but still a token entry
 					tokens_or_jobs.emplace_back(it->second);
 				} else {
 					tokens_or_jobs.emplace_back(Job{submission_id, next_job_id++, newlines});
@@ -437,13 +438,8 @@ void Tokenizer::worker() {
 
 		// Process
 		assert(!job.seq.empty());
-		if (decltype(m_str_to_tok)::iterator it;
-			job.seq.at(0) == '\n' && (it = m_str_to_tok.find(job.seq)) != m_str_to_tok.end()) {
-			// Newline sequences may not have bpe merge entries but still a token entry
-			submit(job, {it->second});
-		} else {
-			submit(job, merge(job.seq));
-		}
+		assert(job.seq.at(0) != '\n' || !m_str_to_tok.contains(job.seq)); // should be handled by preprocessing
+		submit(job, merge(job.seq));
 	}
 }
 
