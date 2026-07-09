@@ -17,11 +17,6 @@ class GenEndingTokensProvider(ABC):
     def get(self) -> list[int]: ...
 
 
-# TODO try to load and utilize the native tokenizer if possible. If compilation fails, use current python impl.
-#  the native tokenizer exposes a c api which requires calling create() and destroy() for resource management, and all
-#  python data must first be serialized into ctypes data in python explicitly to bridge the gap to C++ land.
-#  The native impl must include _split_special_tokens, so the entire Tokenizer.tokenize method should be native E2E.
-# TODO ensure I utf32-le encode (i.e. without a BOM) before passing stuff to C++ tokenizer
 class Tokenizer:
     _NEWLINE_CHUNKS_RE = re.compile(r"[^\n]+|\n+")
 
@@ -65,15 +60,64 @@ class Tokenizer:
         self.end_of_tool_call = self._str_to_tok.get("<tool_call|>")
         self._gen_ending_tokens = [self.eos, self.end_of_turn]
         self._gen_ending_tokens_provider: GenEndingTokensProvider | None = None
+        self._native_tokenizer_dll: ctypes.CDLL | None = None
+        self._native_tokenizer: int | None = None
 
         try:
-            self._native_tokenizer_dll = _get_native_tokenizer_dll()
-        except Exception:
+            self._init_native_tokenizer(token_types)
+        except Exception as e:
             warnings.warn(
-                "Failed to compile and load native tokenizer: switching to python implementation. "
-                "This may be noticeably slower."
+                f"Failed to initialize native tokenizer: switching to python implementation. "
+                f"This may be noticeably slower. ({e})",
+                stacklevel=2,
             )
-            self._native_tokenizer_dll = None
+
+    def __del__(self):
+        self._destroy_native_tokenizer()
+
+    def _init_native_tokenizer(self, token_types: Sequence[int]):
+        dll = _get_native_tokenizer_dll()
+        _configure_native_tokenizer_dll(dll)
+
+        token_buffers = [_NativeUtf32Buffer(tok) for tok in self._tok_to_str]
+        token_ptrs = (ctypes.POINTER(_C_UTF32) * len(token_buffers))(
+            *(buf.ptr for buf in token_buffers)
+        )
+        token_lengths = (_C_UINT64 * len(token_buffers))(*(buf.length for buf in token_buffers))
+
+        special_token_ids = set(self._special_toks.values())
+        native_token_types = (_C_TOKEN * len(token_types))(
+            *(3 if tok_id in special_token_ids else 1 for tok_id in range(len(token_types)))
+        )
+
+        native_merges: list[int] = []
+        for (a, b), _ in sorted(self._merges.items(), key=lambda item: item[1]):
+            try:
+                native_merges.extend((self._str_to_tok[a], self._str_to_tok[b], self._str_to_tok[a + b]))
+            except KeyError as e:
+                raise RuntimeError(f"native tokenizer merge references missing token: {e}") from e
+        native_merges_buf = (_C_TOKEN * len(native_merges))(*native_merges)
+
+        tokenizer = dll.create_tokenizer(
+            token_ptrs,
+            token_lengths,
+            native_token_types,
+            len(token_buffers),
+            native_merges_buf,
+            len(native_merges),
+            self.eos,
+        )
+        if not tokenizer:
+            raise RuntimeError("native tokenizer constructor returned null")
+
+        self._native_tokenizer_dll = dll
+        self._native_tokenizer = tokenizer
+
+    def _destroy_native_tokenizer(self):
+        if self._native_tokenizer is None or self._native_tokenizer_dll is None:
+            return
+        self._native_tokenizer_dll.destroy_tokenizer(self._native_tokenizer)
+        self._native_tokenizer = None
 
     def gen_ending_tokens(self):
         if self._gen_ending_tokens_provider:
@@ -150,6 +194,9 @@ class Tokenizer:
         return [x for x in pieces if x is not None]
 
     def tokenize(self, sequence: str, *, allow_special: bool = False) -> list[int]:
+        if self._native_tokenizer is not None:
+            return self._native_tokenize(sequence, allow_special=allow_special)
+
         sequence = Tokenizer._with_special_spaces(sequence)
         out: list[int] = []
         chunks = self._split_special_tokens(sequence) if allow_special else self._split_newline_chunks(sequence)
@@ -168,6 +215,27 @@ class Tokenizer:
                 else:
                     out.extend(self._byte_to_tok[b] for b in piece.encode())
         return out
+
+    def _native_tokenize(self, sequence: str, *, allow_special: bool) -> list[int]:
+        assert self._native_tokenizer is not None
+        assert self._native_tokenizer_dll is not None
+
+        sequence_buf = _NativeUtf32Buffer(Tokenizer._with_special_spaces(sequence))
+        out = ctypes.POINTER(_C_TOKEN)()
+        out_length = _C_UINT64()
+        self._native_tokenizer_dll.tokenize(
+            self._native_tokenizer,
+            sequence_buf.ptr,
+            sequence_buf.length,
+            ctypes.byref(out),
+            ctypes.byref(out_length),
+            int(allow_special),
+        )
+        try:
+            return [out[i] for i in range(out_length.value)]
+        finally:
+            if out:
+                self._native_tokenizer_dll.destroy_tokens(out)
 
     def split_special_tokens(self, sequence: str) -> Iterator[str | int]:
         return self._split_special_tokens(Tokenizer._with_special_spaces(sequence))
@@ -385,6 +453,54 @@ def _utf8_incomplete_tail_len(b: bytes | bytearray) -> int:
             return 0  # invalid lead byte; let errors="replace" deal with it
         return back if back < seq else 0
     return 0  # only continuation bytes seen (malformed); don't hold anything back
+
+
+_C_UTF32 = ctypes.c_uint32
+_C_TOKEN = ctypes.c_uint32
+_C_UINT64 = ctypes.c_uint64
+
+_pybytes_as_string = ctypes.pythonapi.PyBytes_AsString
+_pybytes_as_string.argtypes = [ctypes.py_object]
+_pybytes_as_string.restype = ctypes.c_void_p
+
+
+class _NativeUtf32Buffer:
+    def __init__(self, s: str):
+        self._data = s.encode("utf-32-le")
+        self.length = len(self._data) // ctypes.sizeof(_C_UTF32)
+        self.ptr = ctypes.cast(_pybytes_as_string(self._data), ctypes.POINTER(_C_UTF32))
+
+
+def _configure_native_tokenizer_dll(dll: ctypes.CDLL):
+    token_ptr = ctypes.POINTER(_C_TOKEN)
+    utf32_ptr = ctypes.POINTER(_C_UTF32)
+
+    dll.create_tokenizer.argtypes = [
+        ctypes.POINTER(utf32_ptr),
+        ctypes.POINTER(_C_UINT64),
+        token_ptr,
+        _C_UINT64,
+        token_ptr,
+        _C_UINT64,
+        _C_TOKEN,
+    ]
+    dll.create_tokenizer.restype = ctypes.c_void_p
+
+    dll.destroy_tokenizer.argtypes = [ctypes.c_void_p]
+    dll.destroy_tokenizer.restype = None
+
+    dll.tokenize.argtypes = [
+        ctypes.c_void_p,
+        utf32_ptr,
+        _C_UINT64,
+        ctypes.POINTER(token_ptr),
+        ctypes.POINTER(_C_UINT64),
+        ctypes.c_int32,
+    ]
+    dll.tokenize.restype = None
+
+    dll.destroy_tokens.argtypes = [token_ptr]
+    dll.destroy_tokens.restype = None
 
 
 @cache

@@ -143,6 +143,7 @@ extern "C" void destroy_tokens(const token_t *tokens) {
 }
 
 std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, const bool allow_special) {
+	// TODO I should probably handle space to special Unicode space conversion (see _with_special_spaces) here, fused
 	const uint64_t submission_id = m_next_submission_id.fetch_add(1, std::memory_order::relaxed);
 
 	// Split into chunks at runs of newlines and if allow_special, also at special tokens
