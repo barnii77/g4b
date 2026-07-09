@@ -11,7 +11,7 @@ from g4b.scheduler import Scheduler
 from g4b.tensor import Tensor, float32, float16, int8, int32, uint8
 from g4b.config import Config
 from g4b.lifecycle import record_static_cuda_graph
-from g4b.utils import gguf_tensors_by_name
+from g4b.utils import gguf_tensors_by_name, G4B_DBG
 from g4b import kernels, device
 from g4b.kernels.memset import memset_contiguous
 from g4b.kernels.matmul import matmul_a3d_b2d
@@ -282,7 +282,7 @@ class Gemma4E(Model):
         self._forward(t_now=self.prefill_chunk_size, phase="prefill")
 
     def _dbg(self, label: str, t: Tensor):
-        if not os.environ.get("G4B_DBG"):
+        if not G4B_DBG:
             return
         raw = t.to_bytes_sync()
         n = math.prod(t.shape)

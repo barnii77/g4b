@@ -4,11 +4,14 @@ import shutil
 import subprocess
 import ctypes
 import tempfile
+import os
 from pathlib import Path
 from functools import cache
 from cuda.bindings import runtime as cudart
 from typing import Sequence
 from g4b.gguf import GGUFTensor
+
+G4B_DBG = bool(int(os.environ.get("G4B_DBG") or 0))
 
 
 def runtime_error(msg):
@@ -114,6 +117,8 @@ def compile_and_load_cpp(src: Path) -> ctypes.CDLL:
     cc = get_cpp_compiler_path()
     dest = get_temp_dir() / src.name
     cmd = [cc, src, "-O3", "-shared", "-fPIC", "-o", dest]
+    if not G4B_DBG:
+        cmd += ["-DNDEBUG"]  # skip assertions
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
     return ctypes.cdll.LoadLibrary(str(dest))
 
