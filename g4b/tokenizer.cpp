@@ -90,7 +90,6 @@ class Tokenizer {
 
 	ThreadSafeQueue<Job> m_jobs{};
 	std::vector<std::thread> m_workers{};
-	std::atomic_uint64_t m_num_workers_exited{};
 
 	// Constant-after-load tokenizer state
 	std::unordered_map<std::u32string_view, token_t> m_str_to_tok{};
@@ -446,8 +445,6 @@ void Tokenizer::worker() {
 			submit(job, merge(job.seq));
 		}
 	}
-	m_num_workers_exited.fetch_add(1);
-	m_num_workers_exited.notify_all();
 }
 
 Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::span<token_t> token_types,
@@ -483,10 +480,8 @@ Tokenizer::Tokenizer(const std::span<std::span<utf32_t> > tokens, const std::spa
 Tokenizer::~Tokenizer() {
 	// Terminate the workers gracefully
 	m_jobs.interrupt();
-	for (uint64_t num_workers_exited = 0; num_workers_exited != m_workers.size();
-	     num_workers_exited = m_num_workers_exited.load()) {
-		m_num_workers_exited.wait(num_workers_exited);
-	}
+	for (auto &m_worker: m_workers)
+		m_worker.join();
 }
 
 Tokenizer::Submission::Submission(const uint64_t id, const uint64_t n_jobs)
