@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
+#include <iostream>
 
 template<typename T>
 class ThreadSafeQueue {
@@ -179,6 +180,7 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 			if (allow_special) {
 				// Try consuming a special token
 				std::u32string_view head = seq.substr(0, std::min(m_max_special_token_str_len, seq.length()));
+				bool special_token_consumed = false;
 				while (!head.empty()) {
 					if (decltype(m_special_str_to_tok)::iterator it;
 						(it = m_special_str_to_tok.find(head)) != m_special_str_to_tok.end()) {
@@ -186,11 +188,13 @@ std::tuple<token_t *, uint64_t> Tokenizer::tokenize(std::u32string_view seq, con
 						tokens_or_jobs.emplace_back(it->second);
 						seq = seq.substr(head.length());
 						seq_after_prev_split = seq;
+						special_token_consumed = true;
 						break;
 					}
 					head = head.substr(0, head.length() - 1);
 				}
-				continue;
+				if (special_token_consumed)
+					continue;
 			}
 			// Normal char
 			seq = seq.substr(1);
