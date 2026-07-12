@@ -1057,5 +1057,5 @@ print("timing now")
 
 import timeit
 
-print(f"tokenize ({len(inp):,} characters):", timeit.timeit("tokenize()", number=10, globals=globals()))
-print("detokenize (10,000,000 tokens):", timeit.timeit("detokenize()", number=10, globals=globals()))
+print(f"10x tokenize ({len(inp):,} characters):", timeit.timeit("tokenize()", number=10, globals=globals()))
+print("10x detokenize (10,000,000 tokens):", timeit.timeit("detokenize()", number=10, globals=globals()))
