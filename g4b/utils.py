@@ -6,7 +6,6 @@ import ctypes
 import tempfile
 import os
 from pathlib import Path
-from functools import cache
 from cuda.bindings import runtime as cudart
 from typing import Sequence
 from g4b.gguf import GGUFTensor
@@ -115,7 +114,7 @@ def compile_and_load_cpp(src: Path) -> ctypes.CDLL:
     if not src.is_file():
         raise RuntimeError("src must reference file")
     cc = get_cpp_compiler_path()
-    dest = get_temp_dir() / src.name
+    dest = get_temp_dir() / (src.name + ".so")
     cmd = [cc, src, "-O3", "-shared", "-fPIC", "-o", dest]
     if G4B_DBG:
         cmd += ["-g"]  # debug symbols
@@ -125,6 +124,8 @@ def compile_and_load_cpp(src: Path) -> ctypes.CDLL:
     return ctypes.cdll.LoadLibrary(str(dest))
 
 
-@cache
 def get_temp_dir() -> Path:
-    return Path(tempfile.gettempdir())
+    path = Path(tempfile.gettempdir()) / "g4b"
+    if not path.exists():
+        path.mkdir()
+    return path
