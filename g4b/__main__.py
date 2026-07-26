@@ -107,7 +107,7 @@ def main():
     try:
         while True:
             scheduler.step()
-    except Exception:
+    except Exception, KeyboardInterrupt:
         traceback.print_exc()
 
     if is_profiling:

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Run the `file` command without seccomp to stop nsys from hanging.
+# See https://docs.nvidia.com/nsight-systems/ReleaseNotes/index.html#general-issues, point 3, for more information.
+exec /usr/bin/file -S "$@"

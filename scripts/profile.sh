@@ -21,15 +21,22 @@ export PYTHONUNBUFFERED=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
 export G4B_PROFILE=1
 
+# nsys requires running as root, but we don't want /root/.triton as the triton cache
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/.triton-cache}"
+
+# nsys will hang if `/usr/bin/file` is execve'd because of seccomp, which the python stdlib does -> shadow it in PATH
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+nsys_shims_dir="$script_dir/nsys_shims"
+export PATH="$nsys_shims_dir:$PATH"
+
 case "$mode" in
   nsys)
     exec nsys profile \
-      --trace=cuda \
-      --sample=none \
-      --cpuctxsw=none \
+      --trace=cuda,nvtx,osrt,cublas \
       --capture-range=cudaProfilerApi \
       --capture-range-end=stop \
       --cuda-graph-trace=node \
+      --gpu-metrics-devices=all \
       --stats=true \
       --force-overwrite=true \
       -o /tmp/profile \
