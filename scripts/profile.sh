@@ -56,7 +56,7 @@ case "$mode" in
         -o /tmp/profile \
         --import-source=yes \
         -f \
-        -- "$@"
+        -- env "$@"
     ;;
 
   *)
