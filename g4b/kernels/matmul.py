@@ -4,7 +4,14 @@ import triton
 from triton import language as tl
 from g4b import tensor
 from g4b.tensor import Tensor, DType
-from g4b.kernels.utils import launch, default_bencher, jfn_cache_key, gated_configs, all_slots_off_phase_jfn
+from g4b.kernels.utils import (
+    launch,
+    default_bencher,
+    jfn_cache_key,
+    gated_configs,
+    all_slots_off_phase_jfn,
+    G4B_SKIP_TUNING,
+)
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.kernels.rsos import compute_rsos
 from g4b.kernels import matmul_epilogue
@@ -203,11 +210,16 @@ def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
         block_k = conf.kwargs.get("A_BLOCKSIZE2", 1)
         block_n = conf.kwargs.get("B_BLOCKSIZE1", 1)
         split_k = conf.kwargs.get("NUM_K_SPLITS", 1)
+
         # split-K validity: K must divide evenly by the split count (kernel static_asserts this), AND each
         # split's K range (K/split_k) must tile evenly by block_k, else the K loop overruns into the next
         # split's columns (the loaders only mask against the global K) and double-counts them.
         if a_shape2 % split_k != 0 or (a_shape2 // split_k) % block_k != 0:
             continue
+
+        # TODO matvec does not necessarily need to be block_b == 1 or block_m == 1, it could also just be small values.
+        #  This code is slop and should be rewritten (communicate is_matvec_cfg in some other way).
+        #  The q6 decode hack must be removed as well.
         # matvec configs are single-row (M==1) split-K tiles. Keep them only in matvec mode, and keep the wide
         # tl.dot tiles only out of matvec mode: the broadcast+sum materialises a [M,K,N] tile that blows up
         # register/shared usage on large tiles, while tl.dot wants M>=16 it does not have here.
@@ -217,6 +229,7 @@ def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
                 continue
         elif is_matvec_cfg:
             continue
+
         q6_decode_hack = block_b == 1 and block_m == 1 and block_n == 16 and block_k in (32, 128)
         if q6_decode_hack and b_dtype != tensor.q6_k.name:
             continue
@@ -224,8 +237,10 @@ def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
             continue
         if block_b == 1 and block_m == 1 and a_shape1 > 1:
             continue
+
         pruned.append(conf)
-    if os.environ.get("G4B_SKIP_TUNING"):
+
+    if G4B_SKIP_TUNING:
         return (pruned or configs[:1])[:1]
     return pruned or configs[:1]
 
