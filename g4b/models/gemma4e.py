@@ -23,6 +23,8 @@ from g4b.kernels.fa2 import PHASE_PREFILL, PHASE_DECODE
 #  experts to device mem from pinned host mem. This should side-step python and linux latency, though it restricts how
 #  advanced the device-side expert caching and prefetch logic can be.
 
+# TODO because of the way KV sharing works in gemma 4, I can actually skip the last N layers during prefill entirely, which should roughly double prefill throughput.
+
 ################
 # Tensors names below are suffixed with shape and dtype annotations.
 # The dtypes refer to the following:
