@@ -216,6 +216,7 @@ class Gemma4E(Model):
     output_copy_ring_idx: list[int]
     batch_size: int
     prefill_chunk_size: int
+    last_kv_cache_owning_layer: int  # during prefill, we can skip all layers after this one
 
     def max_batch_size(self) -> int:
         return self.batch_size
@@ -329,6 +330,9 @@ class Gemma4E(Model):
 
         self._dbg("after first rmsnorm (act)", act)
         for i, layer in enumerate(self.layers):
+            if phase == "prefill" and i > self.last_kv_cache_owning_layer:
+                break  # no layer beyond this point populates any persistent state (because of CED architecture).
+
             self._attention(layer.attn, act, residual, act_rsos, t_now, phase, phase_id)
             self._dbg(
                 f"L{i} after attention (attn out)",
@@ -396,6 +400,11 @@ class Gemma4E(Model):
                     ),
                 )
 
+        if phase == "prefill":
+            # Prefill never samples: it may stop early at last_kv_cache_owning_layer (see loop above), so act/act_rsos
+            # are not the final layer's output. The scheduler feeds the last prompt token as the first decode input.
+            return
+
         self._dbg("final act_rsos (for logits)", act_rsos)
         kernels.select_t.select_t(act, self.sample_positions_B_int32, self.lm_head.input_B1D_dtr)
         kernels.select_t.select_t(
@@ -431,14 +440,13 @@ class Gemma4E(Model):
             user_phase=self.user_phase_B_uint8,
             phase=phase_id,
         )
-        if phase == "decode":
-            kernels.advance_decode_state.advance_decode_state(
-                self.input_token_ids_tB_int32,
-                self.sampling_state.out_token_ids_B1_int32,
-                self.cache_offsets_B_int32,
-                self.time_dim_sizes_B_int32,
-                self.user_phase_B_uint8,
-            )
+        kernels.advance_decode_state.advance_decode_state(
+            self.input_token_ids_tB_int32,
+            self.sampling_state.out_token_ids_B1_int32,
+            self.cache_offsets_B_int32,
+            self.time_dim_sizes_B_int32,
+            self.user_phase_B_uint8,
+        )
 
     def _prepare_ple(self, token_ids: Tensor, residual: Tensor, t_now: int, phase_id: int):
         B, _, D = residual.shape
@@ -716,6 +724,7 @@ class Gemma4E(Model):
         P = meta["gemma4.embedding_length_per_layer_input"]
         V = len(meta["tokenizer.ggml.tokens"])
         L = meta["gemma4.block_count"]
+        last_kv_cache_owning_layer = 0
         assert all(isinstance(x, int) for x in [B, t, T, W, D, k_gqa, v_gqa, k_swa, v_swa, h, g, U, P, V, L])
 
         ts = gguf_tensors_by_name(tensors)
@@ -871,6 +880,7 @@ class Gemma4E(Model):
                     k_cache = Tensor.alloc_empty(DTKV, [B, g, T, k_gqa])
                     v_cache = Tensor.alloc_empty(DTKV, [B, g, T, v_gqa])
                 kv_cache_by_layer[i] = k_cache, v_cache
+                last_kv_cache_owning_layer = i
             else:
                 layers_with_same_type = filter(lambda j: swa_pattern[j] == is_swa, kv_cache_by_layer.keys())
                 layer_to_share_with = max(layers_with_same_type)
@@ -996,6 +1006,7 @@ class Gemma4E(Model):
             output_copy_ring_idx=[0],
             batch_size=B,
             prefill_chunk_size=t,
+            last_kv_cache_owning_layer=last_kv_cache_owning_layer,
         )
         device.sync_all_streams()
         return model

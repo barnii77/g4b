@@ -73,12 +73,14 @@ class Scheduler:
             decode_tokens = self._prepare_decode_inputs()
             self._model.decode(self)
         self._last_phase = phase
-        self._collect_outputs(phase)
+        if phase == "decode":  # prefill doesn't sample
+            self._collect_outputs()
         self._drop_done_slots()
         if self._print_stats:
             self._update_stats(prefill_tokens, decode_tokens)
 
     def submit(self, request: Request):
+        assert len(request.input_tokens) >= 1, "empty prompt: there is no token to start decoding from"
         self._queue.put(request)
 
     def reset(self):
@@ -115,9 +117,14 @@ class Scheduler:
             shared_prefix_len = shared_prefix_len_by_slot[ideal_slot]
             assert shared_prefix_len >= 0
 
-            # skip prefilling fully shared chunks except the last one because it samples a token and it must resample
-            # TODO that is inefficient though... I should still share the last chunk and just retrigger sampling
-            n = max(0, floor_to_multiple_of(shared_prefix_len - 1, self._model.max_prefill_chunk_size()))
+            # Skip prefilling fully shared chunks. The slot's KV cache covers all of its prev tokens except the last
+            #  one (the final sampled token is never fed back). Prefill only covers input_tokens[:-1]; the last prompt
+            #  token is the first decode input, so it is never skipped. This complicated `reusable` expression is
+            #  necessary because at least one existing prompt token must be recomputed with a decode pass to sample the
+            #  first decode token.
+            prev_tokens = self._prev_processed_tokens_by_slot[ideal_slot]
+            reusable = min(shared_prefix_len, len(prev_tokens) - 1, len(new_rq.input_tokens) - 1)
+            n = max(0, floor_to_multiple_of(reusable, self._model.max_prefill_chunk_size()))
             new_rq._prefill_pos = n
             new_rq._context_len += n
 
@@ -125,7 +132,8 @@ class Scheduler:
             self._prev_processed_tokens_by_slot[ideal_slot] = new_rq.input_tokens.copy()
 
     def _needs_prefill(self, rq: Request) -> bool:
-        return not rq.done and rq._prefill_pos < len(rq.input_tokens)
+        # the last prompt token is not prefilled; it is the input of the first decode step, which samples from it
+        return not rq.done and rq._prefill_pos < len(rq.input_tokens) - 1
 
     def _needs_decode(self, rq: Request) -> bool:
         return not rq.done and not self._needs_prefill(rq)
@@ -149,12 +157,11 @@ class Scheduler:
 
             phase_active.append(True)
             start = rq._prefill_pos
-            end = min(start + t, len(rq.input_tokens))
-            real_n = max(1, end - start)
+            end = min(start + t, len(rq.input_tokens) - 1)
+            real_n = end - start
+            assert real_n > 0
             total_real += real_n
             toks = rq.input_tokens[start:end]
-            if not toks:
-                toks = [rq.input_tokens[max(0, len(rq.input_tokens) - 1)]]
             toks = toks + [toks[-1]] * (t - len(toks))
             token_cols.append(toks)
             start_offset = rq._context_len
@@ -239,12 +246,10 @@ class Scheduler:
             flush=True,
         )
 
-    def _collect_outputs(self, phase: str):
+    def _collect_outputs(self):
         vals = self._model.collect_output_token_ids()
         for b, rq in enumerate(self._active):
             if rq is None or rq.done or not self._phase_active[b]:
-                continue
-            if phase == "prefill" and self._needs_prefill(rq):
                 continue
             tok = vals[b]
             rq._output_tokens.append(tok)

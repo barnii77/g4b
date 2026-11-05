@@ -287,7 +287,7 @@ def main():
                 print_top("g4b", g4b_ids, g4b_vals, tokenizer, args.topn)
             else:
                 assert ref_model is not None and ref_conf is not None
-                if step == 0:
+                if ref_kv is None:  # first sampled token (prefill steps produce no output)
                     ref_logits, ref_hidden, ref_layer_residuals, ref_kv = ref_forward_prefill(
                         ref_model,
                         ref_conf,
