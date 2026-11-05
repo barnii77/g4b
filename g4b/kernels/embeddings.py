@@ -104,13 +104,13 @@ def _gather_token_embeddings_kernel(
     # one (b, t) -> one row (token id) per program
     token_id = tl.load(token_ids_ptr + pid_t * token_ids_stride0 + pid_b * token_ids_stride1)
 
-    # dequantize embed[token_id, first_col : first_col + BLOCKSIZE2] -> tile shape (1, 1, BLOCKSIZE2)
+    # dequantize embed[token_id, first_col : first_col + BLOCKSIZE2] -> tile shape (1, BLOCKSIZE2)
     embed_tile = matmul_a3d_b2d_b_loader_jfn(
         # fmt: off
-        "embed", None, 0, token_id, first_col, embed_ptr,
-        1, embed_shape0, embed_shape1,
-        0, embed_stride0, embed_stride1,
-        1, 1, BLOCKSIZE2,
+        "embed", None, token_id, first_col, embed_ptr,
+        embed_shape0, embed_shape1,
+        embed_stride0, embed_stride1,
+        1, BLOCKSIZE2,
         EMBED_DTYPE,
         # fmt: on
     )

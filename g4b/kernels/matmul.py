@@ -382,6 +382,14 @@ def _matmul_a3d_b2d_kernel(
     if all_slots_off_phase_jfn(user_phase_ptr, off_b + tl.arange(0, A_BLOCKSIZE0), a_shape0, user_phase_stride0, PHASE):
         return
 
+    # Inside the K loop everything is 2D: the (batch, row) dims of the [A_BLOCKSIZE0, A_BLOCKSIZE1, ...] tile are
+    # flattened row-major into BLOCK_M rows (see _tile_rows_jfn). Triton emits markedly worse code for 3D tensors,
+    # especially ones with a leading unit dim (the common A_BLOCKSIZE0 == 1 case), than for the equivalent 2D ones,
+    # both for the loads and around the tl.dot. Only the epilogue (merge / storer fns) sees the 3D tile again.
+    BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
+    BLOCK_K: tl.constexpr = A_BLOCKSIZE2
+    BLOCK_N: tl.constexpr = B_BLOCKSIZE1
+
     has_b2: tl.constexpr = b2_ptr is not None
     if USE_MATVEC:
         # direct tl.load/tl.store
@@ -389,17 +397,14 @@ def _matmul_a3d_b2d_kernel(
         b_desc = None
         b2_desc = None
         c_desc = None
-        _co0 = off_b + tl.arange(0, A_BLOCKSIZE0)[:, None, None]
-        _co1 = off_row + tl.arange(0, A_BLOCKSIZE1)[None, :, None]
-        _co2 = off_col + tl.arange(0, B_BLOCKSIZE1)[None, None, :]
-        _c_ptrs = c_ptr + _co0 * c_stride0 + _co1 * c_stride1 + _co2 * c_stride2
-        c = (
-            tl.load(_c_ptrs, mask=(_co0 < c_shape0) & (_co1 < c_shape1) & (_co2 < c_shape2), other=0.0).to(ACCUM_DTYPE)
-            if KEEP_C
-            else tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
-        )
-        c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
+        if KEEP_C:
+            _co0, _co1 = _tile_rows_jfn(off_b, off_row, A_BLOCKSIZE0, A_BLOCKSIZE1)
+            _co2 = off_col + tl.arange(0, BLOCK_N)
+            _c_ptrs = c_ptr + (_co0 * c_stride0 + _co1 * c_stride1)[:, None] + _co2[None, :] * c_stride2
+            _c_mask = ((_co0 < c_shape0) & (_co1 < c_shape1))[:, None] & (_co2 < c_shape2)[None, :]
+            c = tl.load(_c_ptrs, mask=_c_mask, other=0.0).to(ACCUM_DTYPE)
     else:
+        # The default A loader does plain pointer loads and ignores a_desc; it is only here for custom loaders.
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
             (a_shape0, a_shape1, a_shape2),
@@ -408,32 +413,20 @@ def _matmul_a3d_b2d_kernel(
         )
         if TRANSPOSE_B_BEFORE_MMA:
             b_desc = tl.make_tensor_descriptor(
-                b_ptr,
-                (1, b_shape0, b_shape1),
-                (0, b_stride0, b_stride1),
-                (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
+                b_ptr, (b_shape0, b_shape1), (b_stride0, b_stride1), (B_BLOCKSIZE1, A_BLOCKSIZE2)
             )
         else:
             b_desc = tl.make_tensor_descriptor(
-                b_ptr,
-                (1, b_shape0, b_shape1),
-                (0, b_stride0, b_stride1),
-                (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
+                b_ptr, (b_shape0, b_shape1), (b_stride0, b_stride1), (A_BLOCKSIZE2, B_BLOCKSIZE1)
             )
         if has_b2:
             if TRANSPOSE_B_BEFORE_MMA:
                 b2_desc = tl.make_tensor_descriptor(
-                    b2_ptr,
-                    (1, b_shape0, b_shape1),
-                    (0, b2_stride0, b2_stride1),
-                    (1, B_BLOCKSIZE1, A_BLOCKSIZE2),
+                    b2_ptr, (b_shape0, b_shape1), (b2_stride0, b2_stride1), (B_BLOCKSIZE1, A_BLOCKSIZE2)
                 )
             else:
                 b2_desc = tl.make_tensor_descriptor(
-                    b2_ptr,
-                    (1, b_shape0, b_shape1),
-                    (0, b2_stride0, b2_stride1),
-                    (1, A_BLOCKSIZE2, B_BLOCKSIZE1),
+                    b2_ptr, (b_shape0, b_shape1), (b2_stride0, b2_stride1), (A_BLOCKSIZE2, B_BLOCKSIZE1)
                 )
         else:
             b2_desc = None
@@ -444,18 +437,16 @@ def _matmul_a3d_b2d_kernel(
             (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1),
         )
 
-        c = (
-            c_desc.load((off_b, off_row, off_col)).to(ACCUM_DTYPE)
-            if KEEP_C
-            else tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE)
-        )
-        c2 = tl.zeros((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1), dtype=ACCUM_DTYPE) if has_b2 else None
+        if KEEP_C:
+            c = c_desc.load((off_b, off_row, off_col)).to(ACCUM_DTYPE).reshape((BLOCK_M, BLOCK_N))
+
+    if not KEEP_C:
+        c = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACCUM_DTYPE)
+    c2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACCUM_DTYPE) if has_b2 else None
 
     for off_k in tl.range(k_split_start, k_split_start + k_split_step, A_BLOCKSIZE2):
-        BLOCK_M: tl.constexpr = A_BLOCKSIZE0 * A_BLOCKSIZE1
-        BLOCK_K: tl.constexpr = A_BLOCKSIZE2
-        BLOCK_N: tl.constexpr = B_BLOCKSIZE1
         # fmt: off
+        # the default loader already returns [BLOCK_M, BLOCK_K]; custom loaders may still return the 3D tile
         a = a_loader_fn(
             "a", a_desc, off_b, off_row, off_k, a_ptr,
             a_shape0, a_shape1, a_shape2,
@@ -465,20 +456,16 @@ def _matmul_a3d_b2d_kernel(
         ).reshape((BLOCK_M, BLOCK_K))
         if TRANSPOSE_B_BEFORE_MMA:
             b = b_loader_fn(
-                "b", b_desc, 0, off_col, off_k, b_ptr,
-                1, b_shape0, b_shape1,
-                0, b_stride0, b_stride1,
-                1, B_BLOCKSIZE1, A_BLOCKSIZE2,
+                "b", b_desc, off_col, off_k, b_ptr,
+                b_shape0, b_shape1, b_stride0, b_stride1, BLOCK_N, BLOCK_K,
                 B_DTYPE,
-            ).reshape((BLOCK_N, BLOCK_K)).T
+            ).T
         else:
             b = b_loader_fn(
-                "b", b_desc, 0, off_k, off_col, b_ptr,
-                1, b_shape0, b_shape1,
-                0, b_stride0, b_stride1,
-                1, A_BLOCKSIZE2, B_BLOCKSIZE1,
+                "b", b_desc, off_k, off_col, b_ptr,
+                b_shape0, b_shape1, b_stride0, b_stride1, BLOCK_K, BLOCK_N,
                 B_DTYPE,
-            ).reshape((BLOCK_K, BLOCK_N))
+            )
         # fmt: on
 
         # Handle upcasting.
@@ -499,50 +486,31 @@ def _matmul_a3d_b2d_kernel(
             UPCAST_TY = ACCUM_DTYPE
 
         a_upcast = a.to(UPCAST_TY)
-        b_upcast = b.to(UPCAST_TY)
-        if USE_MATVEC:
-            c += (
-                (a_upcast.reshape((BLOCK_M, BLOCK_K, 1)) * b_upcast.reshape((1, BLOCK_K, BLOCK_N)))
-                .sum(axis=1)
-                .reshape((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1))
-            )
-        else:
-            c = tl.dot(a_upcast, b_upcast, c.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(
-                (A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1)
-            )
+        c = _accumulate_jfn(c, a_upcast, b.to(UPCAST_TY), USE_MATVEC)
         if has_b2:
             # TODO maybe t.join'ing the b and b2 tiles and doing one tl.dot call then splitting again is faster? try!
             # fmt: off
             if TRANSPOSE_B_BEFORE_MMA:
                 b2_tile = b_loader_fn(
-                    "b2", b2_desc, 0, off_col, off_k, b2_ptr,
-                    1, b_shape0, b_shape1,
-                    0, b2_stride0, b2_stride1,
-                    1, B_BLOCKSIZE1, A_BLOCKSIZE2,
+                    "b2", b2_desc, off_col, off_k, b2_ptr,
+                    b_shape0, b_shape1, b2_stride0, b2_stride1, BLOCK_N, BLOCK_K,
                     B2_DTYPE,
-                ).reshape((BLOCK_N, BLOCK_K)).T.to(UPCAST_TY)
+                ).T
             else:
                 b2_tile = b_loader_fn(
-                    "b2", b2_desc, 0, off_k, off_col, b2_ptr,
-                    1, b_shape0, b_shape1,
-                    0, b2_stride0, b2_stride1,
-                    1, A_BLOCKSIZE2, B_BLOCKSIZE1,
+                    "b2", b2_desc, off_k, off_col, b2_ptr,
+                    b_shape0, b_shape1, b2_stride0, b2_stride1, BLOCK_K, BLOCK_N,
                     B2_DTYPE,
-                ).reshape((BLOCK_K, BLOCK_N)).to(UPCAST_TY)
-            # fmt: on
-            if USE_MATVEC:
-                c2 += (
-                    (a_upcast.reshape((BLOCK_M, BLOCK_K, 1)) * b2_tile.reshape((1, BLOCK_K, BLOCK_N)))
-                    .sum(axis=1)
-                    .reshape(c.shape)
                 )
-            else:
-                c2 = tl.dot(a_upcast, b2_tile, c2.reshape((BLOCK_M, BLOCK_N)), out_dtype=c.dtype).reshape(c.shape)
+            # fmt: on
+            c2 = _accumulate_jfn(c2, a_upcast, b2_tile.to(UPCAST_TY), USE_MATVEC)
 
+    # the epilogue (merge / storer fns) works on the 3D [A_BLOCKSIZE0, A_BLOCKSIZE1, N] tile
+    c = c.reshape((A_BLOCKSIZE0, A_BLOCKSIZE1, B_BLOCKSIZE1))
     if has_b2:
         # fmt: off
         c = c_c2_merge_tiles_fn(
-            c, c2, off_b, off_row, off_col,
+            c, c2.reshape(c.shape), off_b, off_row, off_col,
             NUM_K_SPLITS, C_DTYPE,
             input_rmsnorm_sum_of_squares_ptr,
             input_rmsnorm_sum_of_squares_shape0, input_rmsnorm_sum_of_squares_shape1,
@@ -572,6 +540,27 @@ def _matmul_a3d_b2d_kernel(
 
 
 @triton.jit
+def _tile_rows_jfn(off0, off1, BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr):
+    # Flattens the (dim0, dim1) part of a [BLOCKSIZE0, BLOCKSIZE1, ...] tile at (off0, off1) into
+    # BLOCKSIZE0 * BLOCKSIZE1 rows, row-major (row r = i0 * BLOCKSIZE1 + i1, the order reshape uses). Returns the
+    # dim0 and dim1 index of every row. This works for any strides, and partial tiles just mask per row.
+    rows = tl.arange(0, BLOCKSIZE0 * BLOCKSIZE1)
+    return off0 + rows // BLOCKSIZE1, off1 + rows % BLOCKSIZE1
+
+
+@triton.jit
+def _accumulate_jfn(acc, a, b, USE_MATVEC: tl.constexpr):
+    # acc[M, N] += a[M, K] @ b[K, N]
+    if not USE_MATVEC:
+        return tl.dot(a, b, acc, out_dtype=acc.dtype)
+    elif a.shape[0] == 1:
+        # single-row matvec: reduce over K without the [1, K, N] intermediate of the general case
+        return acc + tl.sum(a.reshape((a.shape[1], 1)) * b, axis=0)[None, :]
+    else:
+        return acc + tl.sum(a[:, :, None] * b[None, :, :], axis=1)
+
+
+@triton.jit
 def matmul_a3d_b2d_a_loader_jfn(
     # fmt: off
     name: tl.constexpr, desc, off0, off1, off2, ptr,
@@ -581,23 +570,27 @@ def matmul_a3d_b2d_a_loader_jfn(
     conceptual_dtype: tl.constexpr,
     # fmt: on
 ):
-    offs0 = off0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
-    offs1 = off1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
-    offs2 = off2 + tl.arange(0, BLOCKSIZE2)[None, None, :]
-    mask = (offs0 < shape0) & (offs1 < shape1) & (offs2 < shape2)
-    return tl.load(ptr + offs0 * stride0 + offs1 * stride1 + offs2 * stride2, mask=mask, other=0.0)
+    # Loads the [BLOCKSIZE0, BLOCKSIZE1, BLOCKSIZE2] tile at (off0, off1, off2) already flattened to
+    # [BLOCKSIZE0 * BLOCKSIZE1, BLOCKSIZE2]. A 3D tl.load here makes Triton generate much worse code.
+    offs0, offs1 = _tile_rows_jfn(off0, off1, BLOCKSIZE0, BLOCKSIZE1)
+    offs2 = off2 + tl.arange(0, BLOCKSIZE2)
+    ptrs = ptr + (offs0 * stride0 + offs1 * stride1)[:, None] + offs2[None, :] * stride2
+    mask = ((offs0 < shape0) & (offs1 < shape1))[:, None] & (offs2 < shape2)[None, :]
+    return tl.load(ptrs, mask=mask, other=0.0)
 
 
 @triton.jit
 def matmul_a3d_b2d_b_loader_jfn(
     # fmt: off
-    name: tl.constexpr, desc, off0, off1, off2, ptr,
-    shape0: tl.constexpr, shape1: tl.constexpr, shape2: tl.constexpr,
-    stride0: tl.constexpr, stride1: tl.constexpr, stride2: tl.constexpr,
-    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr, BLOCKSIZE2: tl.constexpr,
+    name: tl.constexpr, desc, off0, off1, ptr,
+    shape0: tl.constexpr, shape1: tl.constexpr,
+    stride0: tl.constexpr, stride1: tl.constexpr,
+    BLOCKSIZE0: tl.constexpr, BLOCKSIZE1: tl.constexpr,
     conceptual_dtype: tl.constexpr,
     # fmt: on
 ):
+    # Loads the 2D [BLOCKSIZE0, BLOCKSIZE1] tile at (off0, off1), dequantized to fp16 for K-quants.
+    # desc (2D, or None) is only used for unquantized dtypes.
     is_quantized: tl.constexpr = (
         conceptual_dtype == tensor.q4_k.name
         or conceptual_dtype == tensor.q5_k.name
@@ -605,12 +598,11 @@ def matmul_a3d_b2d_b_loader_jfn(
     )
     if not is_quantized:
         if desc is not None:
-            return desc.load((off0, off1, off2)).to(tl.float16)
-        _offs0 = off0 + tl.arange(0, BLOCKSIZE0)[:, None, None]
-        _offs1 = off1 + tl.arange(0, BLOCKSIZE1)[None, :, None]
-        _offs2 = off2 + tl.arange(0, BLOCKSIZE2)[None, None, :]
-        _ptrs = ptr + _offs0 * stride0 + _offs1 * stride1 + _offs2 * stride2
-        return tl.load(_ptrs, mask=(_offs0 < shape0) & (_offs1 < shape1) & (_offs2 < shape2)).to(tl.float16)
+            return desc.load((off0, off1)).to(tl.float16)
+        _offs0 = off0 + tl.arange(0, BLOCKSIZE0)[:, None]
+        _offs1 = off1 + tl.arange(0, BLOCKSIZE1)[None, :]
+        _ptrs = ptr + _offs0 * stride0 + _offs1 * stride1
+        return tl.load(_ptrs, mask=(_offs0 < shape0) & (_offs1 < shape1), other=0.0).to(tl.float16)
 
     # desc not used, we manually tl.load
     ptr_u8 = ptr.to(tl.pointer_type(tl.uint8))
@@ -618,25 +610,21 @@ def matmul_a3d_b2d_b_loader_jfn(
 
     # each row must fit in one superblock for now
     k_quant_superblock_num_elems: tl.constexpr = 256
-    tl.static_assert(not is_quantized or BLOCKSIZE2 <= k_quant_superblock_num_elems)
+    tl.static_assert(not is_quantized or BLOCKSIZE1 <= k_quant_superblock_num_elems)
 
     # dtype to which it upcasts values
     UPCAST_DTYPE: tl.constexpr = tl.float16
 
-    # for quantized loads, tensor must be 2d for now
-    tl.static_assert(not is_quantized or shape0 == 1)
-    tl.static_assert(not is_quantized or stride0 == 0)
-    tl.static_assert(not is_quantized or BLOCKSIZE0 == 1)
     tl.static_assert(
-        not is_quantized or stride2 == 1
+        not is_quantized or stride1 == 1
     )  # superblocks are physically laid out as contiguous 256-byte arrays
-    tl.static_assert(not is_quantized or BLOCKSIZE2 >= 32)  # hacky assert but makes my life easier below
+    tl.static_assert(not is_quantized or BLOCKSIZE1 >= 32)  # hacky assert but makes my life easier below
 
-    stride_row: tl.constexpr = stride1
-    BLOCKSIZE_ROW: tl.constexpr = BLOCKSIZE1
-    BLOCKSIZE_COL: tl.constexpr = BLOCKSIZE2
-    first_row = off1
-    first_col = off2
+    stride_row: tl.constexpr = stride0
+    BLOCKSIZE_ROW: tl.constexpr = BLOCKSIZE0
+    BLOCKSIZE_COL: tl.constexpr = BLOCKSIZE1
+    first_row = off0
+    first_col = off1
     SUPERBLOCK_SIZE_ELEMS: tl.constexpr = 256
     offs_row = first_row + tl.arange(0, BLOCKSIZE_ROW)[:, None]
 
@@ -650,8 +638,8 @@ def matmul_a3d_b2d_b_loader_jfn(
         SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
         SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
 
-        rows: tl.constexpr = shape1
-        cols: tl.constexpr = shape2 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        rows: tl.constexpr = shape0
+        cols: tl.constexpr = shape1 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
         tl.static_assert(not is_quantized or cols % SUPERBLOCK_SIZE_ELEMS == 0)
 
         ptr_u16 = ptr_u8.cast(tl.pointer_type(tl.uint16))
@@ -726,15 +714,15 @@ def matmul_a3d_b2d_b_loader_jfn(
         ds = all_ds.gather(dm_offs, axis=-1)
         ms = all_ms.gather(dm_offs, axis=-1)
 
-        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((1, BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
     elif conceptual_dtype == tensor.q5_k.name:
         # q5_k
         SUPERBLOCK_SIZE_BYTES: tl.constexpr = 176
         SUBBLOCK_SIZE_ELEMS: tl.constexpr = 32
         SUBBLOCK_SIZE_BYTES: tl.constexpr = 16
 
-        rows: tl.constexpr = shape1
-        cols: tl.constexpr = shape2 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        rows: tl.constexpr = shape0
+        cols: tl.constexpr = shape1 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
         tl.static_assert(not is_quantized or cols % SUPERBLOCK_SIZE_ELEMS == 0)
 
         ptr_u16 = ptr_u8.cast(tl.pointer_type(tl.uint16))
@@ -824,14 +812,14 @@ def matmul_a3d_b2d_b_loader_jfn(
         ds = all_ds.gather(dm_offs, axis=-1)
         ms = all_ms.gather(dm_offs, axis=-1)
 
-        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((1, BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        return (ds.expand_dims(-1) * qs - ms.expand_dims(-1)).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
     else:
         # q6_k
         SUPERBLOCK_SIZE_BYTES: tl.constexpr = 210
         SUBBLOCK_SIZE_ELEMS: tl.constexpr = 16
 
-        rows: tl.constexpr = shape1
-        cols: tl.constexpr = shape2 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
+        rows: tl.constexpr = shape0
+        cols: tl.constexpr = shape1 // SUPERBLOCK_SIZE_BYTES * SUPERBLOCK_SIZE_ELEMS
         tl.static_assert(not is_quantized or cols % SUPERBLOCK_SIZE_ELEMS == 0)
 
         ptr_u16 = ptr_u8.cast(tl.pointer_type(tl.uint16))
@@ -932,7 +920,7 @@ def matmul_a3d_b2d_b_loader_jfn(
 
         ds = all_ds.gather(dm_offs, axis=-1)
 
-        return (ds.expand_dims(-1) * qs).reshape((1, BLOCKSIZE_ROW, BLOCKSIZE_COL))
+        return (ds.expand_dims(-1) * qs).reshape((BLOCKSIZE_ROW, BLOCKSIZE_COL))
 
 
 @triton.jit

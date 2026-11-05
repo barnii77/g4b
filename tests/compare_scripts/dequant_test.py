@@ -41,34 +41,25 @@ def _dequant_loader_test_kernel(
     row_off = tl.program_id(1) * BLOCK_ROWS
     col_off = tl.program_id(0) * BLOCK_COLS
 
-    q_desc = tl.make_tensor_descriptor(
-        q_ptr,
-        (1, q_shape0, q_shape1),
-        (0, q_stride0, q_stride1),
-        (1, BLOCK_ROWS, BLOCK_COLS),
-    )
+    q_desc = tl.make_tensor_descriptor(q_ptr, (q_shape0, q_shape1), (q_stride0, q_stride1), (BLOCK_ROWS, BLOCK_COLS))
 
     tile = matmul_a3d_b2d_b_loader_jfn(
         "q",
         q_desc,
-        0,
         row_off,
         col_off,
         q_ptr,
-        1,
         q_shape0,
         q_shape1,
-        0,
         q_stride0,
         q_stride1,
-        1,
         BLOCK_ROWS,
         BLOCK_COLS,
         CONCEPTUAL_DTYPE,
     )
 
-    out_row = row_off + tl.arange(0, BLOCK_ROWS)[None, :, None]
-    out_col = col_off + tl.arange(0, BLOCK_COLS)[None, None, :]
+    out_row = row_off + tl.arange(0, BLOCK_ROWS)[:, None]
+    out_col = col_off + tl.arange(0, BLOCK_COLS)[None, :]
     mask = (out_row < out_shape0) & (out_col < out_shape1)
     tl.store(out_ptr + out_row * out_stride0 + out_col * out_stride1, tile, mask=mask)
 
