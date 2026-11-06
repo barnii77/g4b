@@ -71,10 +71,12 @@ def _seeded_context_len(batch_idx: int, batch_size: int, max_context_len: int) -
 
 class GuaranteePrefillFirstGenTokenDoesNotPreventDecodeWarmupGenEndingTokensProvider(GenEndingTokensProvider):
     """
-    During warmup and record, since the prefill phase already predicts one token when it completes, that token
-    must not end generation even if it is <eos> or <turn|> because that would prevent decode warmup and crash the
-    engine once it attempts to decode for real requests. This class ensures no tokens terminate generation for count
-    tokens, then all tokens terminate it.
+    Used during warmup and record. No token terminates generation for the first count calls, then every token does.
+
+    Historically, prefill sampled the first generated token; if that was <eos> or <turn|>, the request ended before
+    any decode step ran, so the decode path was never warmed up/recorded and the engine crashed once real requests
+    started decoding. Prefill no longer samples (the first token comes from the first decode step, which has already
+    run by the time it is collected), so that failure mode is gone and this provider is now only a safety net.
     """
 
     def __init__(self, tokenizer: Tokenizer, count: int = 32):

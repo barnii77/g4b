@@ -3,6 +3,7 @@ import os
 import time
 from queue import SimpleQueue
 from typing import TYPE_CHECKING
+from g4b import device, lifecycle
 from g4b.utils import shared_prefix_length, floor_to_multiple_of
 
 if TYPE_CHECKING:
@@ -53,15 +54,23 @@ class Scheduler:
         self._print_stats = bool(os.environ.get("G4B_PRINT_STATS"))
         self._total_prefill_tokens = 0
         self._total_decode_tokens = 0
+        # Throughput is tokens / busy time spent in steps of that phase (not wall time), so idle time between requests
+        # doesn't dilute it.
         self._window_prefill_tokens = 0
         self._window_decode_tokens = 0
+        self._window_prefill_secs = 0.0
+        self._window_decode_secs = 0.0
         self._tokens_since_log = 0
-        self._last_log_time = time.perf_counter()
 
     def step(self):
         self._fill_free_slots()
         if not any(rq is not None and not rq.done for rq in self._active):
             return
+
+        # Warmup steps include triton compilation/autotuning and record steps only capture the graph without running
+        # it, so their timings are meaningless.
+        track_stats = self._print_stats and lifecycle.is_deployment()
+        t0 = time.perf_counter()
 
         phase = "decode" if any(self._needs_decode(rq) for rq in self._active if rq is not None) else "prefill"
         prefill_tokens = 0
@@ -74,10 +83,14 @@ class Scheduler:
             self._model.decode(self)
         self._last_phase = phase
         if phase == "decode":  # prefill doesn't sample
-            self._collect_outputs()
+            self._collect_outputs()  # syncs on the sampled tokens
+        elif track_stats:
+            # Prefill doesn't sync on its own; without this its GPU time would be billed to the next decode step.
+            device.sync_all_streams()
+        step_secs = time.perf_counter() - t0
         self._drop_done_slots()
-        if self._print_stats:
-            self._update_stats(prefill_tokens, decode_tokens)
+        if track_stats:
+            self._update_stats(prefill_tokens, decode_tokens, step_secs)
 
     def submit(self, request: Request):
         assert len(request.input_tokens) >= 1, "empty prompt: there is no token to start decoding from"
@@ -218,24 +231,28 @@ class Scheduler:
                     rq._decode_state_prepared = True
         return total_decode
 
-    def _update_stats(self, prefill_tokens: int, decode_tokens: int):
+    def _update_stats(self, prefill_tokens: int, decode_tokens: int, step_secs: float):
         self._total_prefill_tokens += prefill_tokens
         self._total_decode_tokens += decode_tokens
         self._window_prefill_tokens += prefill_tokens
         self._window_decode_tokens += decode_tokens
+        if prefill_tokens:
+            self._window_prefill_secs += step_secs
+        else:
+            self._window_decode_secs += step_secs
         self._tokens_since_log += prefill_tokens + decode_tokens
         if self._tokens_since_log >= self._STATS_INTERVAL:
             self._log_stats()
             self._tokens_since_log %= self._STATS_INTERVAL
 
     def _log_stats(self):
-        now = time.perf_counter()
-        elapsed = now - self._last_log_time
-        prefill_tps = self._window_prefill_tokens / elapsed if elapsed > 0 else 0.0
-        decode_tps = self._window_decode_tokens / elapsed if elapsed > 0 else 0.0
+        p_secs, d_secs = self._window_prefill_secs, self._window_decode_secs
+        prefill_tps = self._window_prefill_tokens / p_secs if p_secs > 0 else 0.0
+        decode_tps = self._window_decode_tokens / d_secs if d_secs > 0 else 0.0
         self._window_prefill_tokens = 0
         self._window_decode_tokens = 0
-        self._last_log_time = now
+        self._window_prefill_secs = 0.0
+        self._window_decode_secs = 0.0
         active = sum(1 for rq in self._active if rq is not None and not rq.done)
         active_reqs = [rq._context_len for rq in self._active if rq is not None]
         context_len = max(active_reqs) if active_reqs else -1
