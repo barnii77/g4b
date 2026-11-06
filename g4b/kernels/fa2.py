@@ -9,7 +9,7 @@ import triton
 import os
 from triton import language as tl
 from g4b.tensor import Tensor
-from g4b.kernels.utils import launch, default_bencher, gated_configs
+from g4b.kernels.utils import launch, default_bencher, gated_configs, G4B_SKIP_TUNING, G4B_FORCE_CACHE_AUTOTUNE_RESULTS
 
 STAGE_FULL = 1
 STAGE_ON_BAND = 2
@@ -251,7 +251,7 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_configs},
     do_bench=default_bencher,
-    cache_results=True,
+    cache_results=not G4B_SKIP_TUNING or G4B_FORCE_CACHE_AUTOTUNE_RESULTS,
 )
 @triton.jit
 def _attn_kernel(

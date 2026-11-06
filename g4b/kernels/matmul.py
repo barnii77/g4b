@@ -11,6 +11,7 @@ from g4b.kernels.utils import (
     gated_configs,
     all_slots_off_phase_jfn,
     G4B_SKIP_TUNING,
+    G4B_FORCE_CACHE_AUTOTUNE_RESULTS,
 )
 from g4b.kernels.memset import memset_contiguous_by_ptr
 from g4b.kernels.rsos import compute_rsos
@@ -278,7 +279,7 @@ def _prune_invalid_matmul_configs(configs, named_args, **kwargs):
     ],
     prune_configs_by={"early_config_prune": _prune_invalid_matmul_configs},
     do_bench=default_bencher,
-    cache_results=not bool(os.environ.get("G4B_SKIP_TUNING")),
+    cache_results=not G4B_SKIP_TUNING or G4B_FORCE_CACHE_AUTOTUNE_RESULTS,
 )
 @triton.jit
 def _matmul_a3d_b2d_kernel(

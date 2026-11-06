@@ -7,6 +7,7 @@ from triton.experimental.gluon import language as gl
 from g4b import tensor
 
 G4B_SKIP_TUNING = bool(os.environ.get("G4B_SKIP_TUNING"))
+G4B_FORCE_CACHE_AUTOTUNE_RESULTS = bool(os.environ.get("G4B_FORCE_CACHE_AUTOTUNE_RESULTS"))
 
 
 def gated_configs(default, *, tuned=()):
